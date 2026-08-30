@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Literal, Protocol
 
@@ -8,10 +8,13 @@ from reckoning.continuity import (
     DeterministicFakeReckoningProvider,
     IdentifierFactory,
     InMemoryReckoningRepository,
+    Evidence,
+    PersonalRecordVersion,
     Reckoning,
     ReckoningProvider,
     ReckoningRepository,
     UuidIdentifierFactory,
+    WhyView,
 )
 
 MessageRole = Literal["user", "assistant"]
@@ -220,16 +223,127 @@ class ReckoningApplication:
 
         draft = self._dependencies.reckoning_provider.reckon(source_input)
         draft.validate()
+        created_at = self._dependencies.clock.now()
+        reckoning_id = self._dependencies.identifiers.new()
+        record_versions = tuple(
+            PersonalRecordVersion(
+                record_id=self._dependencies.identifiers.new(),
+                version=1,
+                status="proposed",
+                record_type=proposal.record_type,
+                meaning=proposal.meaning,
+                evidence_ids=proposal.evidence_ids,
+                created_at=created_at,
+            )
+            for proposal in draft.proposed_records
+        )
         reckoning = Reckoning(
-            id=self._dependencies.identifiers.new(),
+            id=reckoning_id,
             version=1,
             status="proposed",
-            created_at=self._dependencies.clock.now(),
+            created_at=created_at,
             source_input=source_input,
             draft=draft,
+            record_versions=record_versions,
         )
         self._dependencies.reckoning_repository.save(reckoning)
         return reckoning
+
+    def correct_personal_record(
+        self, reckoning_id: str, record_id: str, corrected_meaning: str
+    ) -> Reckoning:
+        meaning = corrected_meaning.strip()
+        if not meaning:
+            raise ValueError("A correction cannot be empty.")
+
+        reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
+        if reckoning.status == "confirmed":
+            raise ValueError("A confirmed reckoning cannot be corrected in place.")
+        current = next(
+            (
+                record
+                for record in reckoning.current_records
+                if record.record_id == record_id
+            ),
+            None,
+        )
+        if current is None:
+            raise KeyError(f"Unknown personal record: {record_id}")
+
+        correction_evidence = Evidence(
+            id=self._dependencies.identifiers.new(),
+            source="direct user correction",
+            content=meaning,
+        )
+        corrected_record = PersonalRecordVersion(
+            record_id=current.record_id,
+            version=current.version + 1,
+            status="proposed",
+            record_type=current.record_type,
+            meaning=meaning,
+            evidence_ids=(correction_evidence.id,),
+            created_at=self._dependencies.clock.now(),
+            supersedes_version=current.version,
+        )
+        corrected = replace(
+            reckoning,
+            version=reckoning.version + 1,
+            draft=replace(
+                reckoning.draft,
+                evidence=reckoning.draft.evidence + (correction_evidence,),
+            ),
+            record_versions=reckoning.record_versions + (corrected_record,),
+        )
+        self._dependencies.reckoning_repository.save(corrected)
+        return corrected
+
+    def confirm_reckoning(self, reckoning_id: str) -> Reckoning:
+        reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
+        if reckoning.status == "confirmed":
+            return reckoning
+
+        confirmed_at = self._dependencies.clock.now()
+        confirmed_records = tuple(
+            replace(
+                record,
+                version=record.version + 1,
+                status="confirmed",
+                created_at=confirmed_at,
+                supersedes_version=record.version,
+            )
+            for record in reckoning.current_records
+        )
+        confirmed = replace(
+            reckoning,
+            version=reckoning.version + 1,
+            status="confirmed",
+            record_versions=reckoning.record_versions + confirmed_records,
+        )
+        self._dependencies.reckoning_repository.save(confirmed)
+        return confirmed
+
+    def explain_reckoning(self, reckoning_id: str) -> WhyView:
+        reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
+        current_records = reckoning.current_records
+        material_evidence_ids = {
+            evidence_id
+            for item in (*reckoning.draft.known, *reckoning.draft.inferences)
+            for evidence_id in item.evidence_ids
+        }
+        material_evidence_ids.update(
+            evidence_id
+            for record in current_records
+            for evidence_id in record.evidence_ids
+        )
+        return WhyView(
+            reckoning_id=reckoning.id,
+            evidence=tuple(
+                evidence
+                for evidence in reckoning.draft.evidence
+                if evidence.id in material_evidence_ids
+            ),
+            record_versions=current_records,
+        )
 
     def _build_prompt_stack(
         self, user_message: str, available_connectors: tuple[str, ...]

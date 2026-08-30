@@ -6,6 +6,16 @@ from typing import Literal, Protocol
 from uuid import uuid4
 
 ReckoningStatus = Literal["proposed", "confirmed"]
+PersonalRecordStatus = Literal["proposed", "confirmed"]
+PersonalRecordType = Literal[
+    "profile_fact",
+    "current_state",
+    "direction",
+    "goal",
+    "decision",
+    "preference",
+    "boundary",
+]
 
 
 @dataclass(frozen=True)
@@ -35,6 +45,25 @@ class MaterialQuestion:
 
 
 @dataclass(frozen=True)
+class PersonalRecordProposal:
+    record_type: PersonalRecordType
+    meaning: str
+    evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PersonalRecordVersion:
+    record_id: str
+    version: int
+    status: PersonalRecordStatus
+    record_type: PersonalRecordType
+    meaning: str
+    evidence_ids: tuple[str, ...]
+    created_at: datetime
+    supersedes_version: int | None = None
+
+
+@dataclass(frozen=True)
 class ReckoningDraft:
     conflict: str
     questions: tuple[MaterialQuestion, ...]
@@ -46,6 +75,7 @@ class ReckoningDraft:
     inferences: tuple[Inference, ...]
     evidence: tuple[Evidence, ...]
     next_step: str
+    proposed_records: tuple[PersonalRecordProposal, ...] = ()
 
     def validate(self) -> None:
         if len(self.questions) > 3:
@@ -62,6 +92,16 @@ class ReckoningDraft:
             raise RuntimeError("A first reckoning must identify the conflict.")
         if not self.next_step.strip():
             raise RuntimeError("A first reckoning must end with a next step.")
+        evidence_ids = {evidence.id for evidence in self.evidence}
+        if any(
+            not proposal.meaning.strip()
+            or not proposal.evidence_ids
+            or not set(proposal.evidence_ids).issubset(evidence_ids)
+            for proposal in self.proposed_records
+        ):
+            raise RuntimeError(
+                "Every proposed personal record must name its supporting evidence."
+            )
 
 
 @dataclass(frozen=True)
@@ -72,6 +112,21 @@ class Reckoning:
     created_at: datetime
     source_input: str
     draft: ReckoningDraft
+    record_versions: tuple[PersonalRecordVersion, ...] = ()
+
+    @property
+    def current_records(self) -> tuple[PersonalRecordVersion, ...]:
+        current_by_id: dict[str, PersonalRecordVersion] = {}
+        for record in self.record_versions:
+            current_by_id[record.record_id] = record
+        return tuple(current_by_id.values())
+
+
+@dataclass(frozen=True)
+class WhyView:
+    reckoning_id: str
+    evidence: tuple[Evidence, ...]
+    record_versions: tuple[PersonalRecordVersion, ...]
 
 
 class ReckoningProvider(Protocol):
