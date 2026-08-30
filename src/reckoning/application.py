@@ -4,6 +4,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal, Protocol
 
+from reckoning.continuity import (
+    DeterministicFakeReckoningProvider,
+    IdentifierFactory,
+    InMemoryReckoningRepository,
+    Reckoning,
+    ReckoningProvider,
+    ReckoningRepository,
+    UuidIdentifierFactory,
+)
+
 MessageRole = Literal["user", "assistant"]
 PromptLayerName = Literal[
     "protected_product_contract",
@@ -101,6 +111,13 @@ class ApplicationDependencies:
     response_policy: ProtectedResponsePolicy = field(
         default_factory=lambda: ProtectedResponsePolicy()
     )
+    reckoning_provider: ReckoningProvider = field(
+        default_factory=DeterministicFakeReckoningProvider
+    )
+    reckoning_repository: ReckoningRepository = field(
+        default_factory=InMemoryReckoningRepository
+    )
+    identifiers: IdentifierFactory = field(default_factory=UuidIdentifierFactory)
 
 
 class ProtectedResponsePolicy:
@@ -195,6 +212,24 @@ class ReckoningApplication:
 
     def open_session(self) -> tuple[Message, ...]:
         return self._dependencies.storage.list_messages()
+
+    def start_reckoning(self, text: str) -> Reckoning:
+        source_input = text.strip()
+        if not source_input:
+            raise ValueError("A situation cannot be empty.")
+
+        draft = self._dependencies.reckoning_provider.reckon(source_input)
+        draft.validate()
+        reckoning = Reckoning(
+            id=self._dependencies.identifiers.new(),
+            version=1,
+            status="proposed",
+            created_at=self._dependencies.clock.now(),
+            source_input=source_input,
+            draft=draft,
+        )
+        self._dependencies.reckoning_repository.save(reckoning)
+        return reckoning
 
     def _build_prompt_stack(
         self, user_message: str, available_connectors: tuple[str, ...]
