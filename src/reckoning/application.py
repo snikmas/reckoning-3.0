@@ -19,6 +19,7 @@ from reckoning.continuity import (
     UuidIdentifierFactory,
     WhyView,
 )
+from reckoning.providers import ProviderFailure, ProviderResponse, ProviderUsage
 
 MessageRole = Literal["user", "assistant"]
 PromptLayerName = Literal[
@@ -90,7 +91,7 @@ class Clock(Protocol):
 
 
 class ModelProvider(Protocol):
-    def respond(self, request: ModelRequest) -> str: ...
+    def respond(self, request: ModelRequest) -> str | ProviderResponse: ...
 
 
 class ConnectorRegistry(Protocol):
@@ -103,6 +104,31 @@ class ConversationStorage(Protocol):
     ) -> Message: ...
 
     def list_messages(self) -> tuple[Message, ...]: ...
+
+
+ModelRunStatus = Literal["succeeded", "failed", "limited"]
+
+
+@dataclass(frozen=True)
+class ModelRunRecord:
+    id: str
+    requested_at: datetime
+    status: ModelRunStatus
+    provider: str
+    model: str
+    model_calls: int
+    latency_ms: int
+    retries: int
+    input_tokens: int
+    output_tokens: int
+    billable_units: int
+    failure: str | None = None
+
+
+class ModelRunRepository(Protocol):
+    def save_run(self, run: ModelRunRecord) -> None: ...
+
+    def list_runs(self) -> tuple[ModelRunRecord, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -124,6 +150,9 @@ class ApplicationDependencies:
         default_factory=InMemoryReckoningRepository
     )
     identifiers: IdentifierFactory = field(default_factory=UuidIdentifierFactory)
+    model_runs: ModelRunRepository = field(
+        default_factory=lambda: InMemoryModelRunRepository()
+    )
 
 
 class ProtectedResponsePolicy:
@@ -196,28 +225,73 @@ class ReckoningApplication:
             response = immediate_danger_response
         else:
             available_connectors = self._dependencies.connectors.available_names()
-            response = self._dependencies.response_policy.apply(
-                self._dependencies.model.respond(
-                    ModelRequest(
-                        user_message=user_message,
-                        history=self._dependencies.storage.list_messages(),
-                        requested_at=requested_at,
-                        placement=self._dependencies.placement,
-                        available_connectors=available_connectors,
-                        prompt_stack=self._build_prompt_stack(
-                            user_message, available_connectors
-                        ),
-                    )
-                ).strip()
+            request = ModelRequest(
+                user_message=user_message,
+                history=self._dependencies.storage.list_messages(),
+                requested_at=requested_at,
+                placement=self._dependencies.placement,
+                available_connectors=available_connectors,
+                prompt_stack=self._build_prompt_stack(
+                    user_message, available_connectors
+                ),
             )
-        if not response:
-            raise RuntimeError("The model provider returned an empty response.")
+            try:
+                provider_result = self._normalize_provider_response(
+                    self._dependencies.model.respond(request)
+                )
+            except ProviderFailure as error:
+                self._dependencies.model_runs.save_run(
+                    ModelRunRecord(
+                        id=self._dependencies.identifiers.new(),
+                        requested_at=requested_at,
+                        status="failed",
+                        provider=error.provider,
+                        model=error.model,
+                        model_calls=error.model_calls,
+                        latency_ms=error.latency_ms,
+                        retries=error.retries,
+                        input_tokens=0,
+                        output_tokens=0,
+                        billable_units=0,
+                        failure=str(error),
+                    )
+                )
+                self._dependencies.storage.append("user", user_message, requested_at)
+                raise RuntimeError(
+                    f"The {error.provider} run failed. {error}"
+                ) from error
+            proposed_response = provider_result.content.strip()
+            if not proposed_response:
+                self._dependencies.model_runs.save_run(
+                    self._model_run_record(
+                        provider_result,
+                        requested_at=requested_at,
+                        status="failed",
+                        failure="The model provider returned an empty response.",
+                    )
+                )
+                self._dependencies.storage.append("user", user_message, requested_at)
+                raise RuntimeError("The model provider returned an empty response.")
+            response = self._dependencies.response_policy.apply(proposed_response)
+            run_status: ModelRunStatus = (
+                "limited" if response != proposed_response else "succeeded"
+            )
+            self._dependencies.model_runs.save_run(
+                self._model_run_record(
+                    provider_result,
+                    requested_at=requested_at,
+                    status=run_status,
+                )
+            )
 
         self._dependencies.storage.append("user", user_message, requested_at)
         return self._dependencies.storage.append("assistant", response, requested_at)
 
     def open_session(self) -> tuple[Message, ...]:
         return self._dependencies.storage.list_messages()
+
+    def inspect_model_runs(self) -> tuple[ModelRunRecord, ...]:
+        return self._dependencies.model_runs.list_runs()
 
     def start_reckoning(self, text: str) -> Reckoning:
         source_input = text.strip()
@@ -417,6 +491,45 @@ class ReckoningApplication:
             )
         )
 
+    @staticmethod
+    def _normalize_provider_response(
+        response: str | ProviderResponse,
+    ) -> ProviderResponse:
+        if isinstance(response, ProviderResponse):
+            return response
+        return ProviderResponse(
+            content=response,
+            provider="fake",
+            model="deterministic-fake",
+            model_calls=1,
+            latency_ms=0,
+            retries=0,
+            usage=ProviderUsage(),
+        )
+
+    def _model_run_record(
+        self,
+        response: ProviderResponse,
+        *,
+        requested_at: datetime,
+        status: ModelRunStatus,
+        failure: str | None = None,
+    ) -> ModelRunRecord:
+        return ModelRunRecord(
+            id=self._dependencies.identifiers.new(),
+            requested_at=requested_at,
+            status=status,
+            provider=response.provider,
+            model=response.model,
+            model_calls=response.model_calls,
+            latency_ms=response.latency_ms,
+            retries=response.retries,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            billable_units=response.usage.total_tokens,
+            failure=failure,
+        )
+
 
 class SystemClock:
     def now(self) -> datetime:
@@ -453,16 +566,42 @@ class InMemoryConversationStorage:
         return tuple(self._messages)
 
 
-def create_local_application(data_path: Path | None = None) -> ReckoningApplication:
+class InMemoryModelRunRepository:
+    def __init__(self) -> None:
+        self._runs: list[ModelRunRecord] = []
+
+    def save_run(self, run: ModelRunRecord) -> None:
+        self._runs.append(run)
+
+    def list_runs(self) -> tuple[ModelRunRecord, ...]:
+        return tuple(self._runs)
+
+
+def create_local_application(
+    data_path: Path | None = None,
+    *,
+    provider_name: str = "fake",
+    deepseek_api_key: str | None = None,
+    deepseek_model: str = "deepseek-v4-flash",
+) -> ReckoningApplication:
     from reckoning.persistence import JsonFileReckoningRepository
+    from reckoning.providers import DeepSeekModelProvider
 
     continuity_path = data_path or (
         Path.home() / ".local" / "state" / "reckoning" / "continuity.json"
     )
+    if provider_name == "fake":
+        model: ModelProvider = DeterministicFakeModel()
+    elif provider_name == "deepseek":
+        model = DeepSeekModelProvider(
+            deepseek_api_key or "", model=deepseek_model
+        )
+    else:
+        raise ValueError(f"Unsupported model provider: {provider_name}")
     return ReckoningApplication(
         ApplicationDependencies(
             clock=SystemClock(),
-            model=DeterministicFakeModel(),
+            model=model,
             placement=PlacementState(
                 processing_location="local",
                 storage_location="local",

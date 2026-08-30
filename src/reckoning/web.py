@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from html import escape
+import os
 from typing import Callable, Iterable
 from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
@@ -33,7 +34,7 @@ class ReckoningWebApplication:
         if method == "POST" and path == "/messages":
             try:
                 self._application.send_message(self._read_message(environ))
-            except ValueError as error:
+            except (ValueError, RuntimeError) as error:
                 return self._html_response(
                     start_response,
                     "400 Bad Request",
@@ -141,9 +142,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run Reckoning's local web interface.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
+    parser.add_argument("--provider", choices=("fake", "deepseek"), default="fake")
+    parser.add_argument("--model", default="deepseek-v4-flash")
     arguments = parser.parse_args()
 
-    web = ReckoningWebApplication(create_local_application())
+    web = ReckoningWebApplication(
+        create_local_application(
+            provider_name=arguments.provider,
+            deepseek_api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            deepseek_model=arguments.model,
+        )
+    )
     with make_server(arguments.host, arguments.port, web) as server:
         print(f"Simon is available at http://{arguments.host}:{arguments.port}")
         try:
