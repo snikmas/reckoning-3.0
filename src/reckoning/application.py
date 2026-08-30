@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal, Protocol
 
 from reckoning.continuity import (
+    CheckIn,
+    DecisionResume,
     DeterministicFakeReckoningProvider,
     IdentifierFactory,
     InMemoryReckoningRepository,
@@ -345,6 +348,54 @@ class ReckoningApplication:
             record_versions=current_records,
         )
 
+    def resume_decision(self, reckoning_id: str) -> DecisionResume:
+        reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
+        if reckoning.status != "confirmed":
+            raise ValueError("Only a confirmed decision can be resumed.")
+        confirmed_records = tuple(
+            record
+            for record in reckoning.current_records
+            if record.status == "confirmed"
+        )
+        return DecisionResume(
+            decision=reckoning,
+            reasons=(
+                reckoning.draft.conflict,
+                *reckoning.draft.matters_now,
+                *reckoning.draft.maintained,
+                *reckoning.draft.parked,
+                reckoning.draft.next_step,
+            ),
+            stored_facts=(
+                *(fact.text for fact in reckoning.draft.known),
+                *(record.meaning for record in confirmed_records),
+            ),
+            missing_information=reckoning.draft.uncertainties,
+            check_ins=self._dependencies.reckoning_repository.list_check_ins(
+                reckoning.id
+            ),
+        )
+
+    def record_check_in(self, reckoning_id: str, outcome: str) -> CheckIn:
+        recorded_outcome = outcome.strip()
+        if not recorded_outcome:
+            raise ValueError("A check-in outcome cannot be empty.")
+        reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
+        if reckoning.status != "confirmed":
+            raise ValueError("A check-in requires a confirmed decision.")
+        why = self.explain_reckoning(reckoning_id)
+        check_in = CheckIn(
+            id=self._dependencies.identifiers.new(),
+            decision_id=reckoning.id,
+            occurred_at=self._dependencies.clock.now(),
+            outcome=recorded_outcome,
+            supporting_evidence_ids=tuple(
+                evidence.id for evidence in why.evidence
+            ),
+        )
+        self._dependencies.reckoning_repository.save_check_in(check_in)
+        return check_in
+
     def _build_prompt_stack(
         self, user_message: str, available_connectors: tuple[str, ...]
     ) -> PromptStack:
@@ -402,7 +453,12 @@ class InMemoryConversationStorage:
         return tuple(self._messages)
 
 
-def create_local_application() -> ReckoningApplication:
+def create_local_application(data_path: Path | None = None) -> ReckoningApplication:
+    from reckoning.persistence import JsonFileReckoningRepository
+
+    continuity_path = data_path or (
+        Path.home() / ".local" / "state" / "reckoning" / "continuity.json"
+    )
     return ReckoningApplication(
         ApplicationDependencies(
             clock=SystemClock(),
@@ -414,5 +470,6 @@ def create_local_application() -> ReckoningApplication:
             ),
             connectors=NoConnectors(),
             storage=InMemoryConversationStorage(),
+            reckoning_repository=JsonFileReckoningRepository(continuity_path),
         )
     )

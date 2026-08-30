@@ -129,6 +129,24 @@ class WhyView:
     record_versions: tuple[PersonalRecordVersion, ...]
 
 
+@dataclass(frozen=True)
+class CheckIn:
+    id: str
+    decision_id: str
+    occurred_at: datetime
+    outcome: str
+    supporting_evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DecisionResume:
+    decision: Reckoning
+    reasons: tuple[str, ...]
+    stored_facts: tuple[str, ...]
+    missing_information: tuple[str, ...]
+    check_ins: tuple[CheckIn, ...]
+
+
 class ReckoningProvider(Protocol):
     def reckon(self, unstructured_input: str) -> ReckoningDraft: ...
 
@@ -137,6 +155,10 @@ class ReckoningRepository(Protocol):
     def save(self, reckoning: Reckoning) -> None: ...
 
     def get(self, reckoning_id: str) -> Reckoning: ...
+
+    def save_check_in(self, check_in: CheckIn) -> None: ...
+
+    def list_check_ins(self, decision_id: str) -> tuple[CheckIn, ...]: ...
 
 
 class IdentifierFactory(Protocol):
@@ -151,6 +173,7 @@ class UuidIdentifierFactory:
 class InMemoryReckoningRepository:
     def __init__(self) -> None:
         self._reckonings: dict[str, Reckoning] = {}
+        self._check_ins: dict[str, CheckIn] = {}
 
     def save(self, reckoning: Reckoning) -> None:
         self._reckonings[reckoning.id] = reckoning
@@ -160,6 +183,16 @@ class InMemoryReckoningRepository:
             return self._reckonings[reckoning_id]
         except KeyError as error:
             raise KeyError(f"Unknown reckoning: {reckoning_id}") from error
+
+    def save_check_in(self, check_in: CheckIn) -> None:
+        self._check_ins[check_in.id] = check_in
+
+    def list_check_ins(self, decision_id: str) -> tuple[CheckIn, ...]:
+        return tuple(
+            check_in
+            for check_in in self._check_ins.values()
+            if check_in.decision_id == decision_id
+        )
 
 
 class DeterministicFakeReckoningProvider:
