@@ -114,11 +114,30 @@ def test_confirmed_decision_resumes_after_restart_and_keeps_outcome(
         state_path,
         decided_at,
         FirstDecisionProvider(),
-        SequenceIdentifiers("reckoning-1", "record-1"),
+        SequenceIdentifiers(
+            "reckoning-1", "record-1", "correction-evidence-1"
+        ),
     )
     reckoning = first_application.start_reckoning(
         "The exam is fixed, but I do not want the project to disappear."
     )
+    corrected = first_application.correct_personal_record(
+        reckoning.id,
+        reckoning.current_records[0].record_id,
+        "Protect the exam baseline while preserving one project block.",
+    )
+    why = first_application.explain_reckoning(reckoning.id)
+
+    assert corrected.current_records[0].status == "proposed"
+    assert corrected.current_records[0].version == 2
+    assert [(record.record_id, record.version) for record in why.record_versions] == [
+        ("record-1", 2)
+    ]
+    assert {evidence.id for evidence in why.evidence} == {
+        "message-evidence",
+        "correction-evidence-1",
+    }
+
     first_application.confirm_reckoning(reckoning.id)
 
     restarted = build_application(
@@ -140,7 +159,7 @@ def test_confirmed_decision_resumes_after_restart_and_keeps_outcome(
     )
     assert resumed.stored_facts == (
         "The exam is the nearest fixed commitment.",
-        "Protect the exam baseline and maintain one project block.",
+        "Protect the exam baseline while preserving one project block.",
     )
     assert resumed.missing_information == (
         "The result of the next practice exam is still missing.",
@@ -157,7 +176,10 @@ def test_confirmed_decision_resumes_after_restart_and_keeps_outcome(
     assert check_in.occurred_at == datetime(
         2026, 9, 6, 15, 0, tzinfo=timezone.utc
     )
-    assert check_in.supporting_evidence_ids == ("message-evidence",)
+    assert check_in.supporting_evidence_ids == (
+        "message-evidence",
+        "correction-evidence-1",
+    )
 
     restarted_again = build_application(
         state_path,
