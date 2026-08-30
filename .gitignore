@@ -1,0 +1,23 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+.coverage
+htmlcov/
+
+# Local-only instructions, notes, planning, and research
+/AGENTS.md
+/CONTEXT.md
+/.private/
+/notes/
+/docs/agents/
+/docs/adr/
+/docs/research/
+/docs/product-grilling-*.md
+/docs/product-spec.md
+/scripts/check_grilling_questionnaire.sh
+/scripts/check_product_spec.sh
+/scripts/publish_product_tickets.py
