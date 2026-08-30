@@ -15,6 +15,7 @@ from reckoning.continuity import (
     PersonalRecordVersion,
     Reckoning,
     ReckoningProvider,
+    ReckoningProviderResult,
     ReckoningRepository,
     UuidIdentifierFactory,
     WhyView,
@@ -298,8 +299,58 @@ class ReckoningApplication:
         if not source_input:
             raise ValueError("A situation cannot be empty.")
 
-        draft = self._dependencies.reckoning_provider.reckon(source_input)
-        draft.validate()
+        requested_at = self._dependencies.clock.now()
+        try:
+            provider_result = self._dependencies.reckoning_provider.reckon(
+                source_input
+            )
+        except ProviderFailure as error:
+            self._dependencies.model_runs.save_run(
+                self._failed_run_record(error, requested_at=requested_at)
+            )
+            raise RuntimeError(
+                f"The {error.provider} reckoning run failed. {error}"
+            ) from error
+        observed_result: ReckoningProviderResult | None = None
+        if isinstance(provider_result, ReckoningProviderResult):
+            draft = provider_result.draft
+            observed_result = provider_result
+        else:
+            draft = provider_result
+        try:
+            draft.validate()
+        except RuntimeError:
+            if observed_result is not None:
+                self._dependencies.model_runs.save_run(
+                    self._reckoning_run_record(
+                        observed_result,
+                        requested_at=requested_at,
+                        status="failed",
+                        failure="The provider returned an invalid reckoning.",
+                    )
+                )
+            raise
+        if observed_result is not None:
+            rendered_draft = repr(draft)
+            if self._dependencies.response_policy.apply(rendered_draft) != rendered_draft:
+                self._dependencies.model_runs.save_run(
+                    self._reckoning_run_record(
+                        observed_result,
+                        requested_at=requested_at,
+                        status="limited",
+                        failure="The structured reckoning crossed a protected boundary.",
+                    )
+                )
+                raise RuntimeError(
+                    "The provider reckoning crossed a protected boundary."
+                )
+            self._dependencies.model_runs.save_run(
+                self._reckoning_run_record(
+                    observed_result,
+                    requested_at=requested_at,
+                    status="succeeded",
+                )
+            )
         created_at = self._dependencies.clock.now()
         reckoning_id = self._dependencies.identifiers.new()
         record_versions = tuple(
@@ -530,6 +581,47 @@ class ReckoningApplication:
             failure=failure,
         )
 
+    def _reckoning_run_record(
+        self,
+        result: ReckoningProviderResult,
+        *,
+        requested_at: datetime,
+        status: ModelRunStatus,
+        failure: str | None = None,
+    ) -> ModelRunRecord:
+        return ModelRunRecord(
+            id=self._dependencies.identifiers.new(),
+            requested_at=requested_at,
+            status=status,
+            provider=result.provider,
+            model=result.model,
+            model_calls=result.model_calls,
+            latency_ms=result.latency_ms,
+            retries=result.retries,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            billable_units=result.billable_units,
+            failure=failure,
+        )
+
+    def _failed_run_record(
+        self, error: ProviderFailure, *, requested_at: datetime
+    ) -> ModelRunRecord:
+        return ModelRunRecord(
+            id=self._dependencies.identifiers.new(),
+            requested_at=requested_at,
+            status="failed",
+            provider=error.provider,
+            model=error.model,
+            model_calls=error.model_calls,
+            latency_ms=error.latency_ms,
+            retries=error.retries,
+            input_tokens=0,
+            output_tokens=0,
+            billable_units=0,
+            failure=str(error),
+        )
+
 
 class SystemClock:
     def now(self) -> datetime:
@@ -585,17 +677,22 @@ def create_local_application(
     deepseek_model: str = "deepseek-v4-flash",
 ) -> ReckoningApplication:
     from reckoning.persistence import JsonFileReckoningRepository
-    from reckoning.providers import DeepSeekModelProvider
+    from reckoning.providers import (
+        DeepSeekModelProvider,
+        DeepSeekReckoningProvider,
+    )
 
     continuity_path = data_path or (
         Path.home() / ".local" / "state" / "reckoning" / "continuity.json"
     )
     if provider_name == "fake":
         model: ModelProvider = DeterministicFakeModel()
+        reckoning_provider: ReckoningProvider = DeterministicFakeReckoningProvider()
     elif provider_name == "deepseek":
         model = DeepSeekModelProvider(
             deepseek_api_key or "", model=deepseek_model
         )
+        reckoning_provider = DeepSeekReckoningProvider(model)
     else:
         raise ValueError(f"Unsupported model provider: {provider_name}")
     return ReckoningApplication(
@@ -609,6 +706,7 @@ def create_local_application(
             ),
             connectors=NoConnectors(),
             storage=InMemoryConversationStorage(),
+            reckoning_provider=reckoning_provider,
             reckoning_repository=JsonFileReckoningRepository(continuity_path),
         )
     )

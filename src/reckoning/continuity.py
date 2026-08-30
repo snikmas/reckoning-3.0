@@ -105,6 +105,19 @@ class ReckoningDraft:
 
 
 @dataclass(frozen=True)
+class ReckoningProviderResult:
+    draft: ReckoningDraft
+    provider: str
+    model: str
+    model_calls: int
+    latency_ms: int
+    retries: int
+    input_tokens: int
+    output_tokens: int
+    billable_units: int
+
+
+@dataclass(frozen=True)
 class Reckoning:
     id: str
     version: int
@@ -148,7 +161,9 @@ class DecisionResume:
 
 
 class ReckoningProvider(Protocol):
-    def reckon(self, unstructured_input: str) -> ReckoningDraft: ...
+    def reckon(
+        self, unstructured_input: str
+    ) -> ReckoningDraft | ReckoningProviderResult: ...
 
 
 class ReckoningRepository(Protocol):
