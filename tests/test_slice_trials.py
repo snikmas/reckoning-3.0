@@ -17,7 +17,7 @@ def test_slice_stays_unaccepted_until_automated_and_real_use_evidence_exist(
     path = tmp_path / "trials.json"
     instant = datetime(2026, 8, 30, 17, 0, tzinfo=timezone.utc)
     recorder = TrialRecorder(JsonFileTrialRepository(path))
-    trial = recorder.start("trial-1", "continuity-with-deepseek", instant)
+    trial = recorder.start("trial-1", "continuity-with-orcarouter", instant)
 
     trial = recorder.record(
         trial.id,

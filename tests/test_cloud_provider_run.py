@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from io import BytesIO
 import json
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -14,7 +15,7 @@ from reckoning.application import (
     ProtectedResponsePolicy,
     ReckoningApplication,
 )
-from reckoning.providers import DeepSeekModelProvider, ProviderResponse, ProviderUsage
+from reckoning.providers import OrcaRouterModelProvider, ProviderResponse, ProviderUsage
 
 
 class FixedClock:
@@ -38,7 +39,7 @@ class SequenceTimer:
         return next(self._values)
 
 
-def build_application(provider: DeepSeekModelProvider) -> ReckoningApplication:
+def build_application(provider: OrcaRouterModelProvider) -> ReckoningApplication:
     return ReckoningApplication(
         ApplicationDependencies(
             clock=FixedClock(),
@@ -51,7 +52,7 @@ def build_application(provider: DeepSeekModelProvider) -> ReckoningApplication:
     )
 
 
-def test_deepseek_uses_same_boundary_and_records_billable_units() -> None:
+def test_orcarouter_uses_same_boundary_and_records_billable_units() -> None:
     seen_authorization = ""
 
     def transport(request: object, timeout: float) -> bytes:
@@ -59,14 +60,15 @@ def test_deepseek_uses_same_boundary_and_records_billable_units() -> None:
         seen_authorization = request.headers["Authorization"]
         assert timeout == 10.0
         payload = json.loads(request.data)
-        assert payload["model"] == "deepseek-v4-flash"
+        assert request.full_url == "https://api.orcarouter.ai/v1/chat/completions"
+        assert payload["model"] == "orcarouter/auto"
         assert payload["messages"][-1] == {
             "role": "user",
             "content": "Compare these options.",
         }
         return json.dumps(
             {
-                "model": "deepseek-v4-flash",
+                "model": "orcarouter/auto",
                 "choices": [{"message": {"content": "Choose the smaller proof."}}],
                 "usage": {
                     "prompt_tokens": 120,
@@ -77,7 +79,7 @@ def test_deepseek_uses_same_boundary_and_records_billable_units() -> None:
         ).encode()
 
     application = build_application(
-        DeepSeekModelProvider(
+        OrcaRouterModelProvider(
             "secret-value",
             timeout_seconds=10.0,
             transport=transport,
@@ -93,8 +95,8 @@ def test_deepseek_uses_same_boundary_and_records_billable_units() -> None:
         "id": "run-1",
         "requested_at": datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc),
         "status": "succeeded",
-        "provider": "deepseek",
-        "model": "deepseek-v4-flash",
+        "provider": "orcarouter",
+        "model": "orcarouter/auto",
         "model_calls": 1,
         "latency_ms": 245,
         "retries": 0,
@@ -114,7 +116,7 @@ def test_provider_failure_is_recorded_and_never_becomes_a_completed_answer() -> 
         raise URLError("offline")
 
     application = build_application(
-        DeepSeekModelProvider(
+        OrcaRouterModelProvider(
             "secret-value",
             max_retries=1,
             transport=failing_transport,
@@ -130,8 +132,44 @@ def test_provider_failure_is_recorded_and_never_becomes_a_completed_answer() -> 
     assert run.status == "failed"
     assert run.model_calls == 2
     assert run.retries == 1
-    assert run.failure == "DeepSeek could not be reached: offline"
+    assert run.failure == "OrcaRouter could not be reached: offline"
     assert [message.role for message in application.open_session()] == ["user"]
+
+
+def test_provider_reports_safe_orcarouter_error_code_without_echoing_key() -> None:
+    def denied_transport(request: object, timeout: float) -> bytes:
+        body = json.dumps(
+            {
+                "error": {
+                    "type": "orcarouter_api_error",
+                    "code": "model_access_denied",
+                    "message": "The key secret-value cannot use orcarouter/auto.",
+                }
+            }
+        ).encode()
+        raise HTTPError(request.full_url, 403, "Forbidden", {}, BytesIO(body))
+
+    application = build_application(
+        OrcaRouterModelProvider(
+            "secret-value",
+            transport=denied_transport,
+            timer=SequenceTimer(1.0, 1.1),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="model_access_denied") as error:
+        application.send_message("Do the work.")
+
+    assert "secret-value" not in str(error.value)
+    assert "[redacted]" in str(error.value)
+
+
+def test_orcarouter_rejects_a_base_url_that_could_receive_the_key() -> None:
+    with pytest.raises(ValueError, match="official.*api.orcarouter.ai"):
+        OrcaRouterModelProvider(
+            "secret-value",
+            base_url="https://attacker.invalid/v1",
+        )
 
 
 def test_protected_boundary_records_a_limited_run() -> None:
@@ -139,8 +177,8 @@ def test_protected_boundary_records_a_limited_run() -> None:
         def respond(self, request: object) -> ProviderResponse:
             return ProviderResponse(
                 "You are worthless.",
-                "deepseek",
-                "deepseek-v4-flash",
+                "orcarouter",
+                "orcarouter/auto",
                 1,
                 10,
                 0,

@@ -53,7 +53,7 @@ class SliceTrial:
             for item in self.evidence
             if item.kind == "real_use" and item.metric is not None
         }
-        missing = [
+        missing: list[str] = [
             metric for metric in REQUIRED_REAL_USE_METRICS
             if metric not in recorded_real_use
         ]

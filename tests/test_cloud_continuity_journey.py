@@ -12,7 +12,7 @@ from reckoning.application import (
     ReckoningApplication,
 )
 from reckoning.persistence import JsonFileReckoningRepository
-from reckoning.providers import DeepSeekModelProvider, DeepSeekReckoningProvider
+from reckoning.providers import OrcaRouterModelProvider, OrcaRouterReckoningProvider
 
 
 class AdvancingClock:
@@ -33,7 +33,7 @@ class SequenceIdentifiers:
         return next(self._values)
 
 
-def test_deepseek_drives_first_reckoning_then_durable_journey_continues(
+def test_orcarouter_drives_first_reckoning_then_durable_journey_continues(
     tmp_path: Path,
 ) -> None:
     payload = {
@@ -69,7 +69,7 @@ def test_deepseek_drives_first_reckoning_then_durable_journey_continues(
         assert request_payload["messages"][-1]["content"].startswith("I need to")
         return json.dumps(
             {
-                "model": "deepseek-v4-flash",
+                "model": "orcarouter/auto",
                 "choices": [{"message": {"content": json.dumps(payload)}}],
                 "usage": {
                     "prompt_tokens": 200,
@@ -79,7 +79,7 @@ def test_deepseek_drives_first_reckoning_then_durable_journey_continues(
             }
         ).encode()
 
-    model = DeepSeekModelProvider("secret", transport=transport)
+    model = OrcaRouterModelProvider("secret", transport=transport)
     repository_path = tmp_path / "continuity.json"
     clock = AdvancingClock(datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc))
     application = ReckoningApplication(
@@ -89,7 +89,7 @@ def test_deepseek_drives_first_reckoning_then_durable_journey_continues(
             placement=PlacementState("local", "local", True),
             connectors=NoConnectors(),
             storage=InMemoryConversationStorage(),
-            reckoning_provider=DeepSeekReckoningProvider(model),
+            reckoning_provider=OrcaRouterReckoningProvider(model),
             reckoning_repository=JsonFileReckoningRepository(repository_path),
             identifiers=SequenceIdentifiers(
                 "run-1",
@@ -112,7 +112,7 @@ def test_deepseek_drives_first_reckoning_then_durable_journey_continues(
 
     run = application.inspect_model_runs()[0]
     assert run.status == "succeeded"
-    assert run.provider == "deepseek"
+    assert run.provider == "orcarouter"
     assert run.billable_units == 300
     assert corrected.current_records[0].version == 2
 
