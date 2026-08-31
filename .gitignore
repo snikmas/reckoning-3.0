@@ -7,6 +7,8 @@ __pycache__/
 !.env.example
 .coverage
 htmlcov/
+build/
+*.egg-info/
 
 # Local-only instructions, notes, planning, and research
 /AGENTS.md

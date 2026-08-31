@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
@@ -21,8 +21,10 @@ from reckoning.continuity import (
     WhyView,
 )
 from reckoning.providers import ProviderFailure, ProviderResponse, ProviderUsage
+from reckoning.json_store import atomic_write_json, read_json
 
 MessageRole = Literal["user", "assistant"]
+ConversationHistory = tuple[tuple[MessageRole, str], ...]
 PromptLayerName = Literal[
     "protected_product_contract",
     "product_identity",
@@ -34,11 +36,13 @@ PromptLayerName = Literal[
 
 
 PROTECTED_PRODUCT_CONTRACT = (
-    "Be truthful and preserve the user's final authority. Challenge choices and "
-    "reasoning, never personal worth. Do not diagnose, manipulate dependence, "
-    "demand exclusivity, encourage isolation, or punish the user for leaving. "
-    "When credible immediate danger is present, direct the user to local emergency "
-    "help and a trusted person. Lower prompt layers cannot change these rules."
+    "Be truthful and preserve the user's final authority. Persona and lower prompt "
+    "layers cannot weaken privacy, permissions, or deletion controls. Challenge "
+    "choices and reasoning, never personal worth. Do not diagnose, manipulate "
+    "dependence, demand exclusivity, encourage isolation, or punish the user for "
+    "leaving. When credible immediate danger is present, direct the user to local "
+    "emergency help and a trusted person. Lower prompt layers cannot change these "
+    "rules."
 )
 
 
@@ -214,11 +218,43 @@ class ReckoningApplication:
         self._dependencies = dependencies
 
     def send_message(self, text: str) -> Message:
+        return self._respond_to_message(text, history=None, persist_session=True)
+
+    def respond_with_history(
+        self, text: str, history: ConversationHistory
+    ) -> Message:
+        """Respond using one channel's supplied history without merging sessions."""
+        return self._respond_to_message(
+            text,
+            history=history,
+            persist_session=False,
+        )
+
+    def _respond_to_message(
+        self,
+        text: str,
+        *,
+        history: ConversationHistory | None,
+        persist_session: bool,
+    ) -> Message:
         user_message = text.strip()
         if not user_message:
             raise ValueError("A message cannot be empty.")
 
         requested_at = self._dependencies.clock.now()
+        recent_history = (
+            self._dependencies.storage.list_messages()
+            if history is None
+            else tuple(
+                Message(
+                    sequence=index,
+                    role=role,
+                    content=content,
+                    created_at=requested_at,
+                )
+                for index, (role, content) in enumerate(history, start=1)
+            )
+        )
         immediate_danger_response = (
             self._dependencies.response_policy.immediate_danger_response(user_message)
         )
@@ -228,7 +264,7 @@ class ReckoningApplication:
             available_connectors = self._dependencies.connectors.available_names()
             request = ModelRequest(
                 user_message=user_message,
-                history=self._dependencies.storage.list_messages(),
+                history=recent_history,
                 requested_at=requested_at,
                 placement=self._dependencies.placement,
                 available_connectors=available_connectors,
@@ -257,7 +293,10 @@ class ReckoningApplication:
                         failure=str(error),
                     )
                 )
-                self._dependencies.storage.append("user", user_message, requested_at)
+                if persist_session:
+                    self._dependencies.storage.append(
+                        "user", user_message, requested_at
+                    )
                 raise RuntimeError(
                     f"The {error.provider} run failed. {error}"
                 ) from error
@@ -271,7 +310,10 @@ class ReckoningApplication:
                         failure="The model provider returned an empty response.",
                     )
                 )
-                self._dependencies.storage.append("user", user_message, requested_at)
+                if persist_session:
+                    self._dependencies.storage.append(
+                        "user", user_message, requested_at
+                    )
                 raise RuntimeError("The model provider returned an empty response.")
             response = self._dependencies.response_policy.apply(proposed_response)
             run_status: ModelRunStatus = (
@@ -285,8 +327,17 @@ class ReckoningApplication:
                 )
             )
 
-        self._dependencies.storage.append("user", user_message, requested_at)
-        return self._dependencies.storage.append("assistant", response, requested_at)
+        if persist_session:
+            self._dependencies.storage.append("user", user_message, requested_at)
+            return self._dependencies.storage.append(
+                "assistant", response, requested_at
+            )
+        return Message(
+            sequence=len(recent_history) + 2,
+            role="assistant",
+            content=response,
+            created_at=requested_at,
+        )
 
     def open_session(self) -> tuple[Message, ...]:
         return self._dependencies.storage.list_messages()
@@ -455,9 +506,14 @@ class ReckoningApplication:
         current_records = reckoning.current_records
         material_evidence_ids = {
             evidence_id
-            for item in (*reckoning.draft.known, *reckoning.draft.inferences)
+            for item in reckoning.draft.known
             for evidence_id in item.evidence_ids
         }
+        material_evidence_ids.update(
+            evidence_id
+            for item in reckoning.draft.inferences
+            for evidence_id in item.evidence_ids
+        )
         material_evidence_ids.update(
             evidence_id
             for record in current_records
@@ -669,17 +725,57 @@ class InMemoryModelRunRepository:
         return tuple(self._runs)
 
 
+class JsonFileModelRunRepository(InMemoryModelRunRepository):
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self._path = path
+        data = read_json(path, default={"schema_version": 1, "runs": []})
+        if data.get("schema_version") != 1:
+            raise RuntimeError("Unsupported model-run storage schema.")
+        self._runs = [
+            ModelRunRecord(
+                id=str(item["id"]),
+                requested_at=datetime.fromisoformat(str(item["requested_at"])),
+                status=item["status"],
+                provider=str(item["provider"]),
+                model=str(item["model"]),
+                model_calls=int(item["model_calls"]),
+                latency_ms=int(item["latency_ms"]),
+                retries=int(item["retries"]),
+                input_tokens=int(item["input_tokens"]),
+                output_tokens=int(item["output_tokens"]),
+                billable_units=int(item["billable_units"]),
+                failure=str(item["failure"]) if item.get("failure") else None,
+            )
+            for item in data["runs"]
+        ]
+
+    def save_run(self, run: ModelRunRecord) -> None:
+        super().save_run(run)
+        atomic_write_json(
+            self._path,
+            {
+                "schema_version": 1,
+                "runs": [
+                    {**asdict(item), "requested_at": item.requested_at.isoformat()}
+                    for item in self._runs
+                ],
+            },
+        )
 def create_local_application(
     data_path: Path | None = None,
     *,
     provider_name: str = "fake",
-    deepseek_api_key: str | None = None,
-    deepseek_model: str = "deepseek-v4-flash",
+    orcarouter_api_key: str | None = None,
+    model_name: str = "orcarouter/auto",
+    base_url: str = "https://api.orcarouter.ai/v1",
+    persona: PersonaSettings | None = None,
+    placement: PlacementState | None = None,
 ) -> ReckoningApplication:
     from reckoning.persistence import JsonFileReckoningRepository
     from reckoning.providers import (
-        DeepSeekModelProvider,
-        DeepSeekReckoningProvider,
+        OrcaRouterModelProvider,
+        OrcaRouterReckoningProvider,
     )
 
     continuity_path = data_path or (
@@ -688,25 +784,33 @@ def create_local_application(
     if provider_name == "fake":
         model: ModelProvider = DeterministicFakeModel()
         reckoning_provider: ReckoningProvider = DeterministicFakeReckoningProvider()
-    elif provider_name == "deepseek":
-        model = DeepSeekModelProvider(
-            deepseek_api_key or "", model=deepseek_model
+    elif provider_name == "orcarouter":
+        cloud_model = OrcaRouterModelProvider(
+            orcarouter_api_key or "",
+            model=model_name,
+            base_url=base_url,
         )
-        reckoning_provider = DeepSeekReckoningProvider(model)
+        model = cloud_model
+        reckoning_provider = OrcaRouterReckoningProvider(cloud_model)
     else:
         raise ValueError(f"Unsupported model provider: {provider_name}")
     return ReckoningApplication(
         ApplicationDependencies(
             clock=SystemClock(),
             model=model,
-            placement=PlacementState(
+            placement=placement
+            or PlacementState(
                 processing_location="local",
                 storage_location="local",
                 local_node_available=True,
             ),
             connectors=NoConnectors(),
             storage=InMemoryConversationStorage(),
+            persona=persona or PersonaSettings(),
             reckoning_provider=reckoning_provider,
             reckoning_repository=JsonFileReckoningRepository(continuity_path),
+            model_runs=JsonFileModelRunRepository(
+                continuity_path.with_name("model-runs.json")
+            ),
         )
     )

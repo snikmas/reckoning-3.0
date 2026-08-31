@@ -5,6 +5,7 @@ import json
 from time import monotonic
 from typing import Callable, Protocol
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from reckoning.continuity import (
@@ -56,9 +57,14 @@ class ProviderFailure(RuntimeError):
 
 
 class ModelRequestLike(Protocol):
-    user_message: str
-    history: tuple[object, ...]
-    prompt_stack: object
+    @property
+    def user_message(self) -> str: ...
+
+    @property
+    def history(self) -> tuple[object, ...]: ...
+
+    @property
+    def prompt_stack(self) -> object: ...
 
 
 Transport = Callable[[Request, float], bytes]
@@ -69,22 +75,34 @@ def _urlopen_transport(request: Request, timeout: float) -> bytes:
         return response.read()
 
 
-class DeepSeekModelProvider:
-    """Small DeepSeek Chat Completions adapter with bounded retries."""
+class OrcaRouterModelProvider:
+    """Small OrcaRouter Chat Completions adapter with bounded retries."""
 
     def __init__(
         self,
         api_key: str,
         *,
-        model: str = "deepseek-v4-flash",
-        base_url: str = "https://api.deepseek.com",
+        model: str = "orcarouter/auto",
+        base_url: str = "https://api.orcarouter.ai/v1",
         timeout_seconds: float = 60.0,
         max_retries: int = 2,
         transport: Transport = _urlopen_transport,
         timer: Callable[[], float] = monotonic,
     ) -> None:
         if not api_key.strip():
-            raise ValueError("DEEPSEEK_API_KEY is required for the DeepSeek provider.")
+            raise ValueError(
+                "ORCAROUTER_API_KEY is required for the OrcaRouter provider."
+            )
+        if not model.strip():
+            raise ValueError("MODEL cannot be empty.")
+        parsed_base_url = urlsplit(base_url)
+        if (
+            parsed_base_url.scheme != "https"
+            or parsed_base_url.hostname != "api.orcarouter.ai"
+        ):
+            raise ValueError(
+                "BASE_URL must use the official https://api.orcarouter.ai host."
+            )
         if max_retries < 0:
             raise ValueError("max_retries cannot be negative.")
         self._api_key = api_key
@@ -134,7 +152,7 @@ class DeepSeekModelProvider:
                 )
                 return ProviderResponse(
                     content=content,
-                    provider="deepseek",
+                    provider="orcarouter",
                     model=str(parsed.get("model", self._model)),
                     model_calls=model_calls,
                     latency_ms=round((self._timer() - started) * 1000),
@@ -142,24 +160,41 @@ class DeepSeekModelProvider:
                     usage=usage,
                 )
             except HTTPError as error:
-                last_error = f"DeepSeek returned HTTP {error.code}."
+                last_error = self._http_error_message(error)
                 if error.code < 500 and error.code != 429:
                     break
             except (URLError, TimeoutError) as error:
                 reason = error.reason if isinstance(error, URLError) else error
-                last_error = f"DeepSeek could not be reached: {reason}"
+                last_error = f"OrcaRouter could not be reached: {reason}"
             except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
-                last_error = "DeepSeek returned an invalid response."
+                last_error = "OrcaRouter returned an invalid response."
                 break
 
         raise ProviderFailure(
             last_error,
-            provider="deepseek",
+            provider="orcarouter",
             model=self._model,
             model_calls=model_calls,
             latency_ms=round((self._timer() - started) * 1000),
             retries=max(0, model_calls - 1),
         )
+
+    def _http_error_message(self, error: HTTPError) -> str:
+        fallback = f"OrcaRouter returned HTTP {error.code}."
+        try:
+            payload = json.loads(error.read(65_536).decode("utf-8"))
+            detail = payload.get("error", {})
+            if not isinstance(detail, dict):
+                return fallback
+            code = str(detail.get("code") or "").strip()
+            message = str(detail.get("message") or "").strip()
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return fallback
+        if not message:
+            return fallback
+        safe_message = message.replace(self._api_key, "[redacted]")[:500]
+        code_text = f" ({code})" if code else ""
+        return f"OrcaRouter returned HTTP {error.code}{code_text}: {safe_message}"
 
     @staticmethod
     def _messages(request: ModelRequestLike) -> list[dict[str, str]]:
@@ -199,7 +234,7 @@ class _ReckoningModelRequest:
     prompt_stack: _ReckoningPromptStack
 
 
-class DeepSeekReckoningProvider:
+class OrcaRouterReckoningProvider:
     """Turns one unstructured situation into the typed first reckoning."""
 
     _record_types = {
@@ -212,7 +247,7 @@ class DeepSeekReckoningProvider:
         "boundary",
     }
 
-    def __init__(self, model: DeepSeekModelProvider) -> None:
+    def __init__(self, model: OrcaRouterModelProvider) -> None:
         self._model = model
 
     def reckon(self, unstructured_input: str) -> ReckoningProviderResult:
@@ -241,7 +276,7 @@ class DeepSeekReckoningProvider:
             draft.validate()
         except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as error:
             raise ProviderFailure(
-                "DeepSeek returned an invalid structured reckoning.",
+                "OrcaRouter returned an invalid structured reckoning.",
                 provider=response.provider,
                 model=response.model,
                 model_calls=response.model_calls,

@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import re
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from reckoning.json_store import atomic_write_json, read_json
 
@@ -321,7 +321,7 @@ def _version_to_data(version: PersonalContextVersion) -> dict[str, object]:
     return data
 
 
-def _version_from_data(data: dict[str, object]) -> PersonalContextVersion:
+def _version_from_data(data: dict[str, Any]) -> PersonalContextVersion:
     return PersonalContextVersion(
         record_id=str(data["record_id"]),
         version=int(data["version"]),

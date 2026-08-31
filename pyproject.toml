@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reckoning"
+version = "0.1.0"
+description = "A local-first single-user continuity agent"
+requires-python = ">=3.13"
+dependencies = ["cryptography>=43"]
+
+[project.optional-dependencies]
+test = ["pytest>=9,<10"]
+
+[project.scripts]
+reckoning = "reckoning.web:main"
+reckoning-ops = "reckoning.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

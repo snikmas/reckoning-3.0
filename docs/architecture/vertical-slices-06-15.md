@@ -3,13 +3,15 @@
 ## Caller usage
 
 The local web adapter keeps using `ReckoningApplication.send_message`. Selecting
-DeepSeek changes the provider dependency, not the application operation or prompt
-precedence.
+OrcaRouter changes the provider dependency, not the application operation or
+prompt precedence.
 
 ```python
 application = create_local_application(
-    provider_name="deepseek",
-    deepseek_api_key=key,
+    provider_name="orcarouter",
+    orcarouter_api_key=key,
+    model_name="orcarouter/auto",
+    base_url="https://api.orcarouter.ai/v1",
 )
 message = application.send_message("Help me compare these options.")
 runs = application.inspect_model_runs()
@@ -54,7 +56,7 @@ proposal = forecasts.propose_revision(...)
 | Module | Responsibility |
 | --- | --- |
 | `application.py` | Conversation boundary, protected response policy, model run receipts |
-| `providers.py` | DeepSeek transport, retries, response validation, token usage |
+| `providers.py` | OrcaRouter transport, retries, response validation, token usage |
 | `trials.py` | Private-slice evidence and acceptance gate |
 | `personal_context.py` | Versioned context, retrieval filters, lifecycle, deletion |
 | `memory_maintenance.py` | Atomic maintenance results and review-only pattern proposals |
