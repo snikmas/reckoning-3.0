@@ -21,6 +21,7 @@ from reckoning.continuity import (
     WhyView,
 )
 from reckoning.providers import ProviderFailure, ProviderResponse, ProviderUsage
+from reckoning.external_content import ExternalContentResult
 from reckoning.json_store import atomic_write_json, read_json
 
 MessageRole = Literal["user", "assistant"]
@@ -29,6 +30,8 @@ PromptLayerName = Literal[
     "protected_product_contract",
     "product_identity",
     "persona",
+    "confirmed_context",
+    "permissions",
     "retrieved_context",
     "tools",
     "current_request",
@@ -218,7 +221,13 @@ class ReckoningApplication:
         self._dependencies = dependencies
 
     def send_message(self, text: str) -> Message:
-        return self._respond_to_message(text, history=None, persist_session=True)
+        return self._respond_to_message(
+            text,
+            history=None,
+            persist_session=True,
+            retrieved_context=None,
+            available_connectors=None,
+        )
 
     def respond_with_history(
         self, text: str, history: ConversationHistory
@@ -228,6 +237,58 @@ class ReckoningApplication:
             text,
             history=history,
             persist_session=False,
+            retrieved_context=None,
+            available_connectors=None,
+        )
+
+    def respond_with_channel_context(
+        self,
+        text: str,
+        history: ConversationHistory,
+        confirmed_records: tuple[str, ...],
+        permissions: tuple[str, ...],
+    ) -> Message:
+        """Respond with the channel's filtered shared state below protected rules."""
+        return self._respond_to_message(
+            text,
+            history=history,
+            persist_session=False,
+            retrieved_context=None,
+            available_connectors=None,
+            confirmed_records=confirmed_records,
+            permissions=permissions,
+        )
+
+    def respond_with_external_content(
+        self,
+        text: str,
+        history: ConversationHistory,
+        external_content: tuple[ExternalContentResult, ...],
+    ) -> Message:
+        """Use inspected connector content as data under protected prompt layers."""
+        for item in external_content:
+            if item.prompt_layers[:2] != (
+                "protected_product_contract",
+                "product_identity",
+            ) or "external_untrusted_data" not in item.prompt_layers:
+                raise ValueError("External content did not pass the authority boundary.")
+            if item.external_effects:
+                raise ValueError("External content cannot carry external effects.")
+        context = tuple(
+            f"UNTRUSTED EXTERNAL DATA [{item.source}]\n{item.visible_content}"
+            for item in external_content
+        )
+        allowed_tools = tuple(
+            dict.fromkeys(
+                tool for item in external_content for tool in item.allowed_tools
+            )
+        )
+        return self._respond_to_message(
+            text,
+            history=history,
+            persist_session=False,
+            retrieved_context=context,
+            available_connectors=allowed_tools,
         )
 
     def _respond_to_message(
@@ -236,6 +297,10 @@ class ReckoningApplication:
         *,
         history: ConversationHistory | None,
         persist_session: bool,
+        retrieved_context: tuple[str, ...] | None,
+        available_connectors: tuple[str, ...] | None,
+        confirmed_records: tuple[str, ...] = (),
+        permissions: tuple[str, ...] = (),
     ) -> Message:
         user_message = text.strip()
         if not user_message:
@@ -261,15 +326,23 @@ class ReckoningApplication:
         if immediate_danger_response is not None:
             response = immediate_danger_response
         else:
-            available_connectors = self._dependencies.connectors.available_names()
+            connectors = (
+                self._dependencies.connectors.available_names()
+                if available_connectors is None
+                else available_connectors
+            )
             request = ModelRequest(
                 user_message=user_message,
                 history=recent_history,
                 requested_at=requested_at,
                 placement=self._dependencies.placement,
-                available_connectors=available_connectors,
+                available_connectors=connectors,
                 prompt_stack=self._build_prompt_stack(
-                    user_message, available_connectors
+                    user_message,
+                    connectors,
+                    retrieved_context=retrieved_context,
+                    confirmed_records=confirmed_records,
+                    permissions=permissions,
                 ),
             )
             try:
@@ -578,7 +651,13 @@ class ReckoningApplication:
         return check_in
 
     def _build_prompt_stack(
-        self, user_message: str, available_connectors: tuple[str, ...]
+        self,
+        user_message: str,
+        available_connectors: tuple[str, ...],
+        *,
+        retrieved_context: tuple[str, ...] | None = None,
+        confirmed_records: tuple[str, ...] = (),
+        permissions: tuple[str, ...] = (),
     ) -> PromptStack:
         return PromptStack(
             layers=(
@@ -587,11 +666,20 @@ class ReckoningApplication:
                 ),
                 PromptLayer(
                     "product_identity",
-                    "Reckoning is one accountable personal agent. Simon owns the answer.",
+                    "Reckoning is one accountable personal agent. The selected persona "
+                    "is only its style expression and owns no memory, authority, or "
+                    "final answer.",
                 ),
                 PromptLayer("persona", self._dependencies.persona.instructions),
+                PromptLayer("confirmed_context", "\n".join(confirmed_records)),
+                PromptLayer("permissions", "\n".join(permissions)),
                 PromptLayer(
-                    "retrieved_context", "\n".join(self._dependencies.retrieved_context)
+                    "retrieved_context",
+                    "\n".join(
+                        self._dependencies.retrieved_context
+                        if retrieved_context is None
+                        else retrieved_context
+                    ),
                 ),
                 PromptLayer("tools", ", ".join(available_connectors)),
                 PromptLayer("current_request", user_message),
@@ -686,7 +774,7 @@ class SystemClock:
 
 class DeterministicFakeModel:
     def respond(self, request: ModelRequest) -> str:
-        return f'Simon received your message: "{request.user_message}"'
+        return f'Reckoning received your message: "{request.user_message}"'
 
 
 class NoConnectors:
@@ -767,13 +855,16 @@ def create_local_application(
     *,
     provider_name: str = "fake",
     orcarouter_api_key: str | None = None,
-    model_name: str = "orcarouter/auto",
-    base_url: str = "https://api.orcarouter.ai/v1",
+    deepseek_api_key: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
     persona: PersonaSettings | None = None,
     placement: PlacementState | None = None,
 ) -> ReckoningApplication:
     from reckoning.persistence import JsonFileReckoningRepository
     from reckoning.providers import (
+        DeepSeekModelProvider,
+        DeepSeekReckoningProvider,
         OrcaRouterModelProvider,
         OrcaRouterReckoningProvider,
     )
@@ -787,11 +878,19 @@ def create_local_application(
     elif provider_name == "orcarouter":
         cloud_model = OrcaRouterModelProvider(
             orcarouter_api_key or "",
-            model=model_name,
-            base_url=base_url,
+            model=model_name or "orcarouter/auto",
+            base_url=base_url or "https://api.orcarouter.ai/v1",
         )
         model = cloud_model
         reckoning_provider = OrcaRouterReckoningProvider(cloud_model)
+    elif provider_name == "deepseek":
+        deepseek_model = DeepSeekModelProvider(
+            deepseek_api_key or "",
+            model=model_name or "deepseek-v4-flash",
+            base_url=base_url or "https://api.deepseek.com",
+        )
+        model = deepseek_model
+        reckoning_provider = DeepSeekReckoningProvider(deepseek_model)
     else:
         raise ValueError(f"Unsupported model provider: {provider_name}")
     return ReckoningApplication(

@@ -36,6 +36,25 @@ class RoutineProposal:
 
 
 @dataclass(frozen=True)
+class RoutineContractDraft:
+    trigger: str
+    source_scope: tuple[str, ...]
+    context_scope: tuple[str, ...]
+    tools: tuple[str, ...]
+    permissions: tuple[str, ...]
+    delivery: str
+    model_policy: str
+    cost_ceiling: int
+    retry_limit: int
+    delegation_policy: str
+    failure_behavior: str
+
+
+class RoutineCompiler(Protocol):
+    def compile(self, request: str) -> RoutineContractDraft: ...
+
+
+@dataclass(frozen=True)
 class RoutineStep:
     id: str
     kind: StepKind
@@ -95,6 +114,8 @@ class AutomationRepository(Protocol):
 
     def proposals_for(self, routine_id: str) -> tuple[RoutineProposal, ...]: ...
 
+    def list_proposals(self) -> tuple[RoutineProposal, ...]: ...
+
     def save_run(self, run: RoutineRun) -> None: ...
 
     def get_run(self, run_id: str) -> RoutineRun: ...
@@ -125,6 +146,9 @@ class InMemoryAutomationRepository:
         return tuple(
             item for item in self.proposals.values() if item.routine_id == routine_id
         )
+
+    def list_proposals(self) -> tuple[RoutineProposal, ...]:
+        return tuple(self.proposals.values())
 
     def save_run(self, run: RoutineRun) -> None:
         self.runs[run.id] = run
@@ -194,6 +218,37 @@ class JsonFileAutomationRepository(InMemoryAutomationRepository):
 class RoutineService:
     def __init__(self, repository: AutomationRepository) -> None:
         self._repository = repository
+
+    def compile_request(
+        self,
+        source_request: str,
+        *,
+        compiler: RoutineCompiler,
+        proposal_id: str,
+        routine_id: str,
+        created_at: datetime,
+    ) -> RoutineProposal:
+        request = source_request.strip()
+        if not request:
+            raise ValueError("A natural-language recurring request is required.")
+        draft = compiler.compile(request)
+        return self.propose(
+            proposal_id=proposal_id,
+            routine_id=routine_id,
+            source_request=request,
+            created_at=created_at,
+            trigger=draft.trigger,
+            source_scope=draft.source_scope,
+            context_scope=draft.context_scope,
+            tools=draft.tools,
+            permissions=draft.permissions,
+            delivery=draft.delivery,
+            model_policy=draft.model_policy,
+            cost_ceiling=draft.cost_ceiling,
+            retry_limit=draft.retry_limit,
+            delegation_policy=draft.delegation_policy,
+            failure_behavior=draft.failure_behavior,
+        )
 
     def propose(
         self,
@@ -327,6 +382,14 @@ class RoutineService:
     def inspect_proposal(self, proposal_id: str) -> RoutineProposal:
         return self._repository.get_proposal(proposal_id)
 
+    def pending_confirmation_ids(self) -> tuple[str, ...]:
+        """Return proposed routine contracts that still need user confirmation."""
+        return tuple(
+            proposal.id
+            for proposal in self._repository.list_proposals()
+            if proposal.status == "proposed"
+        )
+
     def start_run(
         self,
         *,
@@ -335,10 +398,13 @@ class RoutineService:
         scheduled_for: datetime,
         idempotency_key: str,
         steps: tuple[RoutineStep, ...],
+        triggered_by: str,
     ) -> RoutineRun:
         proposal = self._repository.get_proposal(proposal_id)
         if proposal.status != "confirmed":
             raise PermissionError("A routine must be confirmed before it can run.")
+        if triggered_by != proposal.trigger:
+            raise PermissionError("The routine run does not match its confirmed trigger.")
         existing = self._repository.find_run_by_key(idempotency_key)
         if existing is not None:
             return existing
@@ -382,6 +448,15 @@ class RoutineService:
             max_attempts = proposal.retry_limit + 1
             step_result: StepResult | None = None
             while run.current_step_attempts < max_attempts:
+                if executor is None:
+                    step_result = StepResult("failed", "No model executor is configured.")
+                    break
+                quoted_cost = _quote_step_cost(executor, step)
+                if total_cost + quoted_cost > proposal.cost_ceiling:
+                    step_result = StepResult(
+                        "blocked", "Routine cost ceiling would be exceeded."
+                    )
+                    break
                 run = replace(
                     run,
                     attempts=run.attempts + 1,
@@ -389,11 +464,20 @@ class RoutineService:
                 )
                 self._repository.save_run(run)
                 try:
-                    if executor is None:
-                        raise RuntimeError("No model executor is configured.")
                     step_result = executor.execute(
                         step, f"{run.idempotency_key}:{step.id}"
                     )
+                    if (
+                        step_result.cost_units > quoted_cost
+                        or total_cost + step_result.cost_units
+                        > proposal.cost_ceiling
+                    ):
+                        step_result = StepResult(
+                            "blocked",
+                            "Routine executor exceeded its preflight cost quote.",
+                            cost_units=step_result.cost_units,
+                            model_calls=step_result.model_calls,
+                        )
                     break
                 except InterruptedError:
                     raise
@@ -402,13 +486,6 @@ class RoutineService:
             if step_result is None:
                 step_result = StepResult("failed", "Retry limit exhausted.")
             total_cost += step_result.cost_units
-            if total_cost > proposal.cost_ceiling:
-                step_result = StepResult(
-                    "blocked",
-                    "Routine cost ceiling would be exceeded.",
-                    cost_units=step_result.cost_units,
-                    model_calls=step_result.model_calls,
-                )
             results.append(step_result)
             run = replace(
                 run,
@@ -547,19 +624,38 @@ class WatchService:
         watch_id: str,
         *,
         run_id: str,
-        triggered_by: str | None = None,
+        triggered_by: str,
+        quoted_cost_units: int,
         findings: tuple[WatchFinding, ...],
         checked_at: datetime,
     ) -> WatchReceipt:
         watch = self._watches[watch_id]
         if not watch.confirmed:
             raise PermissionError("A watch must be confirmed before it can run.")
-        actual_trigger = watch.trigger if triggered_by is None else triggered_by
-        if actual_trigger != watch.trigger:
+        if triggered_by != watch.trigger:
             raise PermissionError("The watch run does not match its confirmed trigger.")
+        if quoted_cost_units < 0:
+            raise ValueError("A watch cost quote cannot be negative.")
+        if quoted_cost_units > watch.budget:
+            receipt = WatchReceipt(
+                run_id,
+                watch_id,
+                checked_at,
+                (),
+                findings,
+                0,
+                False,
+                "blocked",
+                True,
+            )
+            self._receipts[run_id] = receipt
+            self._flush()
+            return receipt
         if any(item.source not in watch.source_scope for item in findings):
             raise PermissionError("A finding falls outside the watch source scope.")
         total_cost = sum(item.cost_units for item in findings)
+        if total_cost > quoted_cost_units:
+            raise RuntimeError("Watch source exceeded its preflight cost quote.")
         if total_cost > watch.budget:
             receipt = WatchReceipt(
                 run_id,
@@ -751,6 +847,18 @@ def _aggregate_run_status(
     if len(results) < total_steps or any(item.status == "partial" for item in results):
         return "partial"
     return "success"
+
+
+def _quote_step_cost(executor: StepExecutor, step: RoutineStep) -> int:
+    quote_method = getattr(executor, "quote_cost", None)
+    if quote_method is None:
+        if step.kind == "model":
+            raise RuntimeError("A model routine step requires a preflight cost quote.")
+        return 0
+    quoted_cost = quote_method(step)
+    if not isinstance(quoted_cost, int) or quoted_cost < 0:
+        raise RuntimeError("A routine cost quote must be a non-negative integer.")
+    return quoted_cost
 
 
 def _proposal_to_data(value: RoutineProposal) -> dict[str, object]:

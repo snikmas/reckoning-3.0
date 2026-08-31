@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from reckoning.config import OrcaRouterSettings
+from reckoning.config import DeepSeekSettings, OrcaRouterSettings
 
 
 def test_orcarouter_settings_load_only_allowed_values_from_env_file(
@@ -42,3 +42,16 @@ def test_process_environment_overrides_file_without_requiring_all_values(
     assert settings.api_key == "process-key"
     assert settings.model == "file-model"
     assert settings.base_url == "https://api.orcarouter.ai/v1"
+
+
+def test_deepseek_settings_remain_available_for_existing_evidence_gate(
+    tmp_path: Path,
+) -> None:
+    settings = DeepSeekSettings.load(
+        tmp_path / "missing.env",
+        environ={"DEEPSEEK_API_KEY": "test-key"},
+    )
+
+    assert settings.api_key == "test-key"
+    assert settings.model == "deepseek-v4-flash"
+    assert settings.base_url == "https://api.deepseek.com"

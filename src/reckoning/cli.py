@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     diagnosis = commands.add_parser("diagnose", help="Inspect local operational state.")
     diagnosis.add_argument("--data-dir", type=Path, default=_default_data_dir())
+    diagnosis.add_argument("--server-data-dir", type=Path)
     diagnosis.add_argument(
         "--release-evidence",
         type=Path,
@@ -50,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     restore = commands.add_parser("restore", help="Restore into a clean installation.")
     restore.add_argument("--input", type=Path, required=True)
     restore.add_argument("--data-dir", type=Path, default=_default_data_dir())
+    restore.add_argument("--server-data-dir", type=Path)
 
     setup = commands.add_parser("setup", help="Initialize a single-user installation.")
     setup.add_argument("--data-dir", type=Path, default=_default_data_dir())
@@ -57,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--placement",
         choices=("local", "personal-server", "hybrid"),
         default="local",
+    )
+    setup.add_argument(
+        "--server-data-dir",
+        type=Path,
+        help="Separate personal-server storage root; required outside local placement.",
     )
     setup.add_argument(
         "--persona",
@@ -103,13 +110,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.command == "setup":
             persona = _setup_persona(arguments)
-            setup_instance(arguments.data_dir, arguments.placement, persona)
-            print(_setup_explanation(arguments.placement, persona.name))
+            setup_instance(
+                arguments.data_dir,
+                arguments.placement,
+                persona,
+                server_data_dir=arguments.server_data_dir,
+            )
+            print(
+                _setup_explanation(
+                    arguments.placement, persona.name, arguments.data_dir
+                )
+            )
             return 0
         if arguments.command == "diagnose":
             if arguments.release_evidence is not None:
                 return _print_release_readiness(arguments.release_evidence)
-            print("\n".join(diagnose(arguments.data_dir)))
+            print(
+                "\n".join(
+                    diagnose(
+                        arguments.data_dir,
+                        server_data_dir=arguments.server_data_dir,
+                    )
+                )
+            )
             return 0
         if arguments.command in {"backup", "export"}:
             count = create_transfer(
@@ -117,6 +140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.output,
                 _passphrase(),
                 kind=arguments.command,
+                server_data_dir=arguments.server_data_dir,
             )
             print(
                 f"encrypted {arguments.command} created: {arguments.output} "
@@ -125,7 +149,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.command == "restore":
             count = restore_transfer(
-                arguments.input, arguments.data_dir, _passphrase()
+                arguments.input,
+                arguments.data_dir,
+                _passphrase(),
+                server_data_dir=arguments.server_data_dir,
             )
             print(f"restore complete: {count} state files restored")
             return 0
@@ -151,6 +178,7 @@ def _default_data_dir() -> Path:
 
 def _transfer_source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-dir", type=Path, default=_default_data_dir())
+    parser.add_argument("--server-data-dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
 
 
@@ -199,22 +227,39 @@ def _setup_persona(arguments: argparse.Namespace) -> PersonaDefinition:
         raise OperationError(str(error)) from error
 
 
-def _setup_explanation(placement: str, persona_name: str) -> str:
+def _setup_explanation(
+    placement: str, persona_name: str, data_dir: Path
+) -> str:
+    placement_explanations = {
+        "local": "Private data stays local on this device.",
+        "personal-server": (
+            "Private and confirmed state is stored on your personal server. "
+            "This is still one user's instance, not hosted tenancy."
+        ),
+        "hybrid": (
+            "Private data stays local. Only approved remote-source data is "
+            "placed on your personal server."
+        ),
+    }
+    readiness = release_readiness(data_dir / "release-evidence.json")
     return "\n".join(
         (
             f"Single-user Reckoning setup complete with {placement} placement.",
             f"The selected persona is {persona_name}.",
-            "Private data stays local unless its source category is explicitly "
-            "approved for remote placement.",
+            placement_explanations[placement],
             "External writes require exact or standing permission. Lower layers "
             "cannot broaden that authority.",
             "Missing required context blocks work or enters visible limited mode.",
-            "Operational access is limited to loopback, a private authenticated "
-            "network, or an SSH tunnel.",
+            "The built-in server listens only on loopback. Use an SSH tunnel for "
+            "remote operational access.",
             "Create an encrypted backup with `reckoning-ops backup`. Restore it "
             "into a clean installation with `reckoning-ops restore`.",
             "The deterministic clean-install check completed the core continuity "
             "loop without a developer.",
+            "Public release readiness is BLOCKED until recorded evidence exists "
+            "for " + ", ".join(readiness.missing_gates) + ".",
+            "Inspect that gate report with `reckoning-ops diagnose "
+            f"--release-evidence {data_dir / 'release-evidence.json'}`.",
             "This setup has no hosted tenancy and no public administration dashboard.",
         )
     )

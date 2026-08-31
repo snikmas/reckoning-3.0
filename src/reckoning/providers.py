@@ -88,24 +88,30 @@ class OrcaRouterModelProvider:
         max_retries: int = 2,
         transport: Transport = _urlopen_transport,
         timer: Callable[[], float] = monotonic,
+        _provider_name: str = "orcarouter",
+        _display_name: str = "OrcaRouter",
+        _api_key_name: str = "ORCAROUTER_API_KEY",
+        _required_host: str = "api.orcarouter.ai",
     ) -> None:
         if not api_key.strip():
             raise ValueError(
-                "ORCAROUTER_API_KEY is required for the OrcaRouter provider."
+                f"{_api_key_name} is required for the {_display_name} provider."
             )
         if not model.strip():
             raise ValueError("MODEL cannot be empty.")
         parsed_base_url = urlsplit(base_url)
         if (
             parsed_base_url.scheme != "https"
-            or parsed_base_url.hostname != "api.orcarouter.ai"
+            or parsed_base_url.hostname != _required_host
         ):
             raise ValueError(
-                "BASE_URL must use the official https://api.orcarouter.ai host."
+                f"BASE_URL must use the official https://{_required_host} host."
             )
         if max_retries < 0:
             raise ValueError("max_retries cannot be negative.")
         self._api_key = api_key
+        self._provider_name = _provider_name
+        self._display_name = _display_name
         self._model = model
         self._endpoint = f"{base_url.rstrip('/')}/chat/completions"
         self._timeout_seconds = timeout_seconds
@@ -152,7 +158,7 @@ class OrcaRouterModelProvider:
                 )
                 return ProviderResponse(
                     content=content,
-                    provider="orcarouter",
+                    provider=self._provider_name,
                     model=str(parsed.get("model", self._model)),
                     model_calls=model_calls,
                     latency_ms=round((self._timer() - started) * 1000),
@@ -165,14 +171,14 @@ class OrcaRouterModelProvider:
                     break
             except (URLError, TimeoutError) as error:
                 reason = error.reason if isinstance(error, URLError) else error
-                last_error = f"OrcaRouter could not be reached: {reason}"
+                last_error = f"{self._display_name} could not be reached: {reason}"
             except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
-                last_error = "OrcaRouter returned an invalid response."
+                last_error = f"{self._display_name} returned an invalid response."
                 break
 
         raise ProviderFailure(
             last_error,
-            provider="orcarouter",
+            provider=self._provider_name,
             model=self._model,
             model_calls=model_calls,
             latency_ms=round((self._timer() - started) * 1000),
@@ -180,7 +186,7 @@ class OrcaRouterModelProvider:
         )
 
     def _http_error_message(self, error: HTTPError) -> str:
-        fallback = f"OrcaRouter returned HTTP {error.code}."
+        fallback = f"{self._display_name} returned HTTP {error.code}."
         try:
             payload = json.loads(error.read(65_536).decode("utf-8"))
             detail = payload.get("error", {})
@@ -194,7 +200,7 @@ class OrcaRouterModelProvider:
             return fallback
         safe_message = message.replace(self._api_key, "[redacted]")[:500]
         code_text = f" ({code})" if code else ""
-        return f"OrcaRouter returned HTTP {error.code}{code_text}: {safe_message}"
+        return f"{self._display_name} returned HTTP {error.code}{code_text}: {safe_message}"
 
     @staticmethod
     def _messages(request: ModelRequestLike) -> list[dict[str, str]]:
@@ -384,3 +390,39 @@ class OrcaRouterReckoningProvider:
             "record_type and meaning. Valid record_type values are profile_fact, "
             "current_state, direction, goal, decision, preference, and boundary."
         )
+
+
+class DeepSeekModelProvider(OrcaRouterModelProvider):
+    """DeepSeek's OpenAI-compatible endpoint retained for #38 evidence."""
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str = "deepseek-v4-flash",
+        base_url: str = "https://api.deepseek.com",
+        timeout_seconds: float = 60.0,
+        max_retries: int = 2,
+        transport: Transport = _urlopen_transport,
+        timer: Callable[[], float] = monotonic,
+    ) -> None:
+        super().__init__(
+            api_key,
+            model=model,
+            base_url=base_url,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            transport=transport,
+            timer=timer,
+            _provider_name="deepseek",
+            _display_name="DeepSeek",
+            _api_key_name="DEEPSEEK_API_KEY",
+            _required_host="api.deepseek.com",
+        )
+
+
+class DeepSeekReckoningProvider(OrcaRouterReckoningProvider):
+    """Typed continuity adapter using the retained DeepSeek model provider."""
+
+    def __init__(self, model: DeepSeekModelProvider) -> None:
+        super().__init__(model)

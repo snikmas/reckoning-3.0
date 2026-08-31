@@ -16,8 +16,14 @@ from reckoning.json_store import read_json
 class LocalOperationalRecordSource:
     """Project durable service records into Control without copying their state."""
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        connector_data_dir: Path | None = None,
+    ) -> None:
         self._data_dir = data_dir
+        self._connector_data_dir = connector_data_dir or data_dir
 
     def snapshot(self) -> OperationalSnapshot:
         return _merge_snapshots(
@@ -161,7 +167,7 @@ class LocalOperationalRecordSource:
 
     def _connector_snapshot(self) -> OperationalSnapshot:
         data = read_json(
-            self._data_dir / "connectors.json",
+            self._connector_data_dir / "connectors.json",
             default={
                 "schema_version": 1,
                 "connections": [],
@@ -323,11 +329,7 @@ class LocalOperationalRecordSource:
         )
         receipt_ids = {str(item["write_id"]) for item in _objects(data.get("receipts", []))}
         approvals = tuple(
-            str(item["exact_approval_id"])
-            for item in writes
-            if item.get("exact_approval_id")
-        ) + tuple(
-            f"approval required for {item['id']}"
+            f"write:{item['id']}"
             for item in writes
             if str(item["id"]) not in receipt_ids
             and not item.get("exact_approval_id")
@@ -341,19 +343,35 @@ class LocalOperationalRecordSource:
             prepared = by_id.get(write_id, {})
             occurred_at = datetime.fromisoformat(str(item["completed_at"]))
             status = str(item["status"])
+            authorization_kind = str(item.get("authorization_kind", "unknown"))
+            authorization_id = str(item.get("authorization_id", "unknown"))
+            authorization_scope = str(item.get("authorization_scope", ""))
+            used_permissions = (
+                (authorization_id,)
+                if authorization_kind == "standing_permission"
+                else ()
+            )
+            used_approvals = (
+                (authorization_id,)
+                if authorization_kind == "exact_approval"
+                else ()
+            )
+            authority_evidence = (
+                f"authorization: {authorization_kind}:{authorization_id}",
+                f"authorization scope: {authorization_scope}",
+            )
             receipts.append(
                 RunReceipt(
                     id=write_id,
                     occurred_at=occurred_at,
                     status=status,
                     summary=str(item["detail"]),
-                    evidence=(f"external id: {item.get('external_id') or 'none'}",),
-                    permissions=active_permissions,
-                    approvals=(
-                        (str(prepared["exact_approval_id"]),)
-                        if prepared.get("exact_approval_id")
-                        else ()
+                    evidence=(
+                        f"external id: {item.get('external_id') or 'none'}",
+                        *authority_evidence,
                     ),
+                    permissions=used_permissions,
+                    approvals=used_approvals,
                     connector_health=(f"{item['connector_id']}: {status}",),
                     tools=(f"connector:{item['connector_id']}",),
                     actions=(str(prepared.get("action_type", "external write")),),
@@ -373,7 +391,6 @@ class LocalOperationalRecordSource:
             failures=tuple(failures),
             permissions=active_permissions,
             approvals=approvals,
-            actions=tuple(str(item["action_type"]) for item in writes),
         )
 
 

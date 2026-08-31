@@ -15,7 +15,12 @@ from reckoning.application import (
     ProtectedResponsePolicy,
     ReckoningApplication,
 )
-from reckoning.providers import OrcaRouterModelProvider, ProviderResponse, ProviderUsage
+from reckoning.providers import (
+    DeepSeekModelProvider,
+    OrcaRouterModelProvider,
+    ProviderResponse,
+    ProviderUsage,
+)
 
 
 class FixedClock:
@@ -105,6 +110,35 @@ def test_orcarouter_uses_same_boundary_and_records_billable_units() -> None:
         "billable_units": 129,
         "failure": None,
     }
+
+
+def test_deepseek_remains_selectable_for_the_existing_real_run_gate() -> None:
+    def transport(request: object, timeout: float) -> bytes:
+        assert request.full_url == "https://api.deepseek.com/chat/completions"
+        return json.dumps(
+            {
+                "model": "deepseek-v4-flash",
+                "choices": [{"message": {"content": "Keep the smaller proof."}}],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 4,
+                    "total_tokens": 12,
+                },
+            }
+        ).encode()
+
+    application = build_application(
+        DeepSeekModelProvider(
+            "test-secret",
+            transport=transport,
+            timer=SequenceTimer(1.0, 1.1),
+        )
+    )  # type: ignore[arg-type]
+
+    response = application.send_message("Compare these options.")
+
+    assert response.content == "Keep the smaller proof."
+    assert application.inspect_model_runs()[0].provider == "deepseek"
 
 
 def test_provider_failure_is_recorded_and_never_becomes_a_completed_answer() -> None:

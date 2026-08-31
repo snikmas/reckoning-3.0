@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 
 import pytest
 
+import reckoning.operations as operations
 from reckoning.automation import (
     BriefingFinding,
     BriefingPolicy,
@@ -22,7 +24,12 @@ from reckoning.connectors import (
     ExternalWriteService,
     WriteResult,
 )
-from reckoning.operations import create_transfer, restore_transfer, setup_instance
+from reckoning.operations import (
+    OperationError,
+    create_transfer,
+    restore_transfer,
+    setup_instance,
+)
 from reckoning.personal_context import (
     JsonFilePersonalContextRepository,
     PersonalContextService,
@@ -31,6 +38,44 @@ from reckoning.personal_context import (
 
 NOW = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
 PASSPHRASE = "correct-horse-battery-staple"
+
+
+@pytest.mark.parametrize("relationship", ("same", "server-inside", "local-inside"))
+def test_transfer_rejects_overlapping_configured_roots(
+    tmp_path: Path, relationship: str
+) -> None:
+    case_root = tmp_path / relationship
+    local_root = case_root / "local"
+    if relationship == "same":
+        server_root = local_root
+    elif relationship == "server-inside":
+        server_root = local_root / "server"
+    else:
+        server_root = case_root
+    local_root.mkdir(parents=True)
+    server_root.mkdir(parents=True, exist_ok=True)
+    (local_root / "instance.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "placement_profile": "hybrid",
+                "storage_roots": {
+                    "local": "local-data-dir",
+                    "server": str(server_root.resolve()),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OperationError, match="roots must be separate"):
+        create_transfer(
+            local_root,
+            case_root / "state.reckoning",
+            PASSPHRASE,
+            kind="backup",
+            server_data_dir=server_root,
+        )
 
 
 class ReadAdapter:
@@ -118,6 +163,7 @@ def _populate_real_operational_state(data_dir: Path) -> None:
         scheduled_for=NOW,
         idempotency_key="weekly-goal-check:2026-08-31",
         steps=(RoutineStep("read", "deterministic", "read-official-source"),),
+        triggered_by="0 18 * * SUN",
     )
     routines.resume_run(
         "routine-run-1",
@@ -141,6 +187,8 @@ def _populate_real_operational_state(data_dir: Path) -> None:
     watches.run(
         watch.id,
         run_id="watch-run-1",
+        triggered_by="daily",
+        quoted_cost_units=1,
         findings=(
             WatchFinding(
                 "weak-finding",
@@ -304,3 +352,172 @@ def test_failed_final_restore_swap_keeps_an_existing_clean_target(
     assert target.is_dir()
     assert tuple(target.iterdir()) == ()
     assert tuple(tmp_path.glob(".target.restore-*")) == ()
+
+
+def test_failed_multi_root_restore_preserves_empty_roots_and_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source_server = tmp_path / "source-server"
+    target = tmp_path / "target"
+    target_server = tmp_path / "target-server"
+    archive = tmp_path / "state.reckoning"
+    setup_instance(source, "personal-server", server_data_dir=source_server)
+    create_transfer(
+        source,
+        archive,
+        PASSPHRASE,
+        kind="backup",
+        server_data_dir=source_server,
+    )
+    target.mkdir(mode=0o750)
+    target_server.mkdir(mode=0o710)
+    real_replace = operations.os.replace
+
+    def fail_server_swap(source_path: str | Path, target_path: str | Path) -> None:
+        source_candidate = Path(source_path)
+        if (
+            Path(target_path) == target_server
+            and source_candidate.name.startswith(".target-server.restore-")
+        ):
+            raise OSError("cannot commit the server root")
+        real_replace(source_path, target_path)
+
+    monkeypatch.setattr(operations.os, "replace", fail_server_swap)
+
+    with pytest.raises(OSError, match="cannot commit the server root"):
+        restore_transfer(
+            archive,
+            target,
+            PASSPHRASE,
+            server_data_dir=target_server,
+        )
+
+    assert target.is_dir()
+    assert target_server.is_dir()
+    assert tuple(target.iterdir()) == ()
+    assert tuple(target_server.iterdir()) == ()
+    assert target.stat().st_mode & 0o777 == 0o750
+    assert target_server.stat().st_mode & 0o777 == 0o710
+    assert not tuple(tmp_path.glob(".target.restore-*"))
+    assert not tuple(tmp_path.glob(".target-server.restore-*"))
+
+
+def test_multi_root_transfer_requires_matching_source_and_destination_roots(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source_server = tmp_path / "source-server"
+    archive = tmp_path / "state.reckoning"
+    setup_instance(source, "hybrid", server_data_dir=source_server)
+
+    with pytest.raises(OperationError, match="requires --server-data-dir"):
+        create_transfer(source, archive, PASSPHRASE, kind="backup")
+    with pytest.raises(OperationError, match="does not match"):
+        create_transfer(
+            source,
+            archive,
+            PASSPHRASE,
+            kind="backup",
+            server_data_dir=tmp_path / "wrong-server",
+        )
+
+    create_transfer(
+        source,
+        archive,
+        PASSPHRASE,
+        kind="backup",
+        server_data_dir=source_server,
+    )
+    target = tmp_path / "target"
+    with pytest.raises(OperationError, match="requires --server-data-dir"):
+        restore_transfer(archive, target, PASSPHRASE)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("relationship", ("same", "server-inside", "local-inside"))
+def test_multi_root_restore_rejects_overlapping_destination_roots(
+    tmp_path: Path, relationship: str
+) -> None:
+    source = tmp_path / "source"
+    source_server = tmp_path / "source-server"
+    archive = tmp_path / "state.reckoning"
+    setup_instance(source, "personal-server", server_data_dir=source_server)
+    create_transfer(
+        source,
+        archive,
+        PASSPHRASE,
+        kind="backup",
+        server_data_dir=source_server,
+    )
+    case_root = tmp_path / relationship
+    local_root = case_root / "local"
+    if relationship == "same":
+        server_root = local_root
+    elif relationship == "server-inside":
+        server_root = local_root / "server"
+    else:
+        server_root = case_root
+
+    with pytest.raises(OperationError, match="roots must be separate"):
+        restore_transfer(
+            archive,
+            local_root,
+            PASSPHRASE,
+            server_data_dir=server_root,
+        )
+    assert not local_root.exists()
+    assert not tuple(case_root.glob(".*.restore-*"))
+
+
+def test_restore_accepts_a_legacy_local_only_manifest(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    current_archive = tmp_path / "current.reckoning"
+    legacy_archive = tmp_path / "legacy.reckoning"
+    restored = tmp_path / "restored"
+    source.mkdir()
+    (source / "continuity.json").write_text(
+        '{"schema_version": 1, "status": "confirmed"}\n',
+        encoding="utf-8",
+    )
+    create_transfer(source, current_archive, PASSPHRASE, kind="backup")
+    legacy_payload = operations._read_encrypted_payload(current_archive, PASSPHRASE)
+    legacy_payload.pop("logical_roots")
+    for item in legacy_payload["files"]:
+        item.pop("root")
+    operations._write_encrypted_payload(legacy_archive, legacy_payload, PASSPHRASE)
+
+    restored_count = restore_transfer(legacy_archive, restored, PASSPHRASE)
+
+    assert restored_count == 1
+    assert json.loads(
+        (restored / "continuity.json").read_text(encoding="utf-8")
+    ) == {"schema_version": 1, "status": "confirmed"}
+
+
+def test_restore_rejects_inconsistent_logical_root_manifest(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source_server = tmp_path / "source-server"
+    current_archive = tmp_path / "current.reckoning"
+    inconsistent_archive = tmp_path / "inconsistent.reckoning"
+    setup_instance(source, "personal-server", server_data_dir=source_server)
+    create_transfer(
+        source,
+        current_archive,
+        PASSPHRASE,
+        kind="backup",
+        server_data_dir=source_server,
+    )
+    payload = operations._read_encrypted_payload(current_archive, PASSPHRASE)
+    payload["logical_roots"] = ["local"]
+    operations._write_encrypted_payload(
+        inconsistent_archive, payload, PASSPHRASE
+    )
+
+    with pytest.raises(OperationError, match="logical roots do not match"):
+        restore_transfer(
+            inconsistent_archive,
+            tmp_path / "restored",
+            PASSPHRASE,
+            server_data_dir=tmp_path / "restored-server",
+        )

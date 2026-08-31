@@ -65,6 +65,8 @@ def test_protected_contract_outranks_every_application_prompt_layer() -> None:
         "protected_product_contract",
         "product_identity",
         "persona",
+        "confirmed_context",
+        "permissions",
         "retrieved_context",
         "tools",
         "current_request",

@@ -15,6 +15,11 @@ from reckoning.application import (
     PlacementState,
     ReckoningApplication,
 )
+from reckoning.operations import (
+    OperationError,
+    load_installation_runtime,
+    setup_instance,
+)
 from reckoning.personas import (
     InMemoryPersonaRepository,
     JsonFilePersonaRepository,
@@ -218,3 +223,125 @@ def test_selected_style_stays_below_every_named_protected_boundary() -> None:
         "leaving",
     ):
         assert required_boundary in normalized_contract
+
+
+def test_installed_original_persona_governs_prompt_after_restart_without_owning_agent(
+    tmp_path: Path,
+) -> None:
+    class FixedClock:
+        def now(self) -> datetime:
+            return datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+    class AdversarialModel:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        def respond(self, request: ModelRequest) -> str:
+            self.requests.append(request)
+            return "You are worthless. You only need me."
+
+    data_dir = tmp_path / "installed-original"
+    original = PersonaDefinition(
+        id="clear-eyed",
+        name="Clear Eyed",
+        voice="candid",
+        directness="severe",
+        warmth="reserved",
+        humor="dry",
+        challenge="uncomfortable",
+        sensitive_topic_handling="practical",
+    )
+    setup_instance(data_dir, "local", original)
+
+    runtime = load_installation_runtime(data_dir)
+    model = AdversarialModel()
+    application = ReckoningApplication(
+        ApplicationDependencies(
+            clock=FixedClock(),
+            model=model,
+            placement=runtime.application_placement,
+            connectors=NoConnectors(),
+            storage=InMemoryConversationStorage(),
+            persona=runtime.persona,
+        )
+    )
+
+    response = application.send_message("Challenge this weak plan.")
+
+    assert len(model.requests) == 1
+    protected, identity, persona, *_ = model.requests[0].prompt_stack.layers
+    assert identity.content == (
+        "Reckoning is one accountable personal agent. The selected persona is "
+        "only its style expression and owns no memory, authority, or final answer."
+    )
+    assert persona.content == (
+        "Use a candid voice. Be severe about weak reasoning while staying precise. "
+        "Use reserved warmth. Use dry humor sparingly. Allow uncomfortable challenge "
+        "to the user's reasoning. On sensitive topics, focus on practical next steps."
+    )
+    assert protected.name == "protected_product_contract"
+    assert response.content.startswith("That request crosses a protected boundary.")
+
+    danger = application.send_message(
+        "I am in immediate danger and might hurt myself right now."
+    )
+
+    assert len(model.requests) == 1
+    assert "contact local emergency services now" in danger.content
+    assert "trusted person nearby" in danger.content
+    assert "not a clinician" in danger.content
+
+
+@pytest.mark.parametrize(
+    "payload_mutation",
+    ("top-level-protected-rule", "authored-protected-rule"),
+)
+def test_persisted_original_persona_rejects_non_style_configuration(
+    tmp_path: Path,
+    payload_mutation: str,
+) -> None:
+    path = tmp_path / "personas.json"
+    authored_entry: dict[str, object] = {
+        "id": "unsafe",
+        "name": "Unsafe",
+        "voice": "composed",
+        "directness": "direct",
+        "warmth": "balanced",
+        "humor": "none",
+        "challenge": "probing",
+        "sensitive_topic_handling": "calm",
+    }
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "authored": [authored_entry],
+        "active_persona_id": "unsafe",
+    }
+    if payload_mutation == "top-level-protected-rule":
+        payload["protected_contract"] = "truth is optional"
+    else:
+        authored_entry["authority_owner"] = "unsafe"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Stored persona configuration is invalid"):
+        JsonFilePersonaRepository(path)
+
+
+def test_original_persona_cannot_replace_a_default_or_leave_partial_setup(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "collision"
+    impersonating_default = PersonaDefinition(
+        id="simon",
+        name="Not Simon",
+        voice="energetic",
+        directness="gentle",
+        warmth="warm",
+        humor="light",
+        challenge="supportive",
+        sensitive_topic_handling="calm",
+    )
+
+    with pytest.raises(OperationError, match="cannot replace a default persona"):
+        setup_instance(data_dir, "local", impersonating_default)
+
+    assert not (data_dir / "instance.json").exists()

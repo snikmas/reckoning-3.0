@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from html import escape
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs
@@ -9,13 +10,29 @@ from wsgiref.simple_server import make_server
 from wsgiref.types import StartResponse, WSGIEnvironment
 
 from reckoning.application import Message, ReckoningApplication, create_local_application
-from reckoning.config import OrcaRouterSettings
+from reckoning.config import DeepSeekSettings, OrcaRouterSettings
 from reckoning.interfaces import (
     ControlView,
     ReckoningInterfaceApplication,
     create_local_interface_application,
 )
-from reckoning.operations import load_installation_runtime
+from reckoning.operations import OperationError, load_installation_runtime
+
+
+def validate_bind_host(host: str) -> str:
+    """Keep the unauthenticated built-in server off public interfaces."""
+    if host == "localhost":
+        return host
+    try:
+        loopback = ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise ValueError(
+            "the built-in server may bind only to a loopback address; use an "
+            "SSH tunnel for remote access"
+        )
+    return host
 
 class ReckoningWebApplication:
     """A thin WSGI adapter for the Reckoning application boundary."""
@@ -398,11 +415,11 @@ class ReckoningWebApplication:
         return "<ul>" + "".join(f"<li>{escape(item)}</li>" for item in items) + "</ul>"
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Reckoning's local web interface.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
-    parser.add_argument("--provider", choices=("fake", "orcarouter"))
+    parser.add_argument("--provider", choices=("fake", "deepseek", "orcarouter"))
     parser.add_argument("--model")
     parser.add_argument("--base-url")
     parser.add_argument(
@@ -410,18 +427,45 @@ def main() -> None:
         type=Path,
         default=Path.home() / ".local" / "state" / "reckoning",
     )
+    parser.add_argument(
+        "--server-data-dir",
+        type=Path,
+        help="Configured personal-server storage root for server or hybrid placement.",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     arguments = parser.parse_args()
 
-    settings = OrcaRouterSettings.load()
+    try:
+        host = validate_bind_host(arguments.host)
+        runtime = load_installation_runtime(
+            arguments.data_dir,
+            server_data_dir=arguments.server_data_dir,
+        )
+    except (OperationError, ValueError) as error:
+        parser.error(str(error))
+
+    orcarouter_settings = OrcaRouterSettings.load()
+    deepseek_settings = DeepSeekSettings.load()
     provider_name = arguments.provider or (
-        "orcarouter" if settings.api_key else "fake"
+        "orcarouter"
+        if orcarouter_settings.api_key
+        else "deepseek"
+        if deepseek_settings.api_key
+        else "fake"
+    )
+    settings = (
+        deepseek_settings if provider_name == "deepseek" else orcarouter_settings
     )
 
-    runtime = load_installation_runtime(arguments.data_dir)
     application = create_local_application(
-        arguments.data_dir / "continuity.json",
+        runtime.state_path("confirmed-state", "continuity.json"),
         provider_name=provider_name,
-        orcarouter_api_key=settings.api_key,
+        orcarouter_api_key=orcarouter_settings.api_key,
+        deepseek_api_key=deepseek_settings.api_key,
         model_name=arguments.model or settings.model,
         base_url=arguments.base_url or settings.base_url,
         persona=runtime.persona,
@@ -431,12 +475,13 @@ def main() -> None:
         application,
         interface_application=create_local_interface_application(
             application,
-            arguments.data_dir / "interfaces.json",
+            runtime.state_path("confirmed-state", "interfaces.json"),
             placement=runtime.interface_placement,
+            connector_data_dir=runtime.root_for("approved-remote-sources"),
         ),
     )
-    with make_server(arguments.host, arguments.port, web) as server:
-        print(f"Simon is available at http://{arguments.host}:{arguments.port}")
+    with make_server(host, arguments.port, web) as server:
+        print(f"Simon is available at http://{host}:{arguments.port}")
         try:
             server.serve_forever()
         except KeyboardInterrupt:

@@ -120,15 +120,17 @@ def run(
     context: ExactContextSource | None = None,
     model: ModelGateway | None = None,
     tools: ToolGateway | None = None,
+    receipts: InMemoryDelegationReceiptRepository | None = None,
 ):
     context = context or ExactContextSource()
     model = model or ModelGateway()
     tools = tools or ToolGateway()
+    receipts = receipts or InMemoryDelegationReceiptRepository()
     outcome = DelegationCoordinator(
         context,
         worker,
         reviewer,
-        InMemoryDelegationReceiptRepository(),
+        receipts,
         model_gateway=model,
         tool_gateway=tools,
     ).delegate(
@@ -257,3 +259,148 @@ def test_unverified_evidence_forces_limited_disposition() -> None:
         "Simon could not verify worker evidence: evidence-1",
     )
     assert outcome.receipt.result == "limited"
+
+
+@pytest.mark.parametrize("failure_site", ["context", "worker", "model", "tool"])
+def test_ordinary_delegation_failure_gets_accountable_durable_receipt(
+    failure_site: str,
+) -> None:
+    class FailingContext(ExactContextSource):
+        def read_entries(
+            self, category: str, entry_ids: tuple[str, ...]
+        ) -> tuple[DelegatedContextEntry, ...]:
+            raise RuntimeError("private context failure")
+
+    class FailingModel(ModelGateway):
+        def execute(self, provider: str, prompt: str) -> DelegatedModelResponse:
+            raise RuntimeError("private model failure")
+
+    class FailingTool(ToolGateway):
+        def execute(self, tool: str, payload: str) -> str:
+            raise RuntimeError("private tool failure")
+
+    class Worker:
+        def execute(
+            self, task: Any, runtime: BoundedWorkerRuntime
+        ) -> DelegatedWorkerFinding:
+            if failure_site == "worker":
+                raise RuntimeError("private worker failure")
+            if failure_site == "model":
+                runtime.call_model("fail")
+            if failure_site == "tool":
+                runtime.use_tool("web_read", "fail")
+            return DelegatedWorkerFinding("must not be accepted", ())
+
+    reviewer = SimonReviewer(
+        AgentDisposition(
+            "blocked" if failure_site == "context" else "limited",
+            "Simon reports that delegation failed safely.",
+            "No worker result was accepted.",
+        )
+    )
+    receipts = InMemoryDelegationReceiptRepository()
+    outcome, _, _, _ = run(
+        Worker(),
+        reviewer,
+        context=FailingContext() if failure_site == "context" else None,
+        model=FailingModel() if failure_site == "model" else None,
+        tools=FailingTool() if failure_site == "tool" else None,
+        receipts=receipts,
+    )
+
+    assert receipts.get(outcome.receipt.id) == outcome.receipt
+    assert outcome.receipt.result == (
+        "blocked" if failure_site == "context" else "limited"
+    )
+    assert outcome.response == "Simon reports that delegation failed safely."
+    assert "private" not in repr(outcome.receipt)
+    assert outcome.receipt.policy_violations == (
+        "delegated context selection failed safely"
+        if failure_site == "context"
+        else "delegated execution failed safely",
+    )
+    assert outcome.receipt.model_calls == (1 if failure_site == "model" else 0)
+    assert outcome.receipt.tool_calls == (1 if failure_site == "tool" else 0)
+
+
+def test_evidence_verifier_failure_forces_limited_durable_receipt() -> None:
+    class Worker:
+        def execute(
+            self, task: Any, runtime: BoundedWorkerRuntime
+        ) -> DelegatedWorkerFinding:
+            return DelegatedWorkerFinding(
+                "unreviewed candidate",
+                (DelegationEvidence("evidence-1", "claim", "source"),),
+            )
+
+    class FailingVerifier(SimonReviewer):
+        def verify_evidence(self, evidence: DelegationEvidence) -> bool:
+            raise RuntimeError("private verifier failure")
+
+    reviewer = FailingVerifier(
+        AgentDisposition(
+            "limited",
+            "Simon could not verify the delegated evidence.",
+            "No candidate was accepted.",
+        )
+    )
+    receipts = InMemoryDelegationReceiptRepository()
+    outcome, _, _, _ = run(Worker(), reviewer, receipts=receipts)
+
+    assert receipts.get(outcome.receipt.id) == outcome.receipt
+    assert outcome.receipt.result == "limited"
+    assert outcome.receipt.verified_evidence_ids == ()
+    assert outcome.receipt.policy_violations == (
+        "Simon evidence verification failed safely: evidence-1",
+        "Simon could not verify worker evidence: evidence-1",
+    )
+
+
+def test_disposer_failure_uses_truthful_fallback_and_durable_receipt() -> None:
+    class Worker:
+        def execute(
+            self, task: Any, runtime: BoundedWorkerRuntime
+        ) -> DelegatedWorkerFinding:
+            return DelegatedWorkerFinding("candidate must remain hidden", ())
+
+    class FailingDisposer(SimonReviewer):
+        def dispose(self, review: Any) -> AgentDisposition:
+            raise RuntimeError("private disposition failure")
+
+    receipts = InMemoryDelegationReceiptRepository()
+    outcome, _, _, _ = run(
+        Worker(),
+        FailingDisposer(
+            AgentDisposition("accepted", "must not escape", "must not escape")
+        ),
+        receipts=receipts,
+    )
+
+    assert receipts.get(outcome.receipt.id) == outcome.receipt
+    assert outcome.receipt.result == "limited"
+    assert outcome.response == (
+        "Simon could not complete the accountable review. "
+        "No delegated result was accepted."
+    )
+    assert "candidate must remain hidden" not in outcome.response
+    assert outcome.receipt.policy_violations == (
+        "Simon disposition review failed safely",
+    )
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_process_control_exceptions_are_not_swallowed(
+    interrupt: type[BaseException],
+) -> None:
+    class Worker:
+        def execute(
+            self, task: Any, runtime: BoundedWorkerRuntime
+        ) -> DelegatedWorkerFinding:
+            raise interrupt()
+
+    reviewer = SimonReviewer(
+        AgentDisposition("limited", "unused", "unused")
+    )
+
+    with pytest.raises(interrupt):
+        run(Worker(), reviewer)
