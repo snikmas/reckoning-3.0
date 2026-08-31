@@ -23,7 +23,12 @@ from reckoning.automation import (
     RoutineStep,
     StepResult,
 )
-from reckoning.connectors import ConnectorItem, ConnectorService
+from reckoning.connectors import (
+    ConnectorItem,
+    ConnectorService,
+    ExternalWriteService,
+    WriteResult,
+)
 from reckoning.interfaces import (
     ApplicationChannelResponder,
     ChannelMessage,
@@ -44,8 +49,8 @@ from reckoning.telegram import (
     TelegramRequest,
     TelegramWebhookAdapter,
 )
-from reckoning.operations import load_installation_runtime, setup_instance
-from reckoning.web import ReckoningWebApplication
+from reckoning.operations import NODE_MARKER, load_installation_runtime, setup_instance
+from reckoning.web import ReckoningWebApplication, build_parser as build_web_parser
 
 
 NOW = datetime(2026, 8, 31, 8, 0, tzinfo=timezone.utc)
@@ -503,6 +508,7 @@ def test_control_projects_a_durable_routine_and_simon_explains_the_same_run(
         scheduled_for=NOW,
         idempotency_key="weekly-review:2026-08-31",
         steps=(RoutineStep("read", "deterministic", "read-check-ins"),),
+        triggered_by="Sunday 18:00",
     )
 
     class OfflineReader:
@@ -715,6 +721,167 @@ def test_telegram_chat_sessions_are_durable_and_isolated_from_each_other(
     assert reopened.channel_session("web") == ()
 
 
+def test_telegram_confirmation_dispatches_to_durable_routine_and_write_state(
+    tmp_path: Path,
+) -> None:
+    routines = RoutineService(
+        JsonFileAutomationRepository(tmp_path / "automation.json")
+    )
+    routine = routines.propose(
+        proposal_id="weekly-review-v1",
+        routine_id="weekly-review",
+        source_request="Review confirmed weekly evidence.",
+        created_at=NOW,
+        trigger="Sunday 18:00",
+        source_scope=("confirmed-check-ins",),
+        context_scope=("goal:finish-semester",),
+        tools=("read-check-ins",),
+        permissions=("read:confirmed-check-ins",),
+        delivery="telegram",
+        model_policy="no model",
+        cost_ceiling=0,
+        retry_limit=0,
+        delegation_policy="direct execution only",
+        failure_behavior="record failure",
+    )
+    writes = ExternalWriteService(tmp_path / "external-writes.json")
+    writes.prepare(
+        write_id="calendar-write-1",
+        connector_id="calendar",
+        action_type="create-event",
+        target="mary-calendar",
+        trigger="manual approval",
+        boundary="one event",
+        payload={"title": "Weekly review"},
+        prepared_at=NOW,
+    )
+    core = ReckoningApplication(
+        ApplicationDependencies(
+            clock=FixedClock(),
+            model=HistoryRecordingModel(),
+            placement=PlacementState("local", "local", True),
+            connectors=NoConnectors(),
+            storage=InMemoryConversationStorage(),
+        )
+    )
+    interface = create_local_interface_application(
+        core,
+        tmp_path / "interfaces.json",
+    )
+    gateway = TelegramGateway(
+        interface,
+        authentication_token="gateway-secret",
+        allowed_chat_ids=("42",),
+    )
+
+    status = gateway.handle(
+        "gateway-secret", TelegramRequest("status", "42")
+    )
+    routine_reply = gateway.handle(
+        "gateway-secret",
+        TelegramRequest("confirm", "42", confirmation_id=f"routine:{routine.id}"),
+    )
+    write_reply = gateway.handle(
+        "gateway-secret",
+        TelegramRequest(
+            "confirm",
+            "42",
+            confirmation_id="write:calendar-write-1",
+        ),
+    )
+
+    class RecordingWriteConnector:
+        def execute(self, payload: dict[str, str], idempotency_key: str) -> WriteResult:
+            assert payload == {"title": "Weekly review"}
+            assert idempotency_key.startswith("reckoning-write:calendar-write-1:")
+            return WriteResult("success", "event-1", "Created one event.")
+
+    receipt = ExternalWriteService(tmp_path / "external-writes.json").execute(
+        "calendar-write-1",
+        RecordingWriteConnector(),
+        completed_at=NOW,
+    )
+    settled_status = gateway.handle(
+        "gateway-secret", TelegramRequest("status", "42")
+    )
+
+    assert "routine:weekly-review-v1" in status.text
+    assert "write:calendar-write-1" in status.text
+    assert routine_reply.text == "Confirmed routine:weekly-review-v1."
+    assert write_reply.text == "Confirmed write:calendar-write-1."
+    assert JsonFileAutomationRepository(
+        tmp_path / "automation.json"
+    ).get_proposal(routine.id).status == "confirmed"
+    assert receipt.status == "success"
+    assert settled_status.text.endswith("Pending approvals: none.")
+
+
+def test_control_keeps_write_authority_history_without_claiming_prepared_actions(
+    tmp_path: Path,
+) -> None:
+    writes = ExternalWriteService(tmp_path / "external-writes.json")
+    permission = writes.grant_standing_permission(
+        permission_id="weekly-calendar-write",
+        connector_id="calendar",
+        action_type="create-event",
+        target="mary-calendar",
+        trigger="weekly-plan",
+        boundary="one event",
+        granted_at=NOW,
+    )
+    executed = writes.prepare(
+        write_id="executed-write",
+        connector_id="calendar",
+        action_type="create-event",
+        target="mary-calendar",
+        trigger="weekly-plan",
+        boundary="one event",
+        payload={"title": "Executed event"},
+        prepared_at=NOW,
+    )
+    writes.prepare(
+        write_id="pending-delete",
+        connector_id="calendar",
+        action_type="delete-event",
+        target="mary-calendar",
+        trigger="manual",
+        boundary="one event",
+        payload={"event_id": "event-old"},
+        prepared_at=NOW,
+    )
+
+    class SuccessfulWriteConnector:
+        def execute(self, payload: dict[str, str], idempotency_key: str) -> WriteResult:
+            del payload, idempotency_key
+            return WriteResult("success", "event-new", "Created the event.")
+
+    writes.execute(executed.id, SuccessfulWriteConnector(), completed_at=NOW)
+    writes.revoke_standing_permission(permission.id, revoked_at=NOW)
+    core = ReckoningApplication(
+        ApplicationDependencies(
+            clock=FixedClock(),
+            model=HistoryRecordingModel(),
+            placement=PlacementState("local", "local", True),
+            connectors=NoConnectors(),
+            storage=InMemoryConversationStorage(),
+        )
+    )
+    interface = create_local_interface_application(
+        core,
+        tmp_path / "interfaces.json",
+    )
+
+    control = interface.control()
+    status = interface.status("web")
+
+    assert control.receipts[0].permissions == ("weekly-calendar-write",)
+    assert control.receipts[0].approvals == ()
+    assert control.actions == ("create-event",)
+    assert "delete-event" not in control.actions
+    assert control.permissions == ("weekly-calendar-write",)
+    assert status.pending_approvals == ("write:pending-delete",)
+
+
 def test_real_application_boundary_keeps_web_and_telegram_history_separate() -> None:
     model = HistoryRecordingModel()
     legacy_storage = InMemoryConversationStorage()
@@ -744,6 +911,45 @@ def test_real_application_boundary_keeps_web_and_telegram_history_separate() -> 
         ("assistant", "Reply 1"),
     ]
     assert legacy_storage.list_messages() == ()
+
+
+def test_real_channel_boundary_passes_shared_context_below_protected_layers() -> None:
+    model = HistoryRecordingModel()
+    core = ReckoningApplication(
+        ApplicationDependencies(
+            clock=FixedClock(),
+            model=model,
+            placement=PlacementState("local", "local", True),
+            connectors=NoConnectors(),
+            storage=InMemoryConversationStorage(),
+        )
+    )
+    interface = ReckoningInterfaceApplication(
+        repository=InMemoryInterfaceRepository(
+            InterfaceState(
+                confirmed_records=("decision d-1: keep the smaller proof",),
+                permissions=("calendar.read",),
+            )
+        ),
+        responder=ApplicationChannelResponder(core),
+        placement=local_policy(),
+    )
+
+    interface.send_channel_message("telegram", "What should I do?", session_id="42")
+
+    layers = model.requests[0].prompt_stack.layers
+    assert [layer.name for layer in layers] == [
+        "protected_product_contract",
+        "product_identity",
+        "persona",
+        "confirmed_context",
+        "permissions",
+        "retrieved_context",
+        "tools",
+        "current_request",
+    ]
+    assert layers[3].content == "decision d-1: keep the smaller proof"
+    assert layers[4].content == "calendar.read"
 
 
 def test_hybrid_placement_prevents_private_copy_and_declares_limited_mode(
@@ -877,21 +1083,24 @@ def test_installed_hybrid_outage_gives_web_and_telegram_identical_truth(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "installed-hybrid"
-    setup_instance(data_dir, "hybrid")
+    server_dir = tmp_path / "installed-hybrid-server"
+    setup_instance(data_dir, "hybrid", server_data_dir=server_dir)
     runtime = load_installation_runtime(
         data_dir,
+        server_data_dir=server_dir,
         local_node_available=True,
         server_node_available=False,
     )
     core = create_local_application(
-        data_dir / "continuity.json",
+        runtime.state_path("confirmed-state", "continuity.json"),
         persona=runtime.persona,
         placement=runtime.application_placement,
     )
     interface = create_local_interface_application(
         core,
-        data_dir / "interfaces.json",
+        runtime.state_path("confirmed-state", "interfaces.json"),
         placement=runtime.interface_placement,
+        connector_data_dir=runtime.root_for("approved-remote-sources"),
     )
     web = ReckoningWebApplication(
         LegacyApplicationStub(), interface_application=interface
@@ -913,6 +1122,115 @@ def test_installed_hybrid_outage_gives_web_and_telegram_identical_truth(
     assert interface.status("web").placement == interface.status(
         "telegram"
     ).placement
+
+
+def test_hybrid_state_files_land_only_on_their_assigned_node_roots(
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "routed-local"
+    server_root = tmp_path / "routed-server"
+    setup_instance(local_root, "hybrid", server_data_dir=server_root)
+    runtime = load_installation_runtime(
+        local_root, server_data_dir=server_root
+    )
+    core = create_local_application(
+        runtime.state_path("confirmed-state", "continuity.json")
+    )
+    interface = create_local_interface_application(
+        core,
+        runtime.state_path("confirmed-state", "interfaces.json"),
+        placement=runtime.interface_placement,
+        connector_data_dir=runtime.root_for("approved-remote-sources"),
+    )
+
+    class RoutedConnector:
+        connector_id = "routed-json"
+        read_scopes = ("documents:read",)
+        write_scopes: tuple[str, ...] = ()
+
+        def verify_identity(self) -> str:
+            return "mary-routed-source"
+
+        def synchronize(
+            self, read_scope: tuple[str, ...]
+        ) -> tuple[ConnectorItem, ...]:
+            assert read_scope == self.read_scopes
+            return ()
+
+    interface.send_channel_message("web", "Record this confirmed-state turn.")
+    connectors = ConnectorService(
+        path=runtime.state_path("approved-remote-sources", "connectors.json")
+    )
+    connectors.connect(RoutedConnector(), read_scope=("documents:read",))
+
+    assert runtime.root_for("personal-context") == (
+        local_root / "personal-context"
+    )
+    assert runtime.root_for("confirmed-state") == local_root / "confirmed-state"
+    assert runtime.root_for("approved-remote-sources") == (
+        server_root / "approved-remote-sources"
+    )
+    assert (local_root / "confirmed-state" / "interfaces.json").is_file()
+    assert (server_root / "approved-remote-sources" / "connectors.json").is_file()
+    assert not (server_root / "confirmed-state" / "interfaces.json").exists()
+    assert not (local_root / "approved-remote-sources" / "connectors.json").exists()
+
+
+def test_live_node_probe_outage_is_shared_by_web_and_telegram(
+    tmp_path: Path,
+) -> None:
+    local_root = tmp_path / "probe-local"
+    server_root = tmp_path / "probe-server"
+    setup_instance(local_root, "hybrid", server_data_dir=server_root)
+    runtime = load_installation_runtime(
+        local_root, server_data_dir=server_root
+    )
+    core = create_local_application(
+        runtime.state_path("confirmed-state", "continuity.json")
+    )
+    interface = create_local_interface_application(
+        core,
+        runtime.state_path("confirmed-state", "interfaces.json"),
+        placement=runtime.interface_placement,
+        connector_data_dir=runtime.root_for("approved-remote-sources"),
+    )
+    web = ReckoningWebApplication(
+        LegacyApplicationStub(), interface_application=interface
+    )
+    telegram = TelegramGateway(
+        interface,
+        authentication_token="telegram-secret",
+        allowed_chat_ids=("mary",),
+    )
+    marker = server_root / NODE_MARKER
+    offline_marker = server_root / ".reckoning-node.offline"
+
+    marker.replace(offline_marker)
+    try:
+        _, _, home = request(web, "GET", "/home")
+        telegram_status = telegram.handle(
+            "telegram-secret", TelegramRequest(kind="status", chat_id="mary")
+        )
+    finally:
+        offline_marker.replace(marker)
+
+    expected = "Limited mode: unavailable context: approved-remote-sources."
+    assert expected.encode() in home
+    assert expected in telegram_status.text
+
+
+def test_web_parser_accepts_the_configured_server_root() -> None:
+    arguments = build_web_parser().parse_args(
+        [
+            "--data-dir",
+            "/srv/reckoning-bootstrap",
+            "--server-data-dir",
+            "/mnt/reckoning-server",
+        ]
+    )
+
+    assert arguments.data_dir == Path("/srv/reckoning-bootstrap")
+    assert arguments.server_data_dir == Path("/mnt/reckoning-server")
 
 
 @pytest.mark.parametrize(

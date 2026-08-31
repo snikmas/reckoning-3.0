@@ -18,6 +18,22 @@ Humor = Literal["none", "dry", "light"]
 Challenge = Literal["supportive", "probing", "demanding", "uncomfortable"]
 SensitiveTopicHandling = Literal["warm", "calm", "practical"]
 
+_PERSONA_FILE_FIELDS = {
+    "schema_version",
+    "authored",
+    "active_persona_id",
+}
+_PERSONA_DEFINITION_FIELDS = {
+    "id",
+    "name",
+    "voice",
+    "directness",
+    "warmth",
+    "humor",
+    "challenge",
+    "sensitive_topic_handling",
+}
+
 _VOICE_INSTRUCTIONS: dict[Voice, str] = {
     "composed": "Use a composed voice.",
     "reflective": "Use a reflective voice.",
@@ -218,6 +234,8 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
         )
         if data.get("schema_version") != 1:
             raise RuntimeError("Unsupported persona storage schema.")
+        if set(data) != _PERSONA_FILE_FIELDS:
+            raise RuntimeError("Stored persona configuration is invalid.")
         authored = data.get("authored")
         if not isinstance(authored, list):
             raise RuntimeError("Stored persona configuration is invalid.")
@@ -303,6 +321,8 @@ class PersonaService:
 
 
 def _definition_from_data(data: dict[str, Any]) -> PersonaDefinition:
+    if set(data) != _PERSONA_DEFINITION_FIELDS:
+        raise ValueError("A stored persona may contain only style fields.")
     return PersonaDefinition(
         id=str(data["id"]),
         name=str(data["name"]),

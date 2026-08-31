@@ -5,6 +5,8 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+from types import MappingProxyType
+from collections.abc import Mapping
 from typing import Literal, Protocol
 
 from reckoning.external_content import (
@@ -193,6 +195,10 @@ class ConnectorService:
             raise
         for item in incoming:
             key = (connector_id, item.external_id)
+            existing = self._items.get(key)
+            if existing is not None and existing.deletion_state != "active":
+                self._content_results.pop(key, None)
+                continue
             self._content_results[key] = self._content_boundary.inspect(
                 UntrustedContent(item.external_id, item.provenance, item.content),
                 protected_prompt_layers=(
@@ -205,7 +211,6 @@ class ConnectorService:
                     for scope in connection.granted_read_scope
                 ),
             )
-            existing = self._items.get(key)
             if existing is None:
                 self._items[key] = ImportedConnectorItem(
                     connector_id,
@@ -241,6 +246,12 @@ class ConnectorService:
     def content_result(
         self, connector_id: str, external_id: str
     ) -> ExternalContentResult:
+        item = self._items.get((connector_id, external_id))
+        if item is None or item.deletion_state != "active":
+            raise KeyError(
+                f"Synchronized connector item is not available: "
+                f"{connector_id}:{external_id}"
+            )
         try:
             return self._content_results[(connector_id, external_id)]
         except KeyError as error:
@@ -285,6 +296,7 @@ class ConnectorService:
                 deletion_state="suppressed" if mode == "suppress" else "deleted",
             )
             self._items[key] = updated
+            self._content_results.pop(key, None)
             changed.append(updated)
         self._flush()
         return tuple(changed)
@@ -406,7 +418,7 @@ class PreparedWrite:
     target: str
     trigger: str
     boundary: str
-    payload: dict[str, str]
+    payload: Mapping[str, str]
     prepared_at: datetime
     payload_digest: str
     exact_approval_id: str | None = None
@@ -449,6 +461,11 @@ class WriteReceipt:
     attempts: int
     idempotency_key: str
     completed_at: datetime
+    authorization_kind: Literal[
+        "exact_approval", "standing_permission", "unknown"
+    ]
+    authorization_id: str
+    authorization_scope: str
 
 
 class WriteConnector(Protocol):
@@ -498,6 +515,15 @@ class ExternalWriteService:
         payload: dict[str, str],
         prepared_at: datetime,
     ) -> PreparedWrite:
+        _validate_authority_scope(
+            connector_id=connector_id,
+            action_type=action_type,
+            target=target,
+            trigger=trigger,
+            boundary=boundary,
+        )
+        if not write_id.strip():
+            raise ValueError("An external write identifier is required.")
         if not payload:
             raise ValueError("An external write payload cannot be empty.")
         stable_payload = dict(sorted(payload.items()))
@@ -511,7 +537,7 @@ class ExternalWriteService:
             target,
             trigger,
             boundary,
-            stable_payload,
+            MappingProxyType(stable_payload),
             prepared_at,
             digest,
         )
@@ -523,6 +549,8 @@ class ExternalWriteService:
         self, write_id: str, *, approval_id: str, approved_at: datetime
     ) -> PreparedWrite:
         del approved_at
+        if not approval_id.strip():
+            raise ValueError("An exact approval identifier is required.")
         prepared = self._write(write_id)
         approved = replace(prepared, exact_approval_id=approval_id)
         self._writes[write_id] = approved
@@ -540,6 +568,15 @@ class ExternalWriteService:
         boundary: str,
         granted_at: datetime,
     ) -> StandingPermission:
+        if not permission_id.strip():
+            raise ValueError("A standing permission identifier is required.")
+        _validate_authority_scope(
+            connector_id=connector_id,
+            action_type=action_type,
+            target=target,
+            trigger=trigger,
+            boundary=boundary,
+        )
         permission = StandingPermission(
             permission_id,
             connector_id,
@@ -562,6 +599,15 @@ class ExternalWriteService:
         self._flush()
         return revoked
 
+    def pending_approval_ids(self) -> tuple[str, ...]:
+        """Return prepared writes that still require an exact user approval."""
+        return tuple(
+            prepared.id
+            for prepared in self._writes.values()
+            if prepared.id not in self._receipts
+            and not self._is_authorized(prepared)
+        )
+
     def execute(
         self,
         write_id: str,
@@ -573,7 +619,8 @@ class ExternalWriteService:
         if write_id in self._receipts:
             return self._receipts[write_id]
         prepared = self._write(write_id)
-        if not self._is_authorized(prepared):
+        authorization = self._authorization(prepared)
+        if authorization is None:
             return ApprovalRequest(
                 prepared.id,
                 dict(prepared.payload),
@@ -591,31 +638,59 @@ class ExternalWriteService:
                     break
             except Exception as error:  # adapter failures are recorded, not claimed away
                 result = WriteResult("failed", None, str(error))
+        authorization_kind, authorization_id = authorization
         receipt = WriteReceipt(
-            prepared.id,
-            prepared.connector_id,
-            result.status,
-            result.external_id,
-            result.detail,
-            attempts,
-            idempotency_key,
-            completed_at,
+            write_id=prepared.id,
+            connector_id=prepared.connector_id,
+            status=result.status,
+            external_id=result.external_id,
+            detail=result.detail,
+            attempts=attempts,
+            idempotency_key=idempotency_key,
+            completed_at=completed_at,
+            authorization_kind=authorization_kind,
+            authorization_id=authorization_id,
+            authorization_scope=self._authorization_scope(prepared),
         )
         self._receipts[write_id] = receipt
         self._flush()
         return receipt
 
     def _is_authorized(self, prepared: PreparedWrite) -> bool:
+        return self._authorization(prepared) is not None
+
+    def _authorization(
+        self, prepared: PreparedWrite
+    ) -> tuple[Literal["exact_approval", "standing_permission"], str] | None:
         if prepared.exact_approval_id is not None:
-            return True
-        return any(
-            permission.revoked_at is None
-            and permission.connector_id == prepared.connector_id
-            and permission.action_type == prepared.action_type
-            and permission.target == prepared.target
-            and permission.trigger == prepared.trigger
-            and permission.boundary == prepared.boundary
-            for permission in self._permissions.values()
+            return "exact_approval", prepared.exact_approval_id
+        permission = next(
+            (
+                permission
+                for permission in self._permissions.values()
+                if permission.revoked_at is None
+                and permission.connector_id == prepared.connector_id
+                and permission.action_type == prepared.action_type
+                and permission.target == prepared.target
+                and permission.trigger == prepared.trigger
+                and permission.boundary == prepared.boundary
+            ),
+            None,
+        )
+        if permission is None:
+            return None
+        return "standing_permission", permission.id
+
+    @staticmethod
+    def _authorization_scope(prepared: PreparedWrite) -> str:
+        return "|".join(
+            (
+                prepared.connector_id,
+                prepared.action_type,
+                prepared.target,
+                prepared.trigger,
+                prepared.boundary,
+            )
         )
 
     def _write(self, write_id: str) -> PreparedWrite:
@@ -646,6 +721,7 @@ class ExternalWriteService:
 def _prepared_write_to_data(value: PreparedWrite) -> dict[str, object]:
     return {
         **value.__dict__,
+        "payload": dict(value.payload),
         "prepared_at": value.prepared_at.isoformat(),
     }
 
@@ -661,7 +737,9 @@ def _prepared_write_from_data(data: dict[str, object]) -> PreparedWrite:
         target=str(data["target"]),
         trigger=str(data["trigger"]),
         boundary=str(data["boundary"]),
-        payload={str(key): str(value) for key, value in raw_payload.items()},
+        payload=MappingProxyType(
+            {str(key): str(value) for key, value in raw_payload.items()}
+        ),
         prepared_at=datetime.fromisoformat(str(data["prepared_at"])),
         payload_digest=str(data["payload_digest"]),
         exact_approval_id=(
@@ -714,4 +792,26 @@ def _write_receipt_from_data(data: dict[str, object]) -> WriteReceipt:
         attempts=int(str(data["attempts"])),
         idempotency_key=str(data["idempotency_key"]),
         completed_at=datetime.fromisoformat(str(data["completed_at"])),
+        authorization_kind=data.get("authorization_kind", "unknown"),  # type: ignore[arg-type]
+        authorization_id=str(data.get("authorization_id", "unknown")),
+        authorization_scope=str(data.get("authorization_scope", "")),
     )
+
+
+def _validate_authority_scope(
+    *,
+    connector_id: str,
+    action_type: str,
+    target: str,
+    trigger: str,
+    boundary: str,
+) -> None:
+    for label, value in (
+        ("connector", connector_id),
+        ("action type", action_type),
+        ("target", target),
+        ("trigger", trigger),
+        ("boundary", boundary),
+    ):
+        if not value.strip():
+            raise ValueError(f"An external-write {label} is required.")

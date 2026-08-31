@@ -7,7 +7,14 @@ from typing import Mapping
 
 ORCAROUTER_DEFAULT_MODEL = "orcarouter/auto"
 ORCAROUTER_DEFAULT_BASE_URL = "https://api.orcarouter.ai/v1"
-_ALLOWED_ENV_NAMES = ("ORCAROUTER_API_KEY", "MODEL", "BASE_URL")
+DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
+DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
+_ALLOWED_ENV_NAMES = (
+    "ORCAROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "MODEL",
+    "BASE_URL",
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,33 @@ class OrcaRouterSettings:
             api_key=value("ORCAROUTER_API_KEY"),
             model=value("MODEL") or ORCAROUTER_DEFAULT_MODEL,
             base_url=value("BASE_URL") or ORCAROUTER_DEFAULT_BASE_URL,
+        )
+
+
+@dataclass(frozen=True)
+class DeepSeekSettings:
+    api_key: str | None
+    model: str
+    base_url: str
+
+    @classmethod
+    def load(
+        cls,
+        env_file: Path = Path(".env"),
+        environ: Mapping[str, str] | None = None,
+    ) -> DeepSeekSettings:
+        file_values = _read_allowed_env_file(env_file)
+        process_values = os.environ if environ is None else environ
+
+        def value(name: str) -> str | None:
+            raw = process_values.get(name, file_values.get(name))
+            cleaned = raw.strip() if raw else ""
+            return cleaned or None
+
+        return cls(
+            api_key=value("DEEPSEEK_API_KEY"),
+            model=value("MODEL") or DEEPSEEK_DEFAULT_MODEL,
+            base_url=value("BASE_URL") or DEEPSEEK_DEFAULT_BASE_URL,
         )
 
 

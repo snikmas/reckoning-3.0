@@ -415,22 +415,31 @@ class DelegationCoordinator:
             review_status: ReviewStatus = "blocked"
         else:
             if self._model_gateway is None or self._tool_gateway is None:
-                raise RuntimeError("Bounded delegation requires host-owned gateways.")
+                violations = ("bounded delegation gateways are unavailable",)
+                review_status = "blocked"
             delegated_context: list[DelegatedContext] = []
-            for selection in request.context:
-                entries = self._context_source.read_entries(
-                    selection.category, selection.entry_ids
-                )
-                returned_ids = tuple(entry.id for entry in entries)
-                if returned_ids != selection.entry_ids:
-                    violations = (
-                        "context source returned entries outside the exact selection",
-                    )
-                    break
-                delegated_context.append(DelegatedContext(selection.category, entries))
+            if not violations:
+                try:
+                    for selection in request.context:
+                        entries = self._context_source.read_entries(
+                            selection.category, selection.entry_ids
+                        )
+                        returned_ids = tuple(entry.id for entry in entries)
+                        if returned_ids != selection.entry_ids:
+                            violations = (
+                                "context source returned entries outside the exact selection",
+                            )
+                            break
+                        delegated_context.append(
+                            DelegatedContext(selection.category, entries)
+                        )
+                except Exception:
+                    violations = ("delegated context selection failed safely",)
             if violations:
                 review_status = "blocked"
-            else:
+            if not violations:
+                assert self._model_gateway is not None
+                assert self._tool_gateway is not None
                 task = DelegatedTask(
                     purpose=request.purpose,
                     instructions=request.instructions,
@@ -456,23 +465,37 @@ class DelegationCoordinator:
                         retries=runtime.retries,
                         tools_used=tuple(runtime.tools_used),
                     )
+                except DelegationLimitExceeded as error:
+                    violations = (str(error),)
+                    review_status = "limited"
+                except Exception:
+                    violations = ("delegated execution failed safely",)
+                    review_status = "limited"
+                else:
                     unverified: list[str] = []
                     verified: list[str] = []
                     for evidence in result.evidence:
-                        if self._reviewer.verify_evidence(evidence):
+                        try:
+                            evidence_is_verified = (
+                                self._reviewer.verify_evidence(evidence) is True
+                            )
+                        except Exception:
+                            evidence_is_verified = False
+                            violations += (
+                                "Simon evidence verification failed safely: "
+                                + evidence.id,
+                            )
+                        if evidence_is_verified:
                             verified.append(evidence.id)
                         else:
                             unverified.append(evidence.id)
                     verified_evidence_ids = tuple(verified)
                     if unverified:
-                        violations = (
+                        violations += (
                             "Simon could not verify worker evidence: "
                             + ", ".join(unverified),
                         )
                     review_status = "limited" if violations else "completed"
-                except DelegationLimitExceeded as error:
-                    violations = (str(error),)
-                    review_status = "limited"
                 model_calls = runtime.model_calls
                 cost = runtime.cost
                 retries = runtime.retries
@@ -486,8 +509,24 @@ class DelegationCoordinator:
             policy_violations=violations,
             verified_evidence_ids=verified_evidence_ids,
         )
-        disposition = self._reviewer.dispose(review)
-        self._validate_disposition(review, disposition)
+        try:
+            disposition = self._reviewer.dispose(review)
+            self._validate_disposition(review, disposition)
+        except Exception:
+            violations += ("Simon disposition review failed safely",)
+            fallback_status: DispositionStatus = (
+                "blocked" if review.status == "blocked" else "limited"
+            )
+            disposition = AgentDisposition(
+                status=fallback_status,
+                final_response=(
+                    "Simon could not complete the accountable review. "
+                    "No delegated result was accepted."
+                ),
+                rationale=(
+                    "The disposition step failed, so the delegation failed closed."
+                ),
+            )
 
         receipt = DelegationReceipt(
             id=receipt_id,

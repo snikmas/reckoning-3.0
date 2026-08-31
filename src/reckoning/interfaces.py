@@ -42,6 +42,10 @@ class SourcePlacement:
             )
 
 
+class NodeAvailabilitySource(Protocol):
+    def is_available(self, node: NodeName) -> bool: ...
+
+
 @dataclass(frozen=True)
 class PlacementOutcome:
     status: PlacementStatus
@@ -56,6 +60,7 @@ class PlacementPolicy:
     categories: tuple[SourcePlacement, ...]
     local_node_available: bool
     server_node_available: bool
+    availability_source: NodeAvailabilitySource | None = None
 
     def __post_init__(self) -> None:
         category_names = tuple(item.category for item in self.categories)
@@ -114,8 +119,17 @@ class PlacementPolicy:
     def _nodes_available(self, placement: SourcePlacement) -> bool:
         required_nodes = {placement.storage_node, placement.processing_node}
         return not (
-            ("local" in required_nodes and not self.local_node_available)
-            or ("server" in required_nodes and not self.server_node_available)
+            ("local" in required_nodes and not self._node_available("local"))
+            or ("server" in required_nodes and not self._node_available("server"))
+        )
+
+    def _node_available(self, node: NodeName) -> bool:
+        if self.availability_source is not None:
+            return self.availability_source.is_available(node)
+        return (
+            self.local_node_available
+            if node == "local"
+            else self.server_node_available
         )
 
 
@@ -231,10 +245,12 @@ class ChannelResponder(Protocol):
 
 
 class MessageApplication(Protocol):
-    def respond_with_history(
+    def respond_with_channel_context(
         self,
         text: str,
         history: tuple[tuple[Literal["user", "assistant"], str], ...],
+        confirmed_records: tuple[str, ...],
+        permissions: tuple[str, ...],
     ) -> object: ...
 
 
@@ -248,7 +264,12 @@ class ApplicationChannelResponder:
         history = tuple(
             (message.role, message.content) for message in request.recent_history
         )
-        response = self._application.respond_with_history(request.text, history)
+        response = self._application.respond_with_channel_context(
+            request.text,
+            history,
+            request.confirmed_records,
+            request.permissions,
+        )
         content = getattr(response, "content", None)
         if not isinstance(content, str):
             raise RuntimeError("The conversation boundary returned an invalid message.")
@@ -324,6 +345,21 @@ class EmptyOperationalRecordSource:
         return OperationalSnapshot()
 
 
+class ConfirmationHandler(Protocol):
+    def pending_confirmation_ids(self) -> tuple[str, ...]: ...
+
+    def confirm(self, confirmation_id: str) -> bool: ...
+
+
+class NoDurableConfirmations:
+    def pending_confirmation_ids(self) -> tuple[str, ...]:
+        return ()
+
+    def confirm(self, confirmation_id: str) -> bool:
+        del confirmation_id
+        return False
+
+
 class ReckoningInterfaceApplication:
     """Channel-independent boundary for task areas and remote continuation."""
 
@@ -334,11 +370,13 @@ class ReckoningInterfaceApplication:
         responder: ChannelResponder,
         placement: PlacementPolicy,
         operational_records: OperationalRecordSource | None = None,
+        confirmations: ConfirmationHandler | None = None,
     ) -> None:
         self._repository = repository
         self._responder = responder
         self._placement = placement
         self._operational_records = operational_records or EmptyOperationalRecordSource()
+        self._confirmations = confirmations or NoDurableConfirmations()
 
     def landing_area(self) -> Literal["home", "simon"]:
         return "home" if self._repository.load().returning_user else "simon"
@@ -479,6 +517,8 @@ class ReckoningInterfaceApplication:
 
     def status(self, channel: ChannelName) -> ChannelStatus:
         del channel  # Placement and operational truth are shared across channels.
+        state = self._repository.load()
+        operational = self._operational_records.snapshot()
         control = self.control()
         placement = self._placement.current_outcome()
         if placement.status != "available":
@@ -487,9 +527,18 @@ class ReckoningInterfaceApplication:
             health = "warning"
         else:
             health = "healthy"
-        return ChannelStatus(health, placement, control.approvals)
+        pending_approvals = _unique(
+            (
+                *state.pending_approvals,
+                *operational.approvals,
+                *self._confirmations.pending_confirmation_ids(),
+            )
+        )
+        return ChannelStatus(health, placement, pending_approvals)
 
     def confirm(self, confirmation_id: str) -> bool:
+        if self._confirmations.confirm(confirmation_id):
+            return True
         state = self._repository.load()
         if confirmation_id not in state.pending_approvals:
             return False
@@ -548,6 +597,7 @@ class ReckoningInterfaceApplication:
                     *state.pending_approvals,
                     *_flatten(receipts, "approvals"),
                     *operational.approvals,
+                    *self._confirmations.pending_confirmation_ids(),
                 )
             ),
             cost_units=sum(receipt.cost_units for receipt in receipts),
@@ -605,7 +655,7 @@ class ReckoningInterfaceApplication:
             return "degraded"
         if control.failures:
             return "warning"
-        if control.approvals:
+        if self.status("web").pending_approvals:
             return "approval"
         return {
             "idle": "idle",
@@ -676,7 +726,9 @@ def create_local_interface_application(
     data_path: Path | None = None,
     *,
     placement: PlacementPolicy | None = None,
+    connector_data_dir: Path | None = None,
 ) -> ReckoningInterfaceApplication:
+    from reckoning.confirmations import LocalDurableConfirmationHandler
     from reckoning.operational_records import LocalOperationalRecordSource
 
     state_path = data_path or (
@@ -685,7 +737,11 @@ def create_local_interface_application(
     return ReckoningInterfaceApplication(
         repository=JsonFileInterfaceRepository(state_path),
         responder=ApplicationChannelResponder(application),
-        operational_records=LocalOperationalRecordSource(state_path.parent),
+        operational_records=LocalOperationalRecordSource(
+            state_path.parent,
+            connector_data_dir=connector_data_dir,
+        ),
+        confirmations=LocalDurableConfirmationHandler(state_path.parent),
         placement=placement
         or PlacementPolicy(
             profile="local",

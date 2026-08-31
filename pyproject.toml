@@ -15,6 +15,7 @@ test = ["pytest>=9,<10"]
 [project.scripts]
 reckoning = "reckoning.web:main"
 reckoning-ops = "reckoning.cli:main"
+reckoning-telegram = "reckoning.telegram:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

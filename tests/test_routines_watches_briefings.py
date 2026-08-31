@@ -10,6 +10,7 @@ from reckoning.automation import (
     BriefingPolicy,
     BriefingService,
     JsonFileAutomationRepository,
+    RoutineContractDraft,
     RoutineService,
     RoutineStep,
     StepResult,
@@ -54,6 +55,7 @@ def test_recurring_request_requires_confirmation_and_material_change_is_new_prop
             scheduled_for=NOW,
             idempotency_key="weekly-goal-check:2026-08-31",
             steps=(RoutineStep("read", "deterministic", "read-official-source"),),
+            triggered_by="0 18 * * SUN",
         )
 
     confirmed = service.confirm(proposal.id)
@@ -79,6 +81,40 @@ def test_recurring_request_requires_confirmation_and_material_change_is_new_prop
         )
 
 
+def test_natural_language_request_is_compiled_into_a_reviewable_contract(
+    tmp_path: Path,
+) -> None:
+    service = RoutineService(JsonFileAutomationRepository(tmp_path / "compiled.json"))
+
+    class Compiler:
+        def compile(self, request: str) -> RoutineContractDraft:
+            assert request == "Every Sunday, check my approved goal sources."
+            return RoutineContractDraft(
+                trigger="Sunday 18:00",
+                source_scope=("official-goal-source",),
+                context_scope=("goal:ielts",),
+                tools=("read-official-source",),
+                permissions=("read:official-goal-source",),
+                delivery="private-web",
+                model_policy="no model",
+                cost_ceiling=0,
+                retry_limit=1,
+                delegation_policy="direct execution only",
+                failure_behavior="record failure",
+            )
+
+    proposal = service.compile_request(
+        "Every Sunday, check my approved goal sources.",
+        compiler=Compiler(),
+        proposal_id="compiled-v1",
+        routine_id="compiled",
+        created_at=NOW,
+    )
+
+    assert proposal.status == "proposed"
+    assert proposal.trigger == "Sunday 18:00"
+    assert proposal.tools == ("read-official-source",)
+
 def test_confirmed_routine_resumes_with_idempotency_and_deterministic_step_uses_no_model(
     tmp_path: Path,
 ) -> None:
@@ -91,6 +127,7 @@ def test_confirmed_routine_resumes_with_idempotency_and_deterministic_step_uses_
         scheduled_for=NOW,
         idempotency_key="weekly-goal-check:2026-08-31",
         steps=(RoutineStep("deliver", "deterministic", "deliver-private-briefing"),),
+        triggered_by="0 18 * * SUN",
     )
     effects: dict[str, str] = {}
 
@@ -148,7 +185,14 @@ def test_watch_suppresses_weak_changes_and_can_propose_relevant_check_in() -> No
         open_ended=True,
     )
     with pytest.raises(PermissionError, match="confirmed"):
-        service.run(proposal.id, run_id="watch-run-0", findings=(), checked_at=NOW)
+        service.run(
+            proposal.id,
+            run_id="watch-run-0",
+            triggered_by="daily at 08:00",
+            quoted_cost_units=0,
+            findings=(),
+            checked_at=NOW,
+        )
 
     service.confirm(proposal.id)
     with pytest.raises(PermissionError, match="trigger"):
@@ -156,6 +200,7 @@ def test_watch_suppresses_weak_changes_and_can_propose_relevant_check_in() -> No
             proposal.id,
             run_id="watch-run-wrong-trigger",
             triggered_by="manual research",
+            quoted_cost_units=0,
             findings=(),
             checked_at=NOW,
         )
@@ -163,6 +208,7 @@ def test_watch_suppresses_weak_changes_and_can_propose_relevant_check_in() -> No
         proposal.id,
         run_id="watch-run-1",
         triggered_by="daily at 08:00",
+        quoted_cost_units=3,
         checked_at=NOW,
         findings=(
             WatchFinding(
@@ -205,6 +251,7 @@ def test_routine_failure_uses_bounded_retries_and_truthful_terminal_receipt(
         scheduled_for=NOW,
         idempotency_key="failed-run-key",
         steps=(RoutineStep("read", "deterministic", "read-official-source"),),
+        triggered_by="0 18 * * SUN",
     )
 
     class OfflineExecutor:
@@ -221,6 +268,108 @@ def test_routine_failure_uses_bounded_retries_and_truthful_terminal_receipt(
     assert receipt.status == "failed"
     assert receipt.attempts == 2
     assert receipt.results[0].detail == "source is offline"
+
+
+def test_routine_blocks_quoted_cost_before_executor_side_effect(tmp_path: Path) -> None:
+    service = RoutineService(JsonFileAutomationRepository(tmp_path / "cost.json"))
+    proposal = service.propose(
+        proposal_id="cost-v1",
+        routine_id="cost",
+        source_request="Summarize one approved source.",
+        created_at=NOW,
+        trigger="manual",
+        source_scope=("approved-source",),
+        context_scope=("goal:one",),
+        tools=("summarize",),
+        permissions=("read:approved-source",),
+        delivery="private-web",
+        model_policy="one model call",
+        cost_ceiling=2,
+        retry_limit=0,
+        delegation_policy="direct",
+        failure_behavior="record blocked receipt",
+    )
+    service.confirm(proposal.id)
+    service.start_run(
+        run_id="cost-run",
+        proposal_id=proposal.id,
+        scheduled_for=NOW,
+        idempotency_key="cost-run",
+        steps=(RoutineStep("summary", "model", "summarize"),),
+        triggered_by="manual",
+    )
+
+    class ExpensiveExecutor:
+        called = False
+
+        def quote_cost(self, step: RoutineStep) -> int:
+            return 3
+
+        def execute(self, step: RoutineStep, idempotency_key: str) -> StepResult:
+            self.called = True
+            return StepResult("success", "should not run", cost_units=3)
+
+    executor = ExpensiveExecutor()
+    receipt = service.resume_run(
+        "cost-run",
+        deterministic_executor=executor,
+        model_executor=executor,
+        completed_at=NOW,
+    )
+
+    assert receipt.status == "blocked"
+    assert executor.called is False
+
+
+def test_routine_never_claims_success_when_executor_exceeds_quote(
+    tmp_path: Path,
+) -> None:
+    service = RoutineService(JsonFileAutomationRepository(tmp_path / "quote.json"))
+    proposal = service.propose(
+        proposal_id="quote-v1",
+        routine_id="quote",
+        source_request="Summarize one source.",
+        created_at=NOW,
+        trigger="manual",
+        source_scope=("source",),
+        context_scope=("goal",),
+        tools=("summarize",),
+        permissions=("read:source",),
+        delivery="private-web",
+        model_policy="one model call",
+        cost_ceiling=2,
+        retry_limit=0,
+        delegation_policy="direct",
+        failure_behavior="record blocked receipt",
+    )
+    service.confirm(proposal.id)
+    service.start_run(
+        run_id="quote-run",
+        proposal_id=proposal.id,
+        scheduled_for=NOW,
+        idempotency_key="quote-run",
+        steps=(RoutineStep("summary", "model", "summarize"),),
+        triggered_by="manual",
+    )
+
+    class QuoteBreakingExecutor:
+        def quote_cost(self, step: RoutineStep) -> int:
+            return 1
+
+        def execute(self, step: RoutineStep, idempotency_key: str) -> StepResult:
+            return StepResult("success", "adapter breached quote", cost_units=100)
+
+    executor = QuoteBreakingExecutor()
+    receipt = service.resume_run(
+        "quote-run",
+        deterministic_executor=executor,
+        model_executor=executor,
+        completed_at=NOW,
+    )
+
+    assert receipt.status == "blocked"
+    assert receipt.results[0].cost_units == 100
+    assert "exceeded" in receipt.results[0].detail
 
 
 def test_selective_briefing_ranks_within_cap_and_truthfully_reports_no_change() -> None:
