@@ -30,6 +30,12 @@ from reckoning.personas import (
     PersonaDefinition,
     PersonaService,
 )
+from reckoning.personal_context import (
+    JsonFilePersonalContextRepository,
+    PersonalContextService,
+    UserProfileEntry,
+    read_user_profile,
+)
 
 TRANSFER_FORMAT = "reckoning-encrypted-transfer"
 TRANSFER_VERSION = 1
@@ -206,6 +212,7 @@ def setup_instance(
     persona: PersonaDefinition | None = None,
     *,
     server_data_dir: Path | None = None,
+    user_profile: Path | None = None,
 ) -> dict[str, Any]:
     local_root = data_dir.expanduser().resolve()
     _require_empty_setup_root(local_root, "data")
@@ -219,8 +226,13 @@ def setup_instance(
         and persona != defaults_by_id[persona.id]
     ):
         raise OperationError("an original persona cannot replace a default persona")
+    try:
+        profile_entries = read_user_profile(user_profile) if user_profile else ()
+    except (OSError, ValueError) as error:
+        raise OperationError(str(error)) from error
     _check_core_continuity_loop()
     selected_persona = persona or DEFAULT_PERSONAS[0]
+    created_at = datetime.now(timezone.utc)
     roots = {
         "local": "local-data-dir",
         "server": str(server_root) if server_root else None,
@@ -247,7 +259,12 @@ def setup_instance(
             "core_continuity_loop": "passed",
             "provider": "deterministic-fake",
         },
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "profile_bootstrap": {
+            "provided": bool(profile_entries),
+            "proposal_count": len(profile_entries),
+            "raw_profile_retained": False,
+        },
+        "created_at": created_at.isoformat(),
     }
 
     local_staging: Path | None = None
@@ -262,6 +279,8 @@ def setup_instance(
             placement,
             selected_persona,
             configuration,
+            profile_entries,
+            created_at,
         )
         staged_roots = [(local_root, local_staging)]
         if server_root is not None and server_staging is not None:
@@ -297,6 +316,8 @@ def _write_staged_setup(
     placement: PlacementProfile,
     selected_persona: PersonaDefinition,
     configuration: dict[str, Any],
+    profile_entries: tuple[UserProfileEntry, ...],
+    created_at: datetime,
 ) -> None:
     routes = _state_routes(
         placement,
@@ -323,6 +344,27 @@ def _write_staged_setup(
         persona_service.select(selected_persona.id)
     else:
         persona_service.author_and_select(selected_persona)
+    profile_route = next(
+        route for route in routes if route.category == "personal-context"
+    )
+    profile_repository = JsonFilePersonalContextRepository(
+        profile_route.root / "personal-context.json"
+    )
+    profile_repository.initialize()
+    profile_service = PersonalContextService(profile_repository)
+    processing_location = (
+        "local" if profile_route.node == "local" else "personal-server"
+    )
+    for entry in profile_entries:
+        profile_service.propose(
+            record_id=entry.record_id,
+            original_text=entry.text,
+            language="und",
+            canonical_meaning=f"{entry.section}: {entry.text}",
+            source=entry.source,
+            created_at=created_at,
+            processing_location=processing_location,
+        )
     atomic_write_json(
         local_staging / "release-evidence.json",
         {"schema_version": 1, **{gate: False for gate in RELEASE_GATES}},

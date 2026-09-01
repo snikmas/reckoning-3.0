@@ -66,6 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Separate personal-server storage root; required outside local placement.",
     )
     setup.add_argument(
+        "--user-profile",
+        type=Path,
+        help=(
+            "Optional private UTF-8 Markdown profile. Setup imports reviewable "
+            "proposals and does not retain the raw document."
+        ),
+    )
+    setup.add_argument(
         "--persona",
         choices=("simon", "steady", "original"),
         default="simon",
@@ -110,15 +118,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.command == "setup":
             persona = _setup_persona(arguments)
-            setup_instance(
+            configuration = setup_instance(
                 arguments.data_dir,
                 arguments.placement,
                 persona,
                 server_data_dir=arguments.server_data_dir,
+                user_profile=arguments.user_profile,
             )
             print(
                 _setup_explanation(
-                    arguments.placement, persona.name, arguments.data_dir
+                    arguments.placement,
+                    persona.name,
+                    arguments.data_dir,
+                    int(configuration["profile_bootstrap"]["proposal_count"]),
                 )
             )
             return 0
@@ -228,7 +240,7 @@ def _setup_persona(arguments: argparse.Namespace) -> PersonaDefinition:
 
 
 def _setup_explanation(
-    placement: str, persona_name: str, data_dir: Path
+    placement: str, persona_name: str, data_dir: Path, profile_proposals: int
 ) -> str:
     placement_explanations = {
         "local": "Private data stays local on this device.",
@@ -246,6 +258,14 @@ def _setup_explanation(
         (
             f"Single-user Reckoning setup complete with {placement} placement.",
             f"The selected persona is {persona_name}.",
+            (
+                f"Imported {profile_proposals} private profile proposals for review "
+                "after the first Simon response. You can confirm, correct, or reject "
+                "each proposal. The raw profile was not retained."
+                if profile_proposals
+                else "No user profile was provided. Simon will declare limited context "
+                "until personal context is confirmed."
+            ),
             placement_explanations[placement],
             "External writes require exact or standing permission. Lower layers "
             "cannot broaden that authority.",

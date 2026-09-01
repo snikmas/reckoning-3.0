@@ -151,7 +151,44 @@ class ReckoningWebApplication:
                 )
             start_response("303 See Other", [("Location", "/"), ("Content-Length", "0")])
             return [b""]
+        profile_action = self._profile_action(method, path)
+        if profile_action is not None:
+            record_id, action = profile_action
+            try:
+                if action == "correct":
+                    self._application.correct_profile_proposal(
+                        record_id,
+                        self._read_form_field(environ, "meaning"),
+                        language="und",
+                    )
+                elif action == "confirm":
+                    self._application.confirm_profile_proposal(record_id)
+                else:
+                    self._application.reject_profile_proposal(record_id)
+            except (KeyError, ValueError, RuntimeError) as error:
+                return self._html_response(
+                    start_response,
+                    "400 Bad Request",
+                    self._render_interface_area("simon", error=str(error)),
+                )
+            start_response(
+                "303 See Other",
+                [("Location", "/simon"), ("Content-Length", "0")],
+            )
+            return [b""]
         return None
+
+    @staticmethod
+    def _profile_action(method: str, path: str) -> tuple[str, str] | None:
+        if method != "POST":
+            return None
+        parts = path.strip("/").split("/")
+        if len(parts) != 3 or parts[0] != "profile":
+            return None
+        record_id, action = parts[1], parts[2]
+        if not record_id or action not in {"correct", "confirm", "reject"}:
+            return None
+        return record_id, action
 
     @staticmethod
     def _read_message(environ: WSGIEnvironment) -> str:
@@ -166,6 +203,18 @@ class ReckoningWebApplication:
         body = input_stream.read(content_length).decode("utf-8")
         fields = parse_qs(body, keep_blank_values=True)
         return fields.get("message", [""])[0]
+
+    @staticmethod
+    def _read_form_field(environ: WSGIEnvironment, name: str) -> str:
+        content_length = int(str(environ.get("CONTENT_LENGTH") or "0"))
+        if content_length > 65_536:
+            raise ValueError("The form is too long.")
+        input_stream = environ.get("wsgi.input")
+        if input_stream is None or not hasattr(input_stream, "read"):
+            raise ValueError("The request body is missing.")
+        body = input_stream.read(content_length).decode("utf-8")
+        fields = parse_qs(body, keep_blank_values=True)
+        return fields.get(name, [""])[0]
 
     @staticmethod
     def _html_response(
@@ -264,6 +313,11 @@ class ReckoningWebApplication:
                 for message in messages
             ) or '<p class="empty">Send Simon the first message.</p>'
             error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
+            profile_review = (
+                self._render_profile_review()
+                if any(message.role == "assistant" for message in messages)
+                else ""
+            )
             content = f"""
               <header><p class="eyebrow">Conversation</p><h1>Simon</h1></header>
               <div aria-live="polite">{conversation}</div>{error_markup}
@@ -272,6 +326,7 @@ class ReckoningWebApplication:
                 <textarea id="message" name="message" required></textarea>
                 <button type="submit">Send</button>
               </form>
+              {profile_review}
             """
         elif area == "plan":
             content = (
@@ -377,6 +432,44 @@ class ReckoningWebApplication:
 </body>
 </html>"""
 
+    def _render_profile_review(self) -> str:
+        profile_proposals = getattr(self._application, "profile_proposals", None)
+        if not callable(profile_proposals):
+            return ""
+        proposals = profile_proposals()
+        if not proposals:
+            return ""
+        cards = "".join(
+            f"""
+            <article class="control-section"
+              data-profile-proposal="{escape(item.record_id)}">
+              <p><strong>Unconfirmed profile statement</strong></p>
+              <p>Source: {escape(item.source)}</p>
+              <form action="/profile/{escape(item.record_id)}/correct" method="post">
+                <label for="meaning-{escape(item.record_id)}">Meaning</label>
+                <textarea id="meaning-{escape(item.record_id)}" name="meaning"
+                  required>{escape(item.original_text)}</textarea>
+                <button type="submit">Save correction</button>
+              </form>
+              <form action="/profile/{escape(item.record_id)}/confirm" method="post">
+                <button type="submit">Confirm</button>
+              </form>
+              <form action="/profile/{escape(item.record_id)}/reject" method="post">
+                <button type="submit">Reject</button>
+              </form>
+              <a href="/">Skip for now</a>
+            </article>
+            """
+            for item in proposals
+        )
+        return (
+            '<section aria-labelledby="profile-review-heading">'
+            '<h2 id="profile-review-heading">Review your profile</h2>'
+            "<p>Correct, confirm, reject, or leave a statement for later. "
+            "Nothing becomes confirmed personal context without your choice.</p>"
+            f"{cards}</section>"
+        )
+
     @classmethod
     def _render_control(cls, control: ControlView) -> str:
         runs = tuple(
@@ -463,6 +556,9 @@ def main() -> None:
 
     application = create_local_application(
         runtime.state_path("confirmed-state", "continuity.json"),
+        personal_context_path=runtime.state_path(
+            "personal-context", "personal-context.json"
+        ),
         provider_name=provider_name,
         orcarouter_api_key=orcarouter_settings.api_key,
         deepseek_api_key=deepseek_settings.api_key,

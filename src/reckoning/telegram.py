@@ -358,6 +358,9 @@ def main() -> None:
     )
     application = create_local_application(
         runtime.state_path("confirmed-state", "continuity.json"),
+        personal_context_path=runtime.state_path(
+            "personal-context", "personal-context.json"
+        ),
         provider_name=provider_name,
         orcarouter_api_key=orcarouter_settings.api_key,
         deepseek_api_key=deepseek_settings.api_key,
