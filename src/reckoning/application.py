@@ -23,6 +23,11 @@ from reckoning.continuity import (
 from reckoning.providers import ProviderFailure, ProviderResponse, ProviderUsage
 from reckoning.external_content import ExternalContentResult
 from reckoning.json_store import atomic_write_json, read_json
+from reckoning.personal_context import (
+    PersonalContextService,
+    PersonalContextVersion,
+    RetrievalQuery,
+)
 
 MessageRole = Literal["user", "assistant"]
 ConversationHistory = tuple[tuple[MessageRole, str], ...]
@@ -161,6 +166,7 @@ class ApplicationDependencies:
     model_runs: ModelRunRepository = field(
         default_factory=lambda: InMemoryModelRunRepository()
     )
+    personal_context: PersonalContextService | None = None
 
 
 class ProtectedResponsePolicy:
@@ -323,9 +329,18 @@ class ReckoningApplication:
         immediate_danger_response = (
             self._dependencies.response_policy.immediate_danger_response(user_message)
         )
+        profile_missing = False
         if immediate_danger_response is not None:
             response = immediate_danger_response
         else:
+            profile_context, profile_missing = self._personal_context_for_message(
+                user_message, requested_at
+            )
+            supplied_context = (
+                self._dependencies.retrieved_context
+                if retrieved_context is None
+                else retrieved_context
+            )
             connectors = (
                 self._dependencies.connectors.available_names()
                 if available_connectors is None
@@ -340,7 +355,7 @@ class ReckoningApplication:
                 prompt_stack=self._build_prompt_stack(
                     user_message,
                     connectors,
-                    retrieved_context=retrieved_context,
+                    retrieved_context=profile_context + supplied_context,
                     confirmed_records=confirmed_records,
                     permissions=permissions,
                 ),
@@ -389,8 +404,14 @@ class ReckoningApplication:
                     )
                 raise RuntimeError("The model provider returned an empty response.")
             response = self._dependencies.response_policy.apply(proposed_response)
+            if profile_missing:
+                response = (
+                    "Limited context: no user profile is available. " + response
+                )
             run_status: ModelRunStatus = (
-                "limited" if response != proposed_response else "succeeded"
+                "limited"
+                if response != proposed_response or profile_missing
+                else "succeeded"
             )
             self._dependencies.model_runs.save_run(
                 self._model_run_record(
@@ -414,6 +435,37 @@ class ReckoningApplication:
 
     def open_session(self) -> tuple[Message, ...]:
         return self._dependencies.storage.list_messages()
+
+    def profile_proposals(self) -> tuple[PersonalContextVersion, ...]:
+        context = self._require_personal_context()
+        return context.list_proposed()
+
+    def correct_profile_proposal(
+        self, record_id: str, text: str, *, language: str
+    ) -> PersonalContextVersion:
+        context = self._require_personal_context()
+        return context.correct(
+            record_id,
+            original_text=text,
+            language=language,
+            canonical_meaning=text,
+            corrected_at=self._dependencies.clock.now(),
+        )
+
+    def confirm_profile_proposal(self, record_id: str) -> PersonalContextVersion:
+        return self._require_personal_context().confirm(
+            record_id, self._dependencies.clock.now()
+        )
+
+    def reject_profile_proposal(self, record_id: str) -> None:
+        self._require_personal_context().delete(
+            record_id, self._dependencies.clock.now()
+        )
+
+    def delete_personal_context(self, record_id: str) -> None:
+        self._require_personal_context().delete(
+            record_id, self._dependencies.clock.now()
+        )
 
     def inspect_model_runs(self) -> tuple[ModelRunRecord, ...]:
         return self._dependencies.model_runs.list_runs()
@@ -686,6 +738,49 @@ class ReckoningApplication:
             )
         )
 
+    def _personal_context_for_message(
+        self, user_message: str, requested_at: datetime
+    ) -> tuple[tuple[str, ...], bool]:
+        context = self._dependencies.personal_context
+        if context is None:
+            return (), False
+        available = (*context.list_active(), *context.list_proposed())
+        if not available:
+            return (), True
+        query = RetrievalQuery(
+            text=user_message,
+            now=requested_at,
+            allowed_sources=tuple(dict.fromkeys(item.source for item in available)),
+            allowed_sensitivities=("low", "private"),
+            processing_location=self._dependencies.placement.processing_location,
+        )
+        confirmed = tuple(
+            self._render_personal_context("CONFIRMED PERSONAL CONTEXT", item)
+            for item in context.retrieve(query)
+        )
+        proposed = tuple(
+            self._render_personal_context("UNCONFIRMED USER PROFILE", item)
+            for item in context.retrieve_proposed(query)
+        )
+        return confirmed + proposed, False
+
+    @staticmethod
+    def _render_personal_context(
+        label: str, item: PersonalContextVersion
+    ) -> str:
+        return (
+            f"{label} [{item.record_id} v{item.version}; source={item.source}]\n"
+            f"{item.canonical_meaning}"
+        )
+
+    def _require_personal_context(self) -> PersonalContextService:
+        context = self._dependencies.personal_context
+        if context is None:
+            raise RuntimeError(
+                "Personal context is not configured for this application."
+            )
+        return context
+
     @staticmethod
     def _normalize_provider_response(
         response: str | ProviderResponse,
@@ -853,6 +948,7 @@ class JsonFileModelRunRepository(InMemoryModelRunRepository):
 def create_local_application(
     data_path: Path | None = None,
     *,
+    personal_context_path: Path | None = None,
     provider_name: str = "fake",
     orcarouter_api_key: str | None = None,
     deepseek_api_key: str | None = None,
@@ -862,6 +958,7 @@ def create_local_application(
     placement: PlacementState | None = None,
 ) -> ReckoningApplication:
     from reckoning.persistence import JsonFileReckoningRepository
+    from reckoning.personal_context import JsonFilePersonalContextRepository
     from reckoning.providers import (
         DeepSeekModelProvider,
         DeepSeekReckoningProvider,
@@ -910,6 +1007,13 @@ def create_local_application(
             reckoning_repository=JsonFileReckoningRepository(continuity_path),
             model_runs=JsonFileModelRunRepository(
                 continuity_path.with_name("model-runs.json")
+            ),
+            personal_context=(
+                PersonalContextService(
+                    JsonFilePersonalContextRepository(personal_context_path)
+                )
+                if personal_context_path is not None
+                else None
             ),
         )
     )

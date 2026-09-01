@@ -2,14 +2,48 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 import re
 from typing import Any, Literal, Protocol
 
 from reckoning.json_store import atomic_write_json, read_json
 
-ContextStatus = Literal["active", "archived", "forgotten"]
+ContextStatus = Literal["proposed", "active", "archived", "forgotten"]
 Sensitivity = Literal["low", "private", "restricted"]
+MAX_PROFILE_BYTES = 65_536
+_RETRIEVAL_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "do",
+    "does",
+    "for",
+    "how",
+    "i",
+    "in",
+    "is",
+    "me",
+    "my",
+    "of",
+    "on",
+    "or",
+    "should",
+    "the",
+    "to",
+    "what",
+    "when",
+    "with",
+}
+
+
+@dataclass(frozen=True)
+class UserProfileEntry:
+    record_id: str
+    section: str
+    text: str
+    source: str
 
 
 @dataclass(frozen=True)
@@ -120,6 +154,10 @@ class JsonFilePersonalContextRepository(InMemoryPersonalContextRepository):
         super().delete(record_id, marker)
         self._flush()
 
+    def initialize(self) -> None:
+        if not self._path.exists():
+            self._flush()
+
     def _flush(self) -> None:
         atomic_write_json(
             self._path,
@@ -181,6 +219,36 @@ class PersonalContextService:
         self._repository.save(version)
         return version
 
+    def propose(
+        self,
+        *,
+        record_id: str,
+        original_text: str,
+        language: str,
+        canonical_meaning: str,
+        source: str,
+        created_at: datetime,
+        sensitivity: Sensitivity = "private",
+        processing_location: str = "local",
+    ) -> PersonalContextVersion:
+        if self._repository.versions(record_id):
+            raise ValueError(f"Personal context already exists: {record_id}")
+        version = PersonalContextVersion(
+            record_id=record_id,
+            version=1,
+            status="proposed",
+            original_text=_required(original_text, "Original wording"),
+            language=_required(language, "Language"),
+            canonical_meaning=_required(canonical_meaning, "Canonical meaning"),
+            source=_required(source, "Source"),
+            sensitivity=sensitivity,
+            retrieval_permitted=False,
+            processing_location=processing_location,
+            created_at=created_at,
+        )
+        self._repository.save(version)
+        return version
+
     def correct(
         self,
         record_id: str,
@@ -194,7 +262,7 @@ class PersonalContextService:
         corrected = replace(
             current,
             version=current.version + 1,
-            status="active",
+            status="proposed" if current.status == "proposed" else "active",
             original_text=_required(original_text, "Correction wording"),
             language=_required(language, "Correction language"),
             canonical_meaning=_required(canonical_meaning, "Canonical meaning"),
@@ -204,6 +272,21 @@ class PersonalContextService:
         )
         self._repository.save(corrected)
         return corrected
+
+    def confirm(self, record_id: str, confirmed_at: datetime) -> PersonalContextVersion:
+        current = self._current(record_id)
+        if current.status != "proposed":
+            raise ValueError("Only proposed personal context can be confirmed.")
+        confirmed = replace(
+            current,
+            version=current.version + 1,
+            status="active",
+            retrieval_permitted=True,
+            created_at=confirmed_at,
+            supersedes_version=current.version,
+        )
+        self._repository.save(confirmed)
+        return confirmed
 
     def retrieve(self, query: RetrievalQuery) -> tuple[PersonalContextVersion, ...]:
         query_terms = _lexical_terms(query.text)
@@ -219,9 +302,28 @@ class PersonalContextService:
             and _is_relevant(query.text, query_terms, item)
         )
 
+    def retrieve_proposed(
+        self, query: RetrievalQuery
+    ) -> tuple[PersonalContextVersion, ...]:
+        query_terms = _lexical_terms(query.text)
+        return tuple(
+            item
+            for item in self._current_versions()
+            if item.status == "proposed"
+            and item.source in query.allowed_sources
+            and item.sensitivity in query.allowed_sensitivities
+            and item.processing_location == query.processing_location
+            and _is_relevant(query.text, query_terms, item)
+        )
+
     def list_active(self) -> tuple[PersonalContextVersion, ...]:
         return tuple(
             item for item in self._current_versions() if item.status == "active"
+        )
+
+    def list_proposed(self) -> tuple[PersonalContextVersion, ...]:
+        return tuple(
+            item for item in self._current_versions() if item.status == "proposed"
         )
 
     def inspect(self, record_id: str) -> ContextWhyView:
@@ -293,7 +395,11 @@ def _required(value: str, label: str) -> str:
 
 def _lexical_terms(text: str) -> set[str]:
     normalized = text.casefold()
-    words = set(re.findall(r"\w+", normalized, flags=re.UNICODE))
+    words = {
+        word
+        for word in re.findall(r"\w+", normalized, flags=re.UNICODE)
+        if word not in _RETRIEVAL_STOP_WORDS and len(word) > 1
+    }
     cjk = "".join(re.findall(r"[\u3400-\u9fff]", normalized))
     words.update(cjk[index : index + 2] for index in range(len(cjk) - 1))
     return words
@@ -306,7 +412,9 @@ def _is_relevant(
 ) -> bool:
     searchable = f"{item.original_text} {item.canonical_meaning}".casefold()
     normalized_query = query_text.casefold().strip()
-    return normalized_query in searchable or bool(query_terms & _lexical_terms(searchable))
+    return normalized_query in searchable or bool(
+        query_terms & _lexical_terms(searchable)
+    )
 
 
 def _version_to_data(version: PersonalContextVersion) -> dict[str, object]:
@@ -350,3 +458,68 @@ def _version_from_data(data: dict[str, Any]) -> PersonalContextVersion:
             else None
         ),
     )
+
+
+def read_user_profile(path: Path) -> tuple[UserProfileEntry, ...]:
+    source_path = path.expanduser()
+    if source_path.is_symlink() or not source_path.is_file():
+        raise ValueError("The user profile must be a regular file.")
+    if source_path.stat().st_size > MAX_PROFILE_BYTES:
+        raise ValueError("The user profile cannot exceed 65,536 bytes.")
+    try:
+        text = source_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("The user profile must be UTF-8 text.") from error
+    entries = _profile_entries(text, source_path.name)
+    if not entries:
+        raise ValueError("The user profile contains no reviewable statements.")
+    return entries
+
+
+def _profile_entries(text: str, source_name: str) -> tuple[UserProfileEntry, ...]:
+    section = "Profile"
+    paragraphs: list[tuple[str, str]] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if not current:
+            return
+        statement = " ".join(current).strip()
+        current.clear()
+        if statement:
+            paragraphs.append((section, statement))
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        heading = re.match(r"^#{2,3}\s+(.+?)\s*$", line)
+        if heading:
+            flush()
+            section = heading.group(1).strip()
+            continue
+        if re.match(r"^#\s+", line) or re.fullmatch(r"\|?\s*:?-{3,}.*", line):
+            continue
+        if not line:
+            flush()
+            continue
+        list_item = re.match(r"^(?:[-*+]\s+|\d+[.)]\s+)(.+)$", line)
+        if list_item:
+            flush()
+            paragraphs.append((section, list_item.group(1).strip()))
+            continue
+        current.append(line)
+    flush()
+
+    entries: list[UserProfileEntry] = []
+    for index, (entry_section, statement) in enumerate(paragraphs, start=1):
+        digest = sha256(
+            f"{entry_section}\0{statement}".encode("utf-8")
+        ).hexdigest()[:16]
+        entries.append(
+            UserProfileEntry(
+                record_id=f"profile-{index:03d}-{digest}",
+                section=entry_section,
+                text=statement,
+                source=f"user profile import: {source_name}#{entry_section}",
+            )
+        )
+    return tuple(entries)
