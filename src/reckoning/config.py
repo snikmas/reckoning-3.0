@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 ORCAROUTER_DEFAULT_MODEL = "orcarouter/auto"
 ORCAROUTER_DEFAULT_BASE_URL = "https://api.orcarouter.ai/v1"
@@ -12,6 +12,8 @@ DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
 _ALLOWED_ENV_NAMES = (
     "ORCAROUTER_API_KEY",
     "DEEPSEEK_API_KEY",
+    "DEEPSEEK_MODEL",
+    "BASE_DEEPSEEK_URL",
     "MODEL",
     "BASE_URL",
 )
@@ -59,15 +61,20 @@ class DeepSeekSettings:
         file_values = _read_allowed_env_file(env_file)
         process_values = os.environ if environ is None else environ
 
-        def value(name: str) -> str | None:
-            raw = process_values.get(name, file_values.get(name))
-            cleaned = raw.strip() if raw else ""
-            return cleaned or None
+        def value(*names: str) -> str | None:
+            for values in (process_values, file_values):
+                for name in names:
+                    raw = values.get(name)
+                    cleaned = raw.strip() if raw else ""
+                    if cleaned:
+                        return cleaned
+            return None
 
         return cls(
             api_key=value("DEEPSEEK_API_KEY"),
-            model=value("MODEL") or DEEPSEEK_DEFAULT_MODEL,
-            base_url=value("BASE_URL") or DEEPSEEK_DEFAULT_BASE_URL,
+            model=value("DEEPSEEK_MODEL", "MODEL") or DEEPSEEK_DEFAULT_MODEL,
+            base_url=value("BASE_DEEPSEEK_URL", "BASE_URL")
+            or DEEPSEEK_DEFAULT_BASE_URL,
         )
 
 
