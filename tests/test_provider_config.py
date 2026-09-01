@@ -44,6 +44,26 @@ def test_process_environment_overrides_file_without_requiring_all_values(
     assert settings.base_url == "https://api.orcarouter.ai/v1"
 
 
+def test_deepseek_settings_load_provider_specific_values_from_env_file(
+    tmp_path: Path,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "DEEPSEEK_API_KEY='test-key'\n"
+        'DEEPSEEK_MODEL="deepseek-chat"\n'
+        'BASE_DEEPSEEK_URL="https://api.deepseek.com"\n'
+        "UNRELATED_SECRET=must-not-load\n",
+        encoding="utf-8",
+    )
+
+    settings = DeepSeekSettings.load(env_file, environ={})
+
+    assert settings.api_key == "test-key"
+    assert settings.model == "deepseek-chat"
+    assert settings.base_url == "https://api.deepseek.com"
+    assert "UNRELATED_SECRET" not in settings.__dict__
+
+
 def test_deepseek_settings_remain_available_for_existing_evidence_gate(
     tmp_path: Path,
 ) -> None:

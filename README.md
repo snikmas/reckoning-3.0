@@ -6,9 +6,9 @@ continuity slice: a reckoning can be proposed, corrected, confirmed, explained,
 resumed after restart, and linked to a dated outcome check-in.
 
 The default local model is a deterministic fake. The same application boundary
-also supports OrcaRouter through its OpenAI-compatible API. Recent conversation
-messages remain in memory. Confirmed continuity records use an atomic JSON file
-so that they survive a restart.
+also supports OrcaRouter and DeepSeek through their OpenAI-compatible APIs.
+Recent conversation messages remain in memory. Confirmed continuity records use
+an atomic JSON file so that they survive a restart.
 
 ## Run locally
 
@@ -26,8 +26,6 @@ PYTHONPATH=src python3 -m reckoning
 Open `http://127.0.0.1:8000`. Stop the server with `Ctrl+C`.
 
 To run with OrcaRouter, add these values to the repository's ignored `.env` file.
-Reckoning reads only these three names and does not copy the key into its data
-files.
 
 ```dotenv
 ORCAROUTER_API_KEY=...
@@ -44,6 +42,25 @@ PYTHONPATH=src python3 -m reckoning
 If OrcaRouter returns `model_access_denied`, open the API key in the OrcaRouter
 console and allow the model named by `MODEL`. Router aliases such as
 `orcarouter/auto` must be allowed explicitly for that key.
+
+To run with DeepSeek, add these values to `.env`:
+
+```dotenv
+DEEPSEEK_API_KEY=...
+DEEPSEEK_MODEL="your-model-name"
+BASE_DEEPSEEK_URL="https://api.deepseek.com"
+```
+
+Start Reckoning with the DeepSeek provider:
+
+```bash
+PYTHONPATH=src python3 -m reckoning --provider deepseek
+```
+
+For backward compatibility, DeepSeek also accepts `MODEL` and `BASE_URL`.
+`DEEPSEEK_MODEL` and `BASE_DEEPSEEK_URL` take precedence. Reckoning reads only
+the documented provider values from `.env` and does not copy API keys into its
+data files.
 
 Each attempted provider run records the provider, model calls, latency, retries,
 token usage, and failure status in the application run repository. Token usage is
