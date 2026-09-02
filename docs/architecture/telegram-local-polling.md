@@ -3,7 +3,7 @@
 ## Caller usage
 
 ```text
-reckoning-telegram setup
+reckoning setup
   -> choose a messaging gateway from the setup menu
   -> choose a model provider from the setup menu
   -> skip the provider API-key prompt when Fake is selected

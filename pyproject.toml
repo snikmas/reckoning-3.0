@@ -13,7 +13,7 @@ dependencies = ["cryptography>=43"]
 test = ["pytest>=9,<10"]
 
 [project.scripts]
-reckoning = "reckoning.web:main"
+reckoning = "reckoning.command:main"
 reckoning-ops = "reckoning.cli:main"
 reckoning-telegram = "reckoning.telegram:main"
 

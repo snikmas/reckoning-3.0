@@ -12,7 +12,7 @@ Use Python 3.13 or later.
 python3 -m pip install .
 ```
 
-The package installs `reckoning` for the local web interface,
+The package installs `reckoning` for product setup and the local web interface,
 `reckoning-telegram` for the Telegram channel, and `reckoning-ops` for
 operations.
 
@@ -24,7 +24,7 @@ Anyone who has the token can control the bot.
 Run the setup command:
 
 ```bash
-reckoning-telegram setup
+reckoning setup
 ```
 
 Choose **Telegram**, then choose **Fake**. The menu also shows Discord, WhatsApp,
