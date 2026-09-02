@@ -1,3 +1,3 @@
-from reckoning.web import main
+from reckoning.command import main
 
 main()

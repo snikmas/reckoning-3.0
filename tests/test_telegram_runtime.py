@@ -16,6 +16,7 @@ from reckoning.interfaces import (
     ReckoningInterfaceApplication,
     SourcePlacement,
 )
+from reckoning.setup import setup_reckoning
 from reckoning.telegram import (
     TelegramGateway,
     TelegramPollingApplication,
@@ -24,7 +25,6 @@ from reckoning.telegram import (
     TelegramUpdateAdapter,
     TelegramWebhookAdapter,
     TelegramWebhookApplication,
-    setup_reckoning_telegram,
     setup_telegram_polling,
 )
 
@@ -233,7 +233,7 @@ def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
         return "bot-token"
 
     config_path = tmp_path / "telegram.json"
-    settings = setup_reckoning_telegram(
+    settings = setup_reckoning(
         config_path=config_path,
         secret_reader=read_secret,
         line_reader=read_line,
@@ -322,6 +322,13 @@ def test_polling_settings_are_stored_outside_the_repo_with_private_permissions(
     assert TelegramPollingSettings.load(path) == settings
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert "bot-token" not in repr(settings)
+
+
+def test_polling_settings_direct_unconfigured_users_to_product_setup(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="Run reckoning setup first"):
+        TelegramPollingSettings.load(tmp_path / "missing.json")
 
 
 def test_terminal_setup_pairs_only_the_matching_private_chat(tmp_path: Path) -> None:
