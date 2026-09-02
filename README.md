@@ -1,96 +1,156 @@
 # Reckoning
 
-Reckoning currently provides a small local web interface for sending a message
-through its application boundary. The repository also contains the first
-continuity slice: a reckoning can be proposed, corrected, confirmed, explained,
-resumed after restart, and linked to a dated outcome check-in.
+Reckoning is an early-stage, local-first continuity agent for one person. The
+current runnable flow helps you propose, correct, confirm, revisit, and review
+an important decision across restarts. The codebase also contains broader
+services for goals, plans, research, routines, and personal context.
 
-The default local model is a deterministic fake. The same application boundary
-also supports OrcaRouter and DeepSeek through their OpenAI-compatible APIs.
-Recent conversation messages remain in memory. Confirmed continuity records use
-an atomic JSON file so that they survive a restart.
+The default setup needs no API key and makes no model-provider request. It uses
+a deterministic fake provider so that you can inspect the product safely. You
+can connect OrcaRouter or DeepSeek when you want real model responses.
 
-## Run locally
+## Start a local instance
 
-Reckoning requires Python 3.13. Install the package and its encrypted-transfer
-dependency before running it.
+You need Python 3.13 or newer. From the repository root, run:
 
 ```bash
 python3 -m pip install .
+reckoning-ops setup
+reckoning
 ```
+
+Open <http://127.0.0.1:8000>. Stop the server with `Ctrl+C`.
+
+`reckoning-ops setup` creates a local single-user instance, selects the Simon
+persona, and checks the core continuity flow. It stores the instance under
+`~/.local/state/reckoning` by default. You only need to run setup once.
+
+If your Python installation does not allow system-wide packages, create a
+virtual environment first:
 
 ```bash
-PYTHONPATH=src python3 -m reckoning
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-Open `http://127.0.0.1:8000`. Stop the server with `Ctrl+C`.
+After activating the virtual environment, run the three commands from the start
+section.
 
-To run with OrcaRouter, add these values to the repository's ignored `.env` file.
+## What you can use
+
+The browser interface has separate views for conversation, current priorities,
+planning, review, and local operational status. Confirmed continuity records
+survive a restart. Recent unconfirmed conversation messages stay in memory only.
+
+The Python code also contains domain services for:
+
+- personal context with correction and deletion history;
+- directions, goals, plans, and check-ins;
+- research, forecasts, routines, watches, and briefings;
+- connector permissions, external-content isolation, and data placement;
+- bounded delegation and persona selection.
+
+Some of these services are available through the Python API but do not yet have
+a complete browser workflow.
+
+## Connect Telegram
+
+The browser interface does not require Telegram. To connect a Telegram bot, run:
+
+```bash
+reckoning setup
+```
+
+Choose **Telegram**, then choose **Fake**. Fake does not need a model-provider
+API key. The setup command asks for your BotFather token and pairs one private
+chat. Start the connected bot with:
+
+```bash
+reckoning-telegram
+```
+
+Keep the command running while you use the bot. See
+[operations](docs/operations.md) for webhook and personal-server setup.
+
+## Choose a model provider
+
+You do not need this section for the default fake provider.
+
+To use OrcaRouter, create an ignored `.env` file in the repository root:
 
 ```dotenv
-ORCAROUTER_API_KEY=...
-MODEL="orcarouter/auto"
-BASE_URL="https://api.orcarouter.ai/v1"
+ORCAROUTER_API_KEY=replace-with-your-key
+MODEL=orcarouter/auto
 ```
 
-Then start Reckoning. The presence of `ORCAROUTER_API_KEY` selects OrcaRouter.
+Start the server with an explicit provider:
 
 ```bash
-PYTHONPATH=src python3 -m reckoning
+reckoning --provider orcarouter
 ```
 
-If OrcaRouter returns `model_access_denied`, open the API key in the OrcaRouter
-console and allow the model named by `MODEL`. Router aliases such as
-`orcarouter/auto` must be allowed explicitly for that key.
+If OrcaRouter returns `model_access_denied`, allow the value of `MODEL` for that
+API key in the OrcaRouter console. This also applies to router aliases such as
+`orcarouter/auto`.
 
-To run with DeepSeek, add these values to `.env`:
+To use DeepSeek, put these values in `.env`:
 
 ```dotenv
-DEEPSEEK_API_KEY=...
-DEEPSEEK_MODEL="your-model-name"
-BASE_DEEPSEEK_URL="https://api.deepseek.com"
+DEEPSEEK_API_KEY=replace-with-your-key
+DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
-Start Reckoning with the DeepSeek provider:
+Then start the server:
 
 ```bash
-PYTHONPATH=src python3 -m reckoning --provider deepseek
+reckoning --provider deepseek
 ```
 
-For backward compatibility, DeepSeek also accepts `MODEL` and `BASE_URL`.
-`DEEPSEEK_MODEL` and `BASE_DEEPSEEK_URL` take precedence. Reckoning reads only
-the documented provider values from `.env` and does not copy API keys into its
-data files.
+Both providers use their official API URL by default. Use `BASE_URL` for
+OrcaRouter or `BASE_DEEPSEEK_URL` for DeepSeek only when you need to override
+that default.
 
-Each attempted provider run records the provider, model calls, latency, retries,
-token usage, and failure status in the application run repository. Token usage is
-the billable unit; Reckoning does not hard-code provider prices.
+Reckoning reads only its documented provider variables from `.env`. It does not
+write API keys to the instance data. Each provider attempt records the provider,
+model calls, latency, retries, token usage, and failure status.
 
-The local application stores continuity data in
-`~/.local/state/reckoning/continuity.json`. Live state files contain plain JSON;
-encrypted backup and restore are available through `reckoning-ops`. The web
-interface opens with Simon for a new user and the Home command center for a
-returning user. Plan, Review, and locally restricted Control areas remain
-separate task-based views.
+## Understand the storage and access limits
 
-## Run tests
+The default instance stores live state as plain JSON under
+`~/.local/state/reckoning`. Use `reckoning-ops backup` to create an encrypted
+archive.
 
-Install pytest 9 in a development environment, then run:
+The built-in web server accepts loopback addresses only and has no public login.
+Do not expose it directly to the internet. For remote access to a personal
+server, use an SSH tunnel.
+
+Reckoning supports `local`, `personal-server`, and `hybrid` placement profiles.
+The local profile is the default. See [operations](docs/operations.md) for
+placement, diagnosis, encrypted backup, restore, and migration commands.
+
+## Diagnose a local instance
+
+Run:
 
 ```bash
-PYTHONPATH=src python3 -m pytest
+reckoning-ops diagnose
 ```
 
-The tests use fake time, model, placement, connectors, and temporary storage.
-They do not call an external model or service.
+The command checks the instance configuration and JSON state files. It reports
+`healthy` when every required file is valid.
 
-## Implemented domain services
+## Develop and test
 
-The Python API now includes services for private-slice trials, multilingual
-personal context, context lifecycle and maintenance, directions and goals,
-planning horizons, bounded research, goal forecasts, forecast revisions,
-routines, watches, selective briefings, connector governance, external-content
-isolation, placement, channel continuation, bounded delegation, and persona
-selection. These services keep proposed and confirmed state separate where user
-acceptance matters. See `docs/operations.md` for setup, diagnosis, encrypted
-transfer, and recovery commands.
+Install Reckoning in editable mode with its test dependency:
+
+```bash
+python3 -m pip install -e ".[test]"
+python3 -m pytest
+```
+
+The test suite uses fake time, model, placement, connectors, and temporary
+storage. It does not call an external model or service.
+
+For implementation details, read the
+[architecture overview](docs/architecture/vertical-slices-06-15.md) and the
+[encrypted transfer format](docs/encrypted-transfer-format.md).
