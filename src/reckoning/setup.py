@@ -5,6 +5,11 @@ from dataclasses import dataclass
 from getpass import getpass
 from pathlib import Path
 
+from reckoning.config import (
+    DEFAULT_PROVIDER_CREDENTIALS,
+    ProviderCredentials,
+)
+from reckoning.providers import verify_provider_api_key
 from reckoning.telegram import (
     DEFAULT_TELEGRAM_CONFIG,
     TelegramBotApi,
@@ -46,19 +51,14 @@ GATEWAY_SETUP_OPTIONS = (
 
 PROVIDER_SETUP_OPTIONS = (
     SetupMenuOption("fake", "Fake (no API key)", True),
-    SetupMenuOption(
-        "deepseek",
-        "DeepSeek (API-key setup coming later)",
-        False,
-        "DeepSeek setup is not available yet.",
-    ),
-    SetupMenuOption(
-        "orcarouter",
-        "OrcaRouter (API-key setup coming later)",
-        False,
-        "OrcaRouter setup is not available yet.",
-    ),
+    SetupMenuOption("deepseek", "DeepSeek", True),
+    SetupMenuOption("orcarouter", "OrcaRouter", True),
 )
+
+_PROVIDER_DISPLAY_NAMES = {
+    "deepseek": "DeepSeek",
+    "orcarouter": "OrcaRouter",
+}
 
 
 def _choose_setup_option(
@@ -93,10 +93,12 @@ def _choose_setup_option(
 def setup_reckoning(
     *,
     config_path: Path = DEFAULT_TELEGRAM_CONFIG,
+    credentials_path: Path = DEFAULT_PROVIDER_CREDENTIALS,
     secret_reader: Callable[[str], str] = getpass,
     line_reader: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
     api_factory: Callable[[str], TelegramBotClient] = TelegramBotApi,
+    key_verifier: Callable[[str, str], None] = verify_provider_api_key,
     pairing_code: str | None = None,
     maximum_polls: int = 12,
 ) -> TelegramPollingSettings:
@@ -115,8 +117,19 @@ def setup_reckoning(
         line_reader=line_reader,
         output=output,
     )
-    output("Fake uses deterministic local replies, so it does not need an API key.")
-    return setup_telegram_polling(
+    credentials: ProviderCredentials | None = None
+    if provider_name == "fake":
+        output(
+            "Fake uses deterministic local replies, so it does not need an API key."
+        )
+    else:
+        credentials = _enter_provider_credentials(
+            provider_name,
+            secret_reader=secret_reader,
+            key_verifier=key_verifier,
+        )
+        output(f"{_PROVIDER_DISPLAY_NAMES[provider_name]} verified the API key.")
+    settings = setup_telegram_polling(
         config_path=config_path,
         secret_reader=secret_reader,
         line_reader=line_reader,
@@ -127,3 +140,26 @@ def setup_reckoning(
         gateway_name=gateway_name,
         provider_name=provider_name,
     )
+    if credentials is not None:
+        credentials.save(credentials_path)
+        output(
+            f"Provider credentials saved to {credentials_path} "
+            "with owner-only permissions."
+        )
+    return settings
+
+
+def _enter_provider_credentials(
+    provider_name: str,
+    *,
+    secret_reader: Callable[[str], str],
+    key_verifier: Callable[[str, str], None],
+) -> ProviderCredentials:
+    display_name = _PROVIDER_DISPLAY_NAMES[provider_name]
+    api_key = secret_reader(
+        f"Paste the {display_name} API key (input is hidden): "
+    ).strip()
+    if not api_key:
+        raise ValueError(f"A {display_name} API key is required.")
+    key_verifier(provider_name, api_key)
+    return ProviderCredentials(provider_name, api_key)

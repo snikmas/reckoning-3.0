@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from reckoning.operations import OperationError
+from reckoning.providers import ProviderKeyVerificationError
 from reckoning.setup import setup_reckoning
 from reckoning.telegram import DEFAULT_TELEGRAM_CONFIG, TelegramBotApiError
 from reckoning.web import build_parser as build_web_parser
@@ -37,7 +38,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         setup_arguments = parser.parse_args(arguments[1:])
         try:
             setup_reckoning(config_path=setup_arguments.telegram_config)
-        except (OperationError, TelegramBotApiError, ValueError) as error:
+        except (
+            OperationError,
+            TelegramBotApiError,
+            ProviderKeyVerificationError,
+            ValueError,
+        ) as error:
             parser.error(str(error))
         return
 

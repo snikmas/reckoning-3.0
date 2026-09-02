@@ -218,7 +218,7 @@ def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
             )
         ]
     )
-    answers = iter(("2", "1", "2", "1"))
+    answers = iter(("2", "1", "1"))
     prompts: list[str] = []
     messages: list[str] = []
 
@@ -235,6 +235,7 @@ def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
     config_path = tmp_path / "telegram.json"
     settings = setup_reckoning(
         config_path=config_path,
+        credentials_path=tmp_path / "provider.json",
         secret_reader=read_secret,
         line_reader=read_line,
         output=messages.append,
@@ -249,14 +250,12 @@ def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
     assert "3. WhatsApp (coming later)" in displayed
     assert "4. Slack (coming later)" in displayed
     assert "1. Fake (no API key)" in displayed
-    assert "2. DeepSeek (API-key setup coming later)" in displayed
-    assert "3. OrcaRouter (API-key setup coming later)" in displayed
+    assert "2. DeepSeek" in displayed
+    assert "3. OrcaRouter" in displayed
     assert "Discord is not available yet." in displayed
-    assert "DeepSeek setup is not available yet." in displayed
     assert prompts == [
         "Gateway [1]: ",
         "Gateway [1]: ",
-        "Provider [1]: ",
         "Provider [1]: ",
     ]
     assert secret_prompts == ["Paste the BotFather token (input is hidden): "]

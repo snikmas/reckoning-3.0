@@ -64,9 +64,10 @@ messages that arrive between pairing and startup.
 
 The first setup menu displays Telegram, Discord, WhatsApp, and Slack. Only
 Telegram is enabled. The provider menu displays Fake, DeepSeek, and OrcaRouter.
-Only Fake is enabled in the menu, and Fake needs no API key. The setup saves both
-choices so that a later provider setup can add the API-key step without changing
-the gateway flow.
+Fake needs no API key. DeepSeek and OrcaRouter add an API-key step to setup:
+the key is entered with hidden input, verified against the provider, and stored
+in `~/.config/reckoning/provider.json` with owner-only permissions. The setup
+saves both choices without changing the gateway flow.
 
 ## Alternatives considered
 

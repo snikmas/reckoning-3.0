@@ -17,7 +17,11 @@ from wsgiref.simple_server import make_server
 from wsgiref.types import StartResponse, WSGIEnvironment
 
 from reckoning.application import create_local_application
-from reckoning.config import DeepSeekSettings, OrcaRouterSettings
+from reckoning.config import (
+    DEFAULT_PROVIDER_CREDENTIALS,
+    DeepSeekSettings,
+    OrcaRouterSettings,
+)
 from reckoning.interfaces import (
     ReckoningInterfaceApplication,
     create_local_interface_application,
@@ -686,18 +690,26 @@ def _create_interface(
     base_url = arguments.base_url
     provider_name = arguments.provider or configured_provider
     if provider_name == "orcarouter":
-        orcarouter_settings = OrcaRouterSettings.load()
+        orcarouter_settings = OrcaRouterSettings.load(
+            credential_file=DEFAULT_PROVIDER_CREDENTIALS
+        )
         orcarouter_api_key = orcarouter_settings.api_key
         model_name = model_name or orcarouter_settings.model
         base_url = base_url or orcarouter_settings.base_url
     elif provider_name == "deepseek":
-        deepseek_settings = DeepSeekSettings.load()
+        deepseek_settings = DeepSeekSettings.load(
+            credential_file=DEFAULT_PROVIDER_CREDENTIALS
+        )
         deepseek_api_key = deepseek_settings.api_key
         model_name = model_name or deepseek_settings.model
         base_url = base_url or deepseek_settings.base_url
     elif provider_name is None:
-        orcarouter_settings = OrcaRouterSettings.load()
-        deepseek_settings = DeepSeekSettings.load()
+        orcarouter_settings = OrcaRouterSettings.load(
+            credential_file=DEFAULT_PROVIDER_CREDENTIALS
+        )
+        deepseek_settings = DeepSeekSettings.load(
+            credential_file=DEFAULT_PROVIDER_CREDENTIALS
+        )
         if orcarouter_settings.api_key:
             provider_name = "orcarouter"
             orcarouter_api_key = orcarouter_settings.api_key

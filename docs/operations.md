@@ -27,12 +27,15 @@ Run the setup command:
 reckoning setup
 ```
 
-Choose **Telegram**, then choose **Fake**. The menu also shows Discord, WhatsApp,
-Slack, DeepSeek, and OrcaRouter as future setup choices. Only Telegram and Fake
-are available in this setup flow.
+Choose **Telegram**, then choose a provider. The menu also shows Discord,
+WhatsApp, and Slack as future gateway choices. Only Telegram is available in
+this setup flow.
 
-Fake uses deterministic local replies and does not need a provider API key. The
-command then asks for the BotFather token and hides it while you type. It verifies
+Fake uses deterministic local replies and does not need a provider API key.
+DeepSeek and OrcaRouter ask for the provider API key with hidden input, verify
+the key against the provider, and save it in
+`~/.config/reckoning/provider.json` with owner-only permissions. The command
+then asks for the BotFather token and hides it while you type. It verifies
 the bot and asks you to send a one-time `/connect` code in a private chat.
 Reckoning saves the selected gateway, the selected provider, and the Telegram
 configuration in `~/.config/reckoning/telegram.json`. The file has owner-only
@@ -42,6 +45,20 @@ Start the bot:
 
 ```bash
 reckoning-telegram
+```
+
+The bot reads the saved provider credential automatically. To run it with a
+different provider than the configured one, pass explicit flags:
+
+```bash
+reckoning-telegram --provider deepseek
+```
+
+To switch providers or replace a saved key, re-run setup and answer `y` when
+it asks to replace the existing configuration:
+
+```bash
+reckoning setup
 ```
 
 Keep the command running while you use the bot. Stop it with `Ctrl+C`. The bot

@@ -75,6 +75,51 @@ def _urlopen_transport(request: Request, timeout: float) -> bytes:
         return response.read()
 
 
+class ProviderKeyVerificationError(RuntimeError):
+    """A safe-to-display provider API-key verification failure."""
+
+
+_PROVIDER_VERIFICATION_ENDPOINTS = {
+    "orcarouter": ("OrcaRouter", "https://api.orcarouter.ai/v1"),
+    "deepseek": ("DeepSeek", "https://api.deepseek.com"),
+}
+
+
+def verify_provider_api_key(
+    provider_name: str,
+    api_key: str,
+    *,
+    transport: Transport = _urlopen_transport,
+    timeout_seconds: float = 15.0,
+) -> None:
+    """Check an API key against the provider's model-listing endpoint."""
+    try:
+        display_name, base_url = _PROVIDER_VERIFICATION_ENDPOINTS[provider_name]
+    except KeyError:
+        raise ValueError(f"Unsupported model provider: {provider_name}") from None
+    request = Request(
+        f"{base_url}/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        method="GET",
+    )
+    try:
+        transport(request, timeout_seconds)
+    except HTTPError as error:
+        if error.code in (401, 403):
+            raise ProviderKeyVerificationError(
+                f"{display_name} rejected the API key. "
+                "Check the key and run setup again."
+            ) from error
+        raise ProviderKeyVerificationError(
+            f"{display_name} returned HTTP {error.code} during API-key verification."
+        ) from error
+    except (URLError, TimeoutError) as error:
+        reason = error.reason if isinstance(error, URLError) else error
+        raise ProviderKeyVerificationError(
+            f"{display_name} could not be reached: {reason}"
+        ) from error
+
+
 class OrcaRouterModelProvider:
     """Small OrcaRouter Chat Completions adapter with bounded retries."""
 
