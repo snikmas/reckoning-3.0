@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from hmac import compare_digest
 import json
 import os
+import secrets
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from getpass import getpass
+from hmac import compare_digest
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from wsgiref.simple_server import make_server
 from wsgiref.types import StartResponse, WSGIEnvironment
 
@@ -16,8 +22,185 @@ from reckoning.interfaces import (
     ReckoningInterfaceApplication,
     create_local_interface_application,
 )
+from reckoning.json_store import atomic_write_json, read_json
 from reckoning.operations import OperationError, load_installation_runtime
 from reckoning.web import validate_bind_host
+
+DEFAULT_TELEGRAM_CONFIG = Path.home() / ".config" / "reckoning" / "telegram.json"
+
+
+class TelegramBotApiError(RuntimeError):
+    """A safe-to-display Telegram Bot API failure."""
+
+
+class TelegramBotClient(Protocol):
+    def get_me(self) -> dict[str, object]: ...
+
+    def get_webhook_info(self) -> dict[str, object]: ...
+
+    def delete_webhook(self) -> None: ...
+
+    def get_updates(
+        self,
+        *,
+        offset: int | None,
+        timeout: int,
+    ) -> tuple[dict[str, object], ...]: ...
+
+    def send_message(self, chat_id: str, text: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class TelegramPollingSettings:
+    bot_token: str = field(repr=False)
+    allowed_chat_ids: tuple[str, ...]
+    bot_username: str
+    next_update_offset: int | None = None
+    gateway_name: str = "telegram"
+    provider_name: str = "fake"
+
+    @classmethod
+    def load(cls, path: Path = DEFAULT_TELEGRAM_CONFIG) -> TelegramPollingSettings:
+        data = read_json(path, default={})
+        token = str(data.get("bot_token", "")).strip()
+        username = str(data.get("bot_username", "")).strip()
+        raw_chat_ids = data.get("allowed_chat_ids", [])
+        next_update_offset = data.get("next_update_offset")
+        gateway_name = str(data.get("gateway_name", "telegram")).strip().casefold()
+        provider_name = str(data.get("provider_name", "fake")).strip().casefold()
+        if not token or not username or not isinstance(raw_chat_ids, list):
+            raise ValueError(
+                "Telegram is not configured. Run reckoning-telegram setup first."
+            )
+        if gateway_name != "telegram":
+            raise ValueError("The configured messaging gateway is not supported.")
+        if provider_name not in ("fake", "deepseek", "orcarouter"):
+            raise ValueError("The configured model provider is not supported.")
+        if next_update_offset is not None and type(next_update_offset) is not int:
+            raise ValueError("Telegram polling offset is invalid.")
+        chat_ids = tuple(
+            str(item).strip() for item in raw_chat_ids if str(item).strip()
+        )
+        if not chat_ids:
+            raise ValueError(
+                "Telegram is not configured. Run reckoning-telegram setup first."
+            )
+        return cls(
+            token,
+            chat_ids,
+            username,
+            next_update_offset,
+            gateway_name,
+            provider_name,
+        )
+
+    def save(self, path: Path = DEFAULT_TELEGRAM_CONFIG) -> None:
+        atomic_write_json(
+            path,
+            {
+                "bot_token": self.bot_token,
+                "allowed_chat_ids": list(self.allowed_chat_ids),
+                "bot_username": self.bot_username,
+                "next_update_offset": self.next_update_offset,
+                "gateway_name": self.gateway_name,
+                "provider_name": self.provider_name,
+            },
+        )
+        path.chmod(0o600)
+
+
+class TelegramBotApi:
+    """Small Bot API client for the methods used by local polling."""
+
+    def __init__(
+        self,
+        bot_token: str,
+        *,
+        api_base_url: str = "https://api.telegram.org",
+    ) -> None:
+        token = bot_token.strip()
+        if not token:
+            raise ValueError("A Telegram bot token is required.")
+        self._endpoint = f"{api_base_url.rstrip('/')}/bot{token}"
+
+    def get_me(self) -> dict[str, object]:
+        result = self._call("getMe", {})
+        if not isinstance(result, dict):
+            raise TelegramBotApiError("Telegram getMe returned an invalid result.")
+        return result
+
+    def get_webhook_info(self) -> dict[str, object]:
+        result = self._call("getWebhookInfo", {})
+        if not isinstance(result, dict):
+            raise TelegramBotApiError(
+                "Telegram getWebhookInfo returned an invalid result."
+            )
+        return result
+
+    def delete_webhook(self) -> None:
+        self._call("deleteWebhook", {"drop_pending_updates": False})
+
+    def get_updates(
+        self,
+        *,
+        offset: int | None,
+        timeout: int,
+    ) -> tuple[dict[str, object], ...]:
+        payload: dict[str, object] = {
+            "timeout": timeout,
+            "allowed_updates": ["message"],
+        }
+        if offset is not None:
+            payload["offset"] = offset
+        result = self._call("getUpdates", payload, timeout=timeout + 5)
+        if not isinstance(result, list) or not all(
+            isinstance(item, dict) for item in result
+        ):
+            raise TelegramBotApiError("Telegram getUpdates returned an invalid result.")
+        return tuple(result)
+
+    def send_message(self, chat_id: str, text: str) -> None:
+        chunks = _telegram_text_chunks(text)
+        for chunk in chunks:
+            self._call("sendMessage", {"chat_id": chat_id, "text": chunk})
+
+    def _call(
+        self,
+        method: str,
+        payload: dict[str, object],
+        *,
+        timeout: int = 15,
+    ) -> object:
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        request = Request(
+            f"{self._endpoint}/{method}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                decoded = json.loads(response.read())
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+            raise TelegramBotApiError(f"Telegram {method} request failed.") from None
+        if not isinstance(decoded, dict) or decoded.get("ok") is not True:
+            description = (
+                str(decoded.get("description", "")).strip()
+                if isinstance(decoded, dict)
+                else ""
+            )
+            message = f"Telegram {method} failed"
+            if description:
+                message = f"{message}: {description}"
+            raise TelegramBotApiError(f"{message}.")
+        return decoded.get("result")
+
+
+def _telegram_text_chunks(text: str) -> tuple[str, ...]:
+    content = text or "Reckoning returned an empty reply."
+    return tuple(
+        content[index : index + 4096] for index in range(0, len(content), 4096)
+    )
 
 
 @dataclass(frozen=True)
@@ -41,9 +224,7 @@ class TelegramRuntimeSettings:
 
         allowed_chat_ids = tuple(
             item.strip()
-            for item in required(
-                "RECKONING_TELEGRAM_ALLOWED_CHAT_IDS"
-            ).split(",")
+            for item in required("RECKONING_TELEGRAM_ALLOWED_CHAT_IDS").split(",")
             if item.strip()
         )
         if not allowed_chat_ids:
@@ -93,7 +274,9 @@ class TelegramGateway:
         self._authentication_token = authentication_token
         self._allowed_chat_ids = normalized_chat_ids
 
-    def handle(self, authentication_token: str, request: TelegramRequest) -> TelegramReply:
+    def handle(
+        self, authentication_token: str, request: TelegramRequest
+    ) -> TelegramReply:
         self._authenticate(authentication_token)
         chat_id = self._authorize_chat(request.chat_id)
 
@@ -164,6 +347,62 @@ class TelegramGateway:
         return normalized
 
 
+class TelegramUpdateAdapter:
+    """Translate Telegram message updates into the bounded gateway contract."""
+
+    def __init__(
+        self,
+        gateway: TelegramGateway,
+        *,
+        authentication_token: str,
+    ) -> None:
+        if not authentication_token:
+            raise ValueError("A Telegram authentication token is required.")
+        self._gateway = gateway
+        self._authentication_token = authentication_token
+
+    def handle_update(self, update: dict[str, Any]) -> TelegramReply:
+        message = update.get("message")
+        if not isinstance(message, dict):
+            raise ValueError("Only Telegram message updates are supported.")
+        chat = message.get("chat")
+        text = message.get("text")
+        if not isinstance(chat, dict) or not isinstance(text, str):
+            raise ValueError("A Telegram text message and chat are required.")
+        chat_id = str(chat.get("id", "")).strip()
+        command, separator, argument = text.strip().partition(" ")
+        command = command.partition("@")[0]
+        if command == "/status":
+            request = TelegramRequest("status", chat_id)
+        elif command == "/confirm":
+            if not separator or not argument.strip():
+                raise ValueError("Use /confirm with a confirmation identifier.")
+            request = TelegramRequest(
+                "confirm",
+                chat_id,
+                confirmation_id=argument.strip(),
+            )
+        elif command in ("/start", "/help"):
+            return TelegramReply(
+                "message",
+                self._authorize_help_chat(chat_id),
+                (
+                    "Send a message to talk with Reckoning. Use /status to check "
+                    "the runtime or /confirm <id> to approve a pending action."
+                ),
+            )
+        else:
+            request = TelegramRequest("message", chat_id, text=text)
+        return self._gateway.handle(self._authentication_token, request)
+
+    def _authorize_help_chat(self, chat_id: str) -> str:
+        status = self._gateway.handle(
+            self._authentication_token,
+            TelegramRequest("status", chat_id),
+        )
+        return status.chat_id
+
+
 class TelegramWebhookAdapter:
     """Translate Telegram update payloads without expanding gateway authority."""
 
@@ -178,6 +417,10 @@ class TelegramWebhookAdapter:
             raise ValueError("A Telegram authentication token is required.")
         if not webhook_secret:
             raise ValueError("A Telegram webhook secret is required.")
+        self._updates = TelegramUpdateAdapter(
+            gateway,
+            authentication_token=authentication_token,
+        )
         self._gateway = gateway
         self._authentication_token = authentication_token
         self._webhook_secret = webhook_secret
@@ -189,28 +432,7 @@ class TelegramWebhookAdapter:
         secret_token: str,
     ) -> dict[str, object]:
         self.authenticate(secret_token)
-        message = update.get("message")
-        if not isinstance(message, dict):
-            raise ValueError("Only Telegram message updates are supported.")
-        chat = message.get("chat")
-        text = message.get("text")
-        if not isinstance(chat, dict) or not isinstance(text, str):
-            raise ValueError("A Telegram text message and chat are required.")
-        chat_id = str(chat.get("id", "")).strip()
-        command, separator, argument = text.strip().partition(" ")
-        if command == "/status":
-            request = TelegramRequest("status", chat_id)
-        elif command == "/confirm":
-            if not separator or not argument.strip():
-                raise ValueError("Use /confirm with a confirmation identifier.")
-            request = TelegramRequest(
-                "confirm",
-                chat_id,
-                confirmation_id=argument.strip(),
-            )
-        else:
-            request = TelegramRequest("message", chat_id, text=text)
-        reply = self._gateway.handle(self._authentication_token, request)
+        reply = self._updates.handle_update(update)
         return {
             "method": "sendMessage",
             "chat_id": reply.chat_id,
@@ -242,6 +464,255 @@ class TelegramWebhookAdapter:
         }
 
 
+class TelegramPollingApplication:
+    """Receive Telegram messages without exposing a public HTTP endpoint."""
+
+    def __init__(
+        self,
+        adapter: TelegramUpdateAdapter,
+        client: TelegramBotClient,
+        *,
+        poll_timeout: int = 30,
+    ) -> None:
+        self._adapter = adapter
+        self._client = client
+        self._poll_timeout = poll_timeout
+
+    def run_once(self, offset: int | None = None) -> int | None:
+        updates = self._client.get_updates(
+            offset=offset,
+            timeout=self._poll_timeout,
+        )
+        next_offset = offset
+        for update in updates:
+            update_id = update.get("update_id")
+            if not isinstance(update_id, int):
+                continue
+            next_offset = max(next_offset or 0, update_id + 1)
+            try:
+                reply = self._adapter.handle_update(update)
+            except (KeyError, PermissionError, ValueError):
+                continue
+            self._client.send_message(reply.chat_id, reply.text)
+        return next_offset
+
+    def run_forever(
+        self,
+        *,
+        bot_username: str,
+        initial_offset: int | None = None,
+        output: Callable[[str], None] = print,
+    ) -> None:
+        output(f"Reckoning is listening through @{bot_username}. Press Ctrl+C to stop.")
+        offset = initial_offset
+        while True:
+            try:
+                offset = self.run_once(offset)
+            except TelegramBotApiError as error:
+                output(str(error))
+                time.sleep(2)
+
+
+@dataclass(frozen=True)
+class SetupMenuOption:
+    name: str
+    label: str
+    available: bool
+    unavailable_message: str = ""
+
+
+GATEWAY_SETUP_OPTIONS = (
+    SetupMenuOption("telegram", "Telegram", True),
+    SetupMenuOption(
+        "discord",
+        "Discord (coming later)",
+        False,
+        "Discord is not available yet.",
+    ),
+    SetupMenuOption(
+        "whatsapp",
+        "WhatsApp (coming later)",
+        False,
+        "WhatsApp is not available yet.",
+    ),
+    SetupMenuOption(
+        "slack",
+        "Slack (coming later)",
+        False,
+        "Slack is not available yet.",
+    ),
+)
+
+PROVIDER_SETUP_OPTIONS = (
+    SetupMenuOption("fake", "Fake (no API key)", True),
+    SetupMenuOption(
+        "deepseek",
+        "DeepSeek (API-key setup coming later)",
+        False,
+        "DeepSeek setup is not available yet.",
+    ),
+    SetupMenuOption(
+        "orcarouter",
+        "OrcaRouter (API-key setup coming later)",
+        False,
+        "OrcaRouter setup is not available yet.",
+    ),
+)
+
+
+def _choose_setup_option(
+    heading: str,
+    prompt: str,
+    options: tuple[SetupMenuOption, ...],
+    *,
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+) -> str:
+    output(heading)
+    for index, option in enumerate(options, start=1):
+        output(f"  {index}. {option.label}")
+
+    while True:
+        raw_choice = line_reader(prompt).strip() or "1"
+        try:
+            choice = int(raw_choice)
+        except ValueError:
+            output(f"Enter a number from 1 to {len(options)}.")
+            continue
+        if choice < 1 or choice > len(options):
+            output(f"Enter a number from 1 to {len(options)}.")
+            continue
+        option = options[choice - 1]
+        if not option.available:
+            output(option.unavailable_message)
+            continue
+        return option.name
+
+
+def setup_reckoning_telegram(
+    *,
+    config_path: Path = DEFAULT_TELEGRAM_CONFIG,
+    secret_reader: Callable[[str], str] = getpass,
+    line_reader: Callable[[str], str] = input,
+    output: Callable[[str], None] = print,
+    api_factory: Callable[[str], TelegramBotClient] = TelegramBotApi,
+    pairing_code: str | None = None,
+    maximum_polls: int = 12,
+) -> TelegramPollingSettings:
+    output("Reckoning setup")
+    gateway_name = _choose_setup_option(
+        "Choose a gateway:",
+        "Gateway [1]: ",
+        GATEWAY_SETUP_OPTIONS,
+        line_reader=line_reader,
+        output=output,
+    )
+    provider_name = _choose_setup_option(
+        "Choose a provider:",
+        "Provider [1]: ",
+        PROVIDER_SETUP_OPTIONS,
+        line_reader=line_reader,
+        output=output,
+    )
+    output("Fake uses deterministic local replies, so it does not need an API key.")
+    return setup_telegram_polling(
+        config_path=config_path,
+        secret_reader=secret_reader,
+        line_reader=line_reader,
+        output=output,
+        api_factory=api_factory,
+        pairing_code=pairing_code,
+        maximum_polls=maximum_polls,
+        gateway_name=gateway_name,
+        provider_name=provider_name,
+    )
+
+
+def setup_telegram_polling(
+    *,
+    config_path: Path = DEFAULT_TELEGRAM_CONFIG,
+    secret_reader: Callable[[str], str] = getpass,
+    line_reader: Callable[[str], str] = input,
+    output: Callable[[str], None] = print,
+    api_factory: Callable[[str], TelegramBotClient] = TelegramBotApi,
+    pairing_code: str | None = None,
+    maximum_polls: int = 12,
+    gateway_name: str = "telegram",
+    provider_name: str = "fake",
+) -> TelegramPollingSettings:
+    if config_path.exists():
+        replace = line_reader(
+            f"Telegram is already configured at {config_path}. Replace it? [y/N] "
+        )
+        if replace.strip().casefold() not in ("y", "yes"):
+            raise OperationError("Telegram setup was not changed.")
+
+    token = secret_reader("Paste the BotFather token (input is hidden): ").strip()
+    if not token:
+        raise ValueError("A Telegram bot token is required.")
+    client = api_factory(token)
+    bot = client.get_me()
+    username = str(bot.get("username", "")).strip()
+    if not username:
+        raise TelegramBotApiError("Telegram getMe did not return a bot username.")
+
+    webhook = client.get_webhook_info()
+    if str(webhook.get("url", "")).strip():
+        switch = line_reader(
+            "This bot currently uses a webhook. Switch it to local polling? [y/N] "
+        )
+        if switch.strip().casefold() not in ("y", "yes"):
+            raise OperationError("Telegram setup kept the existing webhook.")
+        client.delete_webhook()
+
+    code = pairing_code or secrets.token_hex(3)
+    output(f"Bot verified: @{username}")
+    output(f"Open the bot in Telegram and send: /connect {code}")
+    output("Waiting for that message for up to five minutes...")
+
+    offset: int | None = None
+    paired_chat_id = ""
+    for _ in range(maximum_polls):
+        updates = client.get_updates(offset=offset, timeout=25)
+        for update in updates:
+            update_id = update.get("update_id")
+            if isinstance(update_id, int):
+                offset = max(offset or 0, update_id + 1)
+            message = update.get("message")
+            if not isinstance(message, dict):
+                continue
+            chat = message.get("chat")
+            if not isinstance(chat, dict) or chat.get("type") != "private":
+                continue
+            if str(message.get("text", "")).strip() != f"/connect {code}":
+                continue
+            paired_chat_id = str(chat.get("id", "")).strip()
+            if paired_chat_id:
+                break
+        if paired_chat_id:
+            break
+    if not paired_chat_id:
+        raise OperationError(
+            "No matching private /connect message arrived. Telegram setup was not saved."
+        )
+
+    settings = TelegramPollingSettings(
+        token,
+        (paired_chat_id,),
+        username,
+        offset,
+        gateway_name,
+        provider_name,
+    )
+    settings.save(config_path)
+    client.send_message(
+        paired_chat_id,
+        "Reckoning is connected. Return to the terminal and start the bot.",
+    )
+    output(f"Telegram setup saved to {config_path} with owner-only permissions.")
+    return settings
+
+
 class TelegramWebhookApplication:
     """WSGI endpoint for Telegram's authenticated webhook delivery."""
 
@@ -258,7 +729,9 @@ class TelegramWebhookApplication:
         method = str(environ.get("REQUEST_METHOD", "GET")).upper()
         path = str(environ.get("PATH_INFO", "/"))
         if path != "/telegram/webhook":
-            return self._response(start_response, "404 Not Found", {"error": "Not found."})
+            return self._response(
+                start_response, "404 Not Found", {"error": "Not found."}
+            )
         if method != "POST":
             return self._response(
                 start_response,
@@ -266,9 +739,7 @@ class TelegramWebhookApplication:
                 {"error": "Telegram webhooks require POST."},
             )
         try:
-            secret_token = str(
-                environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", "")
-            )
+            secret_token = str(environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", ""))
             self._adapter.authenticate(secret_token)
             content_length = int(str(environ.get("CONTENT_LENGTH") or "0"))
             if content_length <= 0 or content_length > self._maximum_body_bytes:
@@ -314,9 +785,77 @@ class TelegramWebhookApplication:
         return [body]
 
 
+def _create_interface(
+    arguments: argparse.Namespace,
+    *,
+    configured_provider: str | None = None,
+) -> ReckoningInterfaceApplication:
+    runtime = load_installation_runtime(
+        arguments.data_dir,
+        server_data_dir=arguments.server_data_dir,
+    )
+
+    orcarouter_api_key: str | None = None
+    deepseek_api_key: str | None = None
+    model_name = arguments.model
+    base_url = arguments.base_url
+    provider_name = arguments.provider or configured_provider
+    if provider_name == "orcarouter":
+        orcarouter_settings = OrcaRouterSettings.load()
+        orcarouter_api_key = orcarouter_settings.api_key
+        model_name = model_name or orcarouter_settings.model
+        base_url = base_url or orcarouter_settings.base_url
+    elif provider_name == "deepseek":
+        deepseek_settings = DeepSeekSettings.load()
+        deepseek_api_key = deepseek_settings.api_key
+        model_name = model_name or deepseek_settings.model
+        base_url = base_url or deepseek_settings.base_url
+    elif provider_name is None:
+        orcarouter_settings = OrcaRouterSettings.load()
+        deepseek_settings = DeepSeekSettings.load()
+        if orcarouter_settings.api_key:
+            provider_name = "orcarouter"
+            orcarouter_api_key = orcarouter_settings.api_key
+            model_name = model_name or orcarouter_settings.model
+            base_url = base_url or orcarouter_settings.base_url
+        elif deepseek_settings.api_key:
+            provider_name = "deepseek"
+            deepseek_api_key = deepseek_settings.api_key
+            model_name = model_name or deepseek_settings.model
+            base_url = base_url or deepseek_settings.base_url
+        else:
+            provider_name = "fake"
+
+    application = create_local_application(
+        runtime.state_path("confirmed-state", "continuity.json"),
+        personal_context_path=runtime.state_path(
+            "personal-context", "personal-context.json"
+        ),
+        provider_name=provider_name or "fake",
+        orcarouter_api_key=orcarouter_api_key,
+        deepseek_api_key=deepseek_api_key,
+        model_name=model_name,
+        base_url=base_url,
+        persona=runtime.persona,
+        placement=runtime.application_placement,
+    )
+    return create_local_interface_application(
+        application,
+        runtime.state_path("confirmed-state", "interfaces.json"),
+        placement=runtime.interface_placement,
+        connector_data_dir=runtime.root_for("approved-remote-sources"),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run Reckoning's bounded Telegram webhook."
+        description="Set up or run Reckoning through Telegram."
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("run", "setup", "webhook"),
+        default="run",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8081, type=int)
@@ -333,66 +872,76 @@ def main() -> None:
         type=Path,
         help="Configured personal-server storage root for server or hybrid placement.",
     )
+    parser.add_argument(
+        "--telegram-config",
+        type=Path,
+        default=DEFAULT_TELEGRAM_CONFIG,
+        help="Local credential file used by Telegram polling.",
+    )
     arguments = parser.parse_args()
+
+    if arguments.command == "setup":
+        try:
+            setup_reckoning_telegram(config_path=arguments.telegram_config)
+        except (OperationError, TelegramBotApiError, ValueError) as error:
+            parser.error(str(error))
+        return
+
     try:
-        host = validate_bind_host(arguments.host)
-        telegram_settings = TelegramRuntimeSettings.load()
-        runtime = load_installation_runtime(
-            arguments.data_dir,
-            server_data_dir=arguments.server_data_dir,
-        )
-    except (OperationError, ValueError) as error:
+        if arguments.command == "webhook":
+            host = validate_bind_host(arguments.host)
+            webhook_settings = TelegramRuntimeSettings.load()
+            interface = _create_interface(arguments)
+        else:
+            polling_settings = TelegramPollingSettings.load(arguments.telegram_config)
+            interface = _create_interface(
+                arguments,
+                configured_provider=polling_settings.provider_name,
+            )
+    except (OperationError, RuntimeError, ValueError) as error:
         parser.error(str(error))
 
-    orcarouter_settings = OrcaRouterSettings.load()
-    deepseek_settings = DeepSeekSettings.load()
-    provider_name = arguments.provider or (
-        "orcarouter"
-        if orcarouter_settings.api_key
-        else "deepseek"
-        if deepseek_settings.api_key
-        else "fake"
-    )
-    provider_settings = (
-        deepseek_settings if provider_name == "deepseek" else orcarouter_settings
-    )
-    application = create_local_application(
-        runtime.state_path("confirmed-state", "continuity.json"),
-        personal_context_path=runtime.state_path(
-            "personal-context", "personal-context.json"
-        ),
-        provider_name=provider_name,
-        orcarouter_api_key=orcarouter_settings.api_key,
-        deepseek_api_key=deepseek_settings.api_key,
-        model_name=arguments.model or provider_settings.model,
-        base_url=arguments.base_url or provider_settings.base_url,
-        persona=runtime.persona,
-        placement=runtime.application_placement,
-    )
-    interface = create_local_interface_application(
-        application,
-        runtime.state_path("confirmed-state", "interfaces.json"),
-        placement=runtime.interface_placement,
-        connector_data_dir=runtime.root_for("approved-remote-sources"),
+    gateway_token = (
+        webhook_settings.gateway_token
+        if arguments.command == "webhook"
+        else secrets.token_urlsafe(32)
     )
     gateway = TelegramGateway(
         interface,
-        authentication_token=telegram_settings.gateway_token,
-        allowed_chat_ids=telegram_settings.allowed_chat_ids,
+        authentication_token=gateway_token,
+        allowed_chat_ids=(
+            webhook_settings.allowed_chat_ids
+            if arguments.command == "webhook"
+            else polling_settings.allowed_chat_ids
+        ),
     )
-    webhook = TelegramWebhookApplication(
-        TelegramWebhookAdapter(
-            gateway,
-            authentication_token=telegram_settings.gateway_token,
-            webhook_secret=telegram_settings.webhook_secret,
+    if arguments.command == "webhook":
+        webhook = TelegramWebhookApplication(
+            TelegramWebhookAdapter(
+                gateway,
+                authentication_token=gateway_token,
+                webhook_secret=webhook_settings.webhook_secret,
+            )
         )
+        with make_server(host, arguments.port, webhook) as server:
+            print(f"Telegram webhook is listening on http://{host}:{arguments.port}")
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                print("\nTelegram webhook stopped.")
+        return
+
+    polling = TelegramPollingApplication(
+        TelegramUpdateAdapter(gateway, authentication_token=gateway_token),
+        TelegramBotApi(polling_settings.bot_token),
     )
-    with make_server(host, arguments.port, webhook) as server:
-        print(f"Telegram webhook is listening on http://{host}:{arguments.port}")
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            print("\nTelegram webhook stopped.")
+    try:
+        polling.run_forever(
+            bot_username=polling_settings.bot_username,
+            initial_offset=polling_settings.next_update_offset,
+        )
+    except KeyboardInterrupt:
+        print("\nTelegram polling stopped.")
 
 
 if __name__ == "__main__":
