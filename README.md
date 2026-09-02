@@ -61,9 +61,10 @@ The browser interface does not require Telegram. To connect a Telegram bot, run:
 reckoning setup
 ```
 
-Choose **Telegram**, then choose **Fake**. Fake does not need a model-provider
-API key. The setup command asks for your BotFather token and pairs one private
-chat. Start the connected bot with:
+Choose **Telegram**, then choose a provider. **Fake** does not need a
+model-provider API key. **DeepSeek** and **OrcaRouter** ask for the provider's
+API key during setup (see the next section). The setup command then asks for
+your BotFather token and pairs one private chat. Start the connected bot with:
 
 ```bash
 reckoning-telegram
@@ -76,7 +77,47 @@ Keep the command running while you use the bot. See
 
 You do not need this section for the default fake provider.
 
-To use OrcaRouter, create an ignored `.env` file in the repository root:
+### Enter the API key during setup
+
+Run the setup command:
+
+```bash
+reckoning setup
+```
+
+Choose **Telegram**, then choose **DeepSeek** or **OrcaRouter** in the provider
+menu. Setup asks for the provider's API key with hidden input — the key is
+never echoed to the terminal. It verifies the key against the provider and
+refuses to save a key that fails verification. A verified key is saved in
+`~/.config/reckoning/provider.json` with owner-only permissions. The key is
+never written to the instance data.
+
+Then start the interface you use:
+
+```bash
+reckoning
+```
+
+or:
+
+```bash
+reckoning-telegram
+```
+
+Both commands pick up the saved key automatically; no `.env` file is needed.
+To switch providers or replace a key, re-run the full setup:
+
+```bash
+reckoning setup
+```
+
+Answer `y` when setup asks to replace the existing Telegram configuration.
+
+### Use environment variables instead
+
+You can still configure a provider with environment variables or an ignored
+`.env` file in the repository root. Those values take precedence over the
+saved credential. To use OrcaRouter:
 
 ```dotenv
 ORCAROUTER_API_KEY=replace-with-your-key
@@ -104,6 +145,12 @@ Then start the server:
 
 ```bash
 reckoning --provider deepseek
+```
+
+The same flags work for the Telegram runtime:
+
+```bash
+reckoning-telegram --provider deepseek
 ```
 
 Both providers use their official API URL by default. Use `BASE_URL` for

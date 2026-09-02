@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+import json
+import stat
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request
+
+import pytest
+
+from reckoning.config import DeepSeekSettings, OrcaRouterSettings
+from reckoning.operations import OperationError
+from reckoning.providers import (
+    ProviderKeyVerificationError,
+    verify_provider_api_key,
+)
+from reckoning.setup import setup_reckoning
+
+
+class PairingTelegramClient:
+    def __init__(self, updates: tuple[dict[str, object], ...]) -> None:
+        self.updates = updates
+
+    def get_me(self) -> dict[str, object]:
+        return {"id": 7, "username": "reckoning_test_bot"}
+
+    def get_webhook_info(self) -> dict[str, object]:
+        return {"url": ""}
+
+    def delete_webhook(self) -> None:
+        raise AssertionError("No webhook is configured.")
+
+    def get_updates(
+        self,
+        *,
+        offset: int | None,
+        timeout: int,
+    ) -> tuple[dict[str, object], ...]:
+        return self.updates
+
+    def send_message(self, chat_id: str, text: str) -> None:
+        pass
+
+
+PAIRED_UPDATE = (
+    {
+        "update_id": 5,
+        "message": {
+            "chat": {"id": 42, "type": "private"},
+            "text": "/connect abc123",
+        },
+    },
+)
+
+
+class RecordingKeyVerifier:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, provider_name: str, api_key: str) -> None:
+        self.calls.append((provider_name, api_key))
+        if self.error is not None:
+            raise self.error
+
+
+def run_setup(
+    tmp_path: Path,
+    answers: tuple[str, ...],
+    secrets: tuple[str, ...],
+    *,
+    verifier: RecordingKeyVerifier,
+    updates: tuple[dict[str, object], ...] = PAIRED_UPDATE,
+):
+    line_answers = iter(answers)
+    secret_answers = iter(secrets)
+    secret_prompts: list[str] = []
+    messages: list[str] = []
+
+    def read_secret(prompt: str) -> str:
+        secret_prompts.append(prompt)
+        return next(secret_answers)
+
+    settings = setup_reckoning(
+        config_path=tmp_path / "telegram.json",
+        credentials_path=tmp_path / "provider.json",
+        secret_reader=read_secret,
+        line_reader=lambda prompt: next(line_answers),
+        output=messages.append,
+        api_factory=lambda token: PairingTelegramClient(updates),
+        key_verifier=verifier,
+        pairing_code="abc123",
+        maximum_polls=1,
+    )
+    return settings, secret_prompts, messages
+
+
+def test_setup_verifies_and_saves_a_deepseek_key_with_owner_only_permissions(
+    tmp_path: Path,
+) -> None:
+    verifier = RecordingKeyVerifier()
+
+    settings, secret_prompts, messages = run_setup(
+        tmp_path,
+        ("1", "2"),
+        ("sk-deepseek-test", "bot-token"),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == [("deepseek", "sk-deepseek-test")]
+    assert secret_prompts == [
+        "Paste the DeepSeek API key (input is hidden): ",
+        "Paste the BotFather token (input is hidden): ",
+    ]
+    assert settings.provider_name == "deepseek"
+
+    credentials_path = tmp_path / "provider.json"
+    assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
+    assert json.loads(credentials_path.read_text(encoding="utf-8")) == {
+        "provider_name": "deepseek",
+        "api_key": "sk-deepseek-test",
+    }
+    displayed = "\n".join(messages)
+    assert "DeepSeek verified the API key." in displayed
+    assert f"Provider credentials saved to {credentials_path}" in displayed
+
+    loaded = DeepSeekSettings.load(
+        tmp_path / "missing.env",
+        environ={},
+        credential_file=credentials_path,
+    )
+    assert loaded.api_key == "sk-deepseek-test"
+
+
+def test_setup_verifies_and_saves_an_orcarouter_key(tmp_path: Path) -> None:
+    verifier = RecordingKeyVerifier()
+
+    settings, _, _ = run_setup(
+        tmp_path,
+        ("1", "3"),
+        ("orca-key", "bot-token"),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == [("orcarouter", "orca-key")]
+    assert settings.provider_name == "orcarouter"
+    loaded = OrcaRouterSettings.load(
+        tmp_path / "missing.env",
+        environ={},
+        credential_file=tmp_path / "provider.json",
+    )
+    assert loaded.api_key == "orca-key"
+
+
+def test_setup_refuses_a_key_the_provider_rejects(tmp_path: Path) -> None:
+    verifier = RecordingKeyVerifier(
+        ProviderKeyVerificationError(
+            "DeepSeek rejected the API key. Check the key and run setup again."
+        )
+    )
+
+    with pytest.raises(ProviderKeyVerificationError, match="rejected the API key"):
+        run_setup(
+            tmp_path,
+            ("1", "2"),
+            ("bad-key", "bot-token"),
+            verifier=verifier,
+        )
+
+    assert not (tmp_path / "provider.json").exists()
+    assert not (tmp_path / "telegram.json").exists()
+
+
+def test_setup_requires_a_non_empty_api_key(tmp_path: Path) -> None:
+    verifier = RecordingKeyVerifier()
+
+    with pytest.raises(ValueError, match="A DeepSeek API key is required."):
+        run_setup(
+            tmp_path,
+            ("1", "2"),
+            ("   ", "bot-token"),
+            verifier=verifier,
+        )
+
+    assert verifier.calls == []
+    assert not (tmp_path / "provider.json").exists()
+
+
+def test_an_aborted_pairing_leaves_no_partial_credential(tmp_path: Path) -> None:
+    verifier = RecordingKeyVerifier()
+
+    with pytest.raises(OperationError, match="Telegram setup was not saved"):
+        run_setup(
+            tmp_path,
+            ("1", "2"),
+            ("sk-deepseek-test", "bot-token"),
+            verifier=verifier,
+            updates=(),
+        )
+
+    assert verifier.calls == [("deepseek", "sk-deepseek-test")]
+    assert not (tmp_path / "provider.json").exists()
+    assert not (tmp_path / "telegram.json").exists()
+
+
+def test_verify_provider_api_key_accepts_a_key_the_provider_recognizes() -> None:
+    requests: list[Request] = []
+
+    def transport(request: Request, timeout: float) -> bytes:
+        requests.append(request)
+        return b'{"data": []}'
+
+    verify_provider_api_key("deepseek", "sk-good", transport=transport)
+
+    (request,) = requests
+    assert request.full_url == "https://api.deepseek.com/models"
+    assert request.headers["Authorization"] == "Bearer sk-good"
+    assert request.get_method() == "GET"
+
+
+def test_verify_provider_api_key_explains_a_rejected_key() -> None:
+    def transport(request: Request, timeout: float) -> bytes:
+        raise HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+
+    with pytest.raises(
+        ProviderKeyVerificationError,
+        match="OrcaRouter rejected the API key",
+    ):
+        verify_provider_api_key("orcarouter", "bad-key", transport=transport)
+
+
+def test_verify_provider_api_key_explains_other_failures() -> None:
+    def failing_http(request: Request, timeout: float) -> bytes:
+        raise HTTPError(request.full_url, 500, "Server Error", {}, None)
+
+    with pytest.raises(
+        ProviderKeyVerificationError,
+        match="DeepSeek returned HTTP 500 during API-key verification",
+    ):
+        verify_provider_api_key("deepseek", "key", transport=failing_http)
+
+    def unreachable(request: Request, timeout: float) -> bytes:
+        raise URLError("offline")
+
+    with pytest.raises(
+        ProviderKeyVerificationError,
+        match="DeepSeek could not be reached: offline",
+    ):
+        verify_provider_api_key("deepseek", "key", transport=unreachable)
+
+
+def test_verify_provider_api_key_rejects_an_unknown_provider() -> None:
+    with pytest.raises(ValueError, match="Unsupported model provider: fake"):
+        verify_provider_api_key("fake", "key", transport=lambda r, t: b"")

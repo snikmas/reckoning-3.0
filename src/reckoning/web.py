@@ -10,7 +10,11 @@ from wsgiref.simple_server import make_server
 from wsgiref.types import StartResponse, WSGIEnvironment
 
 from reckoning.application import Message, ReckoningApplication, create_local_application
-from reckoning.config import DeepSeekSettings, OrcaRouterSettings
+from reckoning.config import (
+    DEFAULT_PROVIDER_CREDENTIALS,
+    DeepSeekSettings,
+    OrcaRouterSettings,
+)
 from reckoning.interfaces import (
     ControlView,
     ReckoningInterfaceApplication,
@@ -541,8 +545,12 @@ def main() -> None:
     except (OperationError, ValueError) as error:
         parser.error(str(error))
 
-    orcarouter_settings = OrcaRouterSettings.load()
-    deepseek_settings = DeepSeekSettings.load()
+    orcarouter_settings = OrcaRouterSettings.load(
+        credential_file=DEFAULT_PROVIDER_CREDENTIALS
+    )
+    deepseek_settings = DeepSeekSettings.load(
+        credential_file=DEFAULT_PROVIDER_CREDENTIALS
+    )
     provider_name = arguments.provider or (
         "orcarouter"
         if orcarouter_settings.api_key
