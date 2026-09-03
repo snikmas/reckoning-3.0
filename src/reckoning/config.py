@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,30 +22,65 @@ _ALLOWED_ENV_NAMES = (
 
 DEFAULT_PROVIDER_CREDENTIALS = Path.home() / ".config" / "reckoning" / "provider.json"
 
+CREDENTIAL_PROVIDER_NAMES = ("deepseek", "orcarouter")
 
-@dataclass(frozen=True)
-class ProviderCredentials:
-    """The verified provider API key saved by terminal setup."""
 
-    provider_name: str
-    api_key: str = field(repr=False)
+@dataclass
+class ProviderCredentialStore:
+    """All configured provider API keys plus the default-provider marker."""
+
+    providers: dict[str, str] = field(default_factory=dict)
+    default_provider: str | None = None
 
     @classmethod
     def load(
         cls,
         path: Path = DEFAULT_PROVIDER_CREDENTIALS,
-    ) -> ProviderCredentials | None:
+    ) -> ProviderCredentialStore:
         data = read_json(path, default={})
-        provider_name = str(data.get("provider_name", "")).strip().casefold()
-        api_key = str(data.get("api_key", "")).strip()
-        if provider_name not in ("deepseek", "orcarouter") or not api_key:
-            return None
-        return cls(provider_name, api_key)
+        providers: dict[str, str] = {}
+        raw_providers = data.get("providers")
+        entries: Iterable[tuple[object, object]]
+        if isinstance(raw_providers, dict):
+            entries = raw_providers.items()
+        else:
+            # Legacy single-slot format: {"provider_name": ..., "api_key": ...}
+            entries = [(data.get("provider_name", ""), data.get("api_key", ""))]
+        for raw_name, raw_key in entries:
+            name = str(raw_name).strip().casefold()
+            key = str(raw_key).strip()
+            if name in CREDENTIAL_PROVIDER_NAMES and key:
+                providers[name] = key
+        default: str | None = str(data.get("default_provider", "")).strip().casefold()
+        if default not in providers:
+            default = next(iter(providers), None)
+        return cls(providers=providers, default_provider=default)
+
+    def set_key(
+        self, provider_name: str, api_key: str, *, make_default: bool = False
+    ) -> None:
+        self.providers[provider_name] = api_key
+        if make_default or self.default_provider not in self.providers:
+            self.default_provider = provider_name
+
+    def remove(self, provider_name: str) -> bool:
+        if provider_name not in self.providers:
+            return False
+        del self.providers[provider_name]
+        if self.default_provider == provider_name:
+            self.default_provider = next(iter(self.providers), None)
+        return True
+
+    def api_key_for(self, provider_name: str) -> str | None:
+        return self.providers.get(provider_name)
 
     def save(self, path: Path = DEFAULT_PROVIDER_CREDENTIALS) -> None:
         atomic_write_json(
             path,
-            {"provider_name": self.provider_name, "api_key": self.api_key},
+            {
+                "default_provider": self.default_provider,
+                "providers": dict(self.providers),
+            },
         )
         path.chmod(0o600)
 
@@ -56,10 +91,7 @@ def _credential_api_key(
 ) -> str | None:
     if credential_file is None:
         return None
-    credentials = ProviderCredentials.load(credential_file)
-    if credentials is None or credentials.provider_name != provider_name:
-        return None
-    return credentials.api_key
+    return ProviderCredentialStore.load(credential_file).api_key_for(provider_name)
 
 
 @dataclass(frozen=True)
