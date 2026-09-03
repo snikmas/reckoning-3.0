@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import stat
+from collections.abc import Callable
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
@@ -64,12 +65,26 @@ class RecordingKeyVerifier:
             raise self.error
 
 
+class SequenceKeyVerifier:
+    """Plays back one verification outcome per call."""
+
+    def __init__(self, outcomes: tuple[Exception | None, ...]) -> None:
+        self.outcomes = list(outcomes)
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, provider_name: str, api_key: str) -> None:
+        self.calls.append((provider_name, api_key))
+        outcome = self.outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+
 def run_setup(
     tmp_path: Path,
     answers: tuple[str, ...],
     secrets: tuple[str, ...],
     *,
-    verifier: RecordingKeyVerifier,
+    verifier: Callable[[str, str], None],
     updates: tuple[dict[str, object], ...] = PAIRED_UPDATE,
 ):
     line_answers = iter(answers)
@@ -251,23 +266,78 @@ def test_setup_with_only_fake_needs_no_key_and_saves_no_credentials(
     assert not (tmp_path / "provider.json").exists()
 
 
-def test_setup_refuses_a_key_the_provider_rejects(tmp_path: Path) -> None:
-    verifier = RecordingKeyVerifier(
-        ProviderKeyVerificationError(
-            "DeepSeek rejected the API key. Check the key and run setup again."
-        )
+REJECTED_KEY = ProviderKeyVerificationError(
+    "DeepSeek rejected the API key. Check the key and run setup again."
+)
+
+
+def test_setup_retries_a_rejected_key_and_verifies_the_next_one(
+    tmp_path: Path,
+) -> None:
+    verifier = SequenceKeyVerifier((REJECTED_KEY, None))
+
+    settings, secret_prompts, messages = run_setup(
+        tmp_path,
+        ("1", "2", "1", "n"),
+        ("bad-key", "good-key", "bot-token"),
+        verifier=verifier,
     )
 
-    with pytest.raises(ProviderKeyVerificationError, match="rejected the API key"):
+    assert verifier.calls == [("deepseek", "bad-key"), ("deepseek", "good-key")]
+    assert secret_prompts == [
+        "Paste the DeepSeek API key (input is hidden): ",
+        "Paste the DeepSeek API key (input is hidden): ",
+        "Paste the BotFather token (input is hidden): ",
+    ]
+    displayed = "\n".join(messages)
+    assert "DeepSeek rejected the API key." in displayed
+    assert "Re-enter the API key" in displayed
+    assert "Save the key anyway" in displayed
+    assert "Abort setup" in displayed
+    assert settings.provider_name == "deepseek"
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "deepseek",
+        "providers": {"deepseek": "good-key"},
+    }
+
+
+def test_setup_can_save_a_key_the_provider_could_not_verify(
+    tmp_path: Path,
+) -> None:
+    verifier = SequenceKeyVerifier((REJECTED_KEY,))
+
+    settings, _, messages = run_setup(
+        tmp_path,
+        ("1", "2", "2", "n"),
+        ("unverified-key", "bot-token"),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == [("deepseek", "unverified-key")]
+    assert "unverified" in "\n".join(messages)
+    assert settings.provider_name == "deepseek"
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "deepseek",
+        "providers": {"deepseek": "unverified-key"},
+    }
+
+
+def test_setup_abort_after_a_rejected_key_leaves_nothing_written(
+    tmp_path: Path,
+) -> None:
+    verifier = SequenceKeyVerifier((REJECTED_KEY,))
+
+    with pytest.raises(OperationError, match="[Aa]borted"):
         run_setup(
             tmp_path,
-            ("1", "2", "n"),
-            ("bad-key", "bot-token"),
+            ("1", "2", "3"),
+            ("bad-key",),
             verifier=verifier,
         )
 
     assert not (tmp_path / "provider.json").exists()
     assert not (tmp_path / "telegram.json").exists()
+
 
 
 def test_setup_requires_a_non_empty_api_key(tmp_path: Path) -> None:
