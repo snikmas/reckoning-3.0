@@ -599,3 +599,25 @@ def test_management_mode_without_telegram_config_runs_pairing(
 
     assert settings.provider_name == "deepseek"
     assert TelegramPollingSettings.load(tmp_path / "telegram.json") == settings
+
+
+def test_management_menu_can_make_fake_the_default(tmp_path: Path) -> None:
+    seed_management_install(tmp_path, {"deepseek": "sk-deepseek"}, "deepseek")
+    verifier = RecordingKeyVerifier()
+
+    settings, _, _ = run_setup(
+        tmp_path,
+        ("1", "1", "n", "2", "5"),
+        (),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == []
+    assert settings.provider_name == "fake"
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "deepseek",
+        "providers": {"deepseek": "sk-deepseek"},
+    }
+    assert (
+        TelegramPollingSettings.load(tmp_path / "telegram.json").provider_name == "fake"
+    )

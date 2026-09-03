@@ -138,14 +138,16 @@ def setup_reckoning(
     output("Reckoning setup")
     store = ProviderCredentialStore.load(credentials_path)
     if store.providers:
-        _manage_providers(
+        fake_default = _manage_providers(
             store,
             secret_reader=secret_reader,
             line_reader=line_reader,
             output=output,
             key_verifier=key_verifier,
         )
-        provider_name = store.default_provider or "fake"
+        provider_name = (
+            "fake" if fake_default else store.default_provider or "fake"
+        )
         settings = _ensure_telegram_settings(
             provider_name,
             config_path=config_path,
@@ -203,7 +205,9 @@ def _manage_providers(
     line_reader: Callable[[str], str],
     output: Callable[[str], None],
     key_verifier: Callable[[str, str], None],
-) -> None:
+) -> bool:
+    """Manage stored providers; return True when the default became fake."""
+    fake_default = False
     while True:
         configured = ", ".join(
             f"{_provider_label(name)}"
@@ -220,9 +224,9 @@ def _manage_providers(
             output=output,
         )
         if action == "done":
-            return
+            return fake_default
         if action == "add":
-            _run_provider_loop(
+            chosen = _run_provider_loop(
                 secret_reader=secret_reader,
                 line_reader=line_reader,
                 output=output,
@@ -230,6 +234,7 @@ def _manage_providers(
                 store=store,
                 current_default=store.default_provider,
             )
+            fake_default = chosen == "fake"
             continue
         if not store.providers:
             output("No providers are configured yet.")
@@ -268,6 +273,7 @@ def _manage_providers(
                     output=output,
                     current_default=store.default_provider,
                 )
+                fake_default = False
             elif not store.providers:
                 output("No providers remain; the fake provider will be used.")
         elif action == "default":
@@ -281,6 +287,7 @@ def _manage_providers(
                 output=output,
                 current_default=store.default_provider,
             )
+            fake_default = False
 
 
 def _choose_stored_provider(

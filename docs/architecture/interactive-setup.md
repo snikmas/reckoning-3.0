@@ -1,6 +1,8 @@
 # Interactive setup wizard: multi-provider credentials
 
-Status: accepted (design). Implementation tracked as a GitHub issue.
+Status: implemented (#68 credential store and migration, #69 provider loop
+and default choice, #70 verification-failure recovery, #71 re-run
+management menu).
 
 ## Context
 
