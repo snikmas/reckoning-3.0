@@ -362,7 +362,6 @@ def test_setup_abort_after_a_rejected_key_leaves_nothing_written(
     assert not (tmp_path / "telegram.json").exists()
 
 
-
 def test_setup_requires_a_non_empty_api_key(tmp_path: Path) -> None:
     verifier = RecordingKeyVerifier()
 
