@@ -32,8 +32,11 @@ WhatsApp, and Slack as future gateway choices. Only Telegram is available in
 this setup flow.
 
 Fake uses deterministic local replies and does not need a provider API key.
-DeepSeek and OrcaRouter ask for the provider API key with hidden input, verify
-the key against the provider, and save it in
+DeepSeek and OrcaRouter ask for the provider API key with hidden input and
+verify the key against the provider. If verification fails, the command offers
+to re-enter the key, save it unverified, or abort without saving. After each
+provider, the command asks whether to add another one, then asks which
+configured provider is the default. Keys are saved in
 `~/.config/reckoning/provider.json` with owner-only permissions. The command
 then asks for the BotFather token and hides it while you type. It verifies
 the bot and asks you to send a one-time `/connect` code in a private chat.
@@ -54,8 +57,9 @@ different provider than the configured one, pass explicit flags:
 reckoning-telegram --provider deepseek
 ```
 
-To switch providers or replace a saved key, re-run setup and answer `y` when
-it asks to replace the existing configuration:
+To add, replace, or remove a provider, or to change the default provider,
+re-run setup. When credentials already exist, setup opens a management menu
+instead of the first-run wizard:
 
 ```bash
 reckoning setup

@@ -6,8 +6,8 @@ an important decision across restarts. The codebase also contains broader
 services for goals, plans, research, routines, and personal context.
 
 The default setup needs no API key and makes no model-provider request. It uses
-a deterministic fake provider so that you can inspect the product safely. You
-can connect OrcaRouter or DeepSeek when you want real model responses.
+a deterministic fake provider so you can inspect the product safely. Connect
+OrcaRouter or DeepSeek when you want real model responses.
 
 ## Start a local instance
 
@@ -20,6 +20,10 @@ reckoning
 ```
 
 Open <http://127.0.0.1:8000>. Stop the server with `Ctrl+C`.
+
+The package installs three commands: `reckoning` runs the web interface and the
+setup wizard, `reckoning-telegram` runs the Telegram bot, and `reckoning-ops`
+handles instance setup, backup, restore, and diagnosis.
 
 `reckoning-ops setup` creates a local single-user instance, selects the Simon
 persona, and checks the core continuity flow. It stores the instance under
@@ -77,7 +81,7 @@ Keep the command running while you use the bot. See
 
 You do not need this section for the default fake provider.
 
-### Enter the API key during setup
+### Enter API keys during setup
 
 Run the setup command:
 
@@ -86,11 +90,15 @@ reckoning setup
 ```
 
 Choose **Telegram**, then choose **DeepSeek** or **OrcaRouter** in the provider
-menu. Setup asks for the provider's API key with hidden input — the key is
-never echoed to the terminal. It verifies the key against the provider and
-refuses to save a key that fails verification. A verified key is saved in
-`~/.config/reckoning/provider.json` with owner-only permissions. The key is
-never written to the instance data.
+menu. Setup asks for the provider's API key with hidden input and verifies the
+key against the provider. The key never echoes to the terminal. If verification
+fails, setup offers to re-enter the key, save it unverified, or abort without
+saving anything. After each provider, setup asks whether to add another one,
+then asks which configured provider is the default.
+
+Keys are saved in `~/.config/reckoning/provider.json` with owner-only
+permissions. The file can hold one key per provider plus the default-provider
+marker. Keys are never written to the instance data.
 
 Then start the interface you use:
 
@@ -104,14 +112,20 @@ or:
 reckoning-telegram
 ```
 
-Both commands pick up the saved key automatically; no `.env` file is needed.
-To switch providers or replace a key, re-run the full setup:
+Both commands use the saved default provider automatically; no `.env` file or
+`--provider` flag is needed.
+
+To manage providers later, re-run:
 
 ```bash
 reckoning setup
 ```
 
-Answer `y` when setup asks to replace the existing Telegram configuration.
+When credentials already exist, setup opens a management menu instead of the
+first-run wizard. From there you can add a provider, replace a key, remove a
+provider, or change the default. Pressing Enter at the key prompt keeps the
+current key. Credential files saved by older versions migrate to the
+multi-provider format automatically.
 
 ### Use environment variables instead
 
@@ -161,7 +175,7 @@ Reckoning reads only its documented provider variables from `.env`. It does not
 write API keys to the instance data. Each provider attempt records the provider,
 model calls, latency, retries, token usage, and failure status.
 
-## Understand the storage and access limits
+## Storage and access limits
 
 The default instance stores live state as plain JSON under
 `~/.local/state/reckoning`. Use `reckoning-ops backup` to create an encrypted
