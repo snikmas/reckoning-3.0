@@ -9,7 +9,11 @@ from reckoning.config import (
     DEFAULT_PROVIDER_CREDENTIALS,
     ProviderCredentialStore,
 )
-from reckoning.providers import verify_provider_api_key
+from reckoning.operations import OperationError
+from reckoning.providers import (
+    ProviderKeyVerificationError,
+    verify_provider_api_key,
+)
 from reckoning.telegram import (
     DEFAULT_TELEGRAM_CONFIG,
     TelegramBotApi,
@@ -59,6 +63,16 @@ _PROVIDER_DISPLAY_NAMES = {
     "deepseek": "DeepSeek",
     "orcarouter": "OrcaRouter",
 }
+
+VERIFICATION_RECOVERY_OPTIONS = (
+    SetupMenuOption("retry", "Re-enter the API key", True),
+    SetupMenuOption(
+        "save",
+        "Save the key anyway (the verification endpoint may be down)",
+        True,
+    ),
+    SetupMenuOption("abort", "Abort setup without saving anything", True),
+)
 
 
 def _choose_setup_option(
@@ -187,9 +201,10 @@ def _run_provider_loop(
                 provider_name,
                 secret_reader=secret_reader,
                 key_verifier=key_verifier,
+                line_reader=line_reader,
+                output=output,
             )
             store.set_key(provider_name, api_key)
-            output(f"{_PROVIDER_DISPLAY_NAMES[provider_name]} verified the API key.")
         if provider_name not in configured:
             configured.append(provider_name)
         if not _confirm(
@@ -243,12 +258,37 @@ def _enter_provider_key(
     *,
     secret_reader: Callable[[str], str],
     key_verifier: Callable[[str, str], None],
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
 ) -> str:
     display_name = _PROVIDER_DISPLAY_NAMES[provider_name]
-    api_key = secret_reader(
-        f"Paste the {display_name} API key (input is hidden): "
-    ).strip()
-    if not api_key:
-        raise ValueError(f"A {display_name} API key is required.")
-    key_verifier(provider_name, api_key)
-    return api_key
+    while True:
+        api_key = secret_reader(
+            f"Paste the {display_name} API key (input is hidden): "
+        ).strip()
+        if not api_key:
+            raise ValueError(f"A {display_name} API key is required.")
+        try:
+            key_verifier(provider_name, api_key)
+        except ProviderKeyVerificationError as error:
+            output(str(error))
+            action = _choose_setup_option(
+                f"{display_name} could not verify the API key. What now?",
+                "Recovery [1]: ",
+                VERIFICATION_RECOVERY_OPTIONS,
+                line_reader=line_reader,
+                output=output,
+            )
+            if action == "retry":
+                continue
+            if action == "abort":
+                raise OperationError(
+                    "Setup aborted; no credentials or gateway config were saved."
+                )
+            output(
+                f"Saved the {display_name} API key unverified; "
+                "rerun setup to verify it later."
+            )
+            return api_key
+        output(f"{display_name} verified the API key.")
+        return api_key
