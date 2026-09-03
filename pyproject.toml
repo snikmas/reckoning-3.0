@@ -4,18 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reckoning"
-version = "0.1.0"
+version = "0.2.0"
 description = "A local-first single-user continuity agent"
 requires-python = ">=3.13"
-dependencies = ["cryptography>=43"]
+dependencies = ["cryptography>=43", "rich>=13"]
 
 [project.optional-dependencies]
 test = ["pytest>=9,<10"]
 
 [project.scripts]
 reckoning = "reckoning.command:main"
-reckoning-ops = "reckoning.cli:main"
-reckoning-telegram = "reckoning.telegram:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

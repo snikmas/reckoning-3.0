@@ -5,92 +5,104 @@ current runnable flow helps you propose, correct, confirm, revisit, and review
 an important decision across restarts. The codebase also contains broader
 services for goals, plans, research, routines, and personal context.
 
-The default setup needs no API key and makes no model-provider request. It uses
-a deterministic fake provider so you can inspect the product safely. Connect
-OrcaRouter or DeepSeek when you want real model responses.
+The default setup needs no API key and makes no model-provider request until
+you choose a real provider. It uses a deterministic fake provider so you can
+inspect the product safely. Connect OrcaRouter or DeepSeek when you want real
+model responses.
 
-## Start a local instance
+## Commands changed in 0.2.0
 
-You need Python 3.13 or newer. From the repository root, run:
+0.2.0 installs exactly one binary, `reckoning`. The 0.1.x binaries are gone —
+no shims, no deprecation period. Your data, credentials, and configuration
+files are untouched.
 
-```bash
-python3 -m pip install .
-reckoning-ops setup
-reckoning
-```
+| 0.1.x | 0.2.0 |
+| --- | --- |
+| `reckoning-ops setup` | `reckoning setup` |
+| `reckoning-ops diagnose` | `reckoning doctor` |
+| `reckoning-ops backup` | `reckoning backup` |
+| `reckoning-ops restore` | `reckoning restore` |
+| `reckoning-ops export` | `reckoning export` |
+| `reckoning-ops migrate` | `reckoning migrate` |
+| `reckoning-telegram` | `reckoning gateway` |
+| `reckoning` (web interface) | `reckoning` (unchanged) |
 
-Open <http://127.0.0.1:8000>. Stop the server with `Ctrl+C`.
+## Quickstart
 
-The package installs three commands: `reckoning` runs the web interface and the
-setup wizard, `reckoning-telegram` runs the Telegram bot, and `reckoning-ops`
-handles instance setup, backup, restore, and diagnosis.
-
-`reckoning-ops setup` creates a local single-user instance, selects the Simon
-persona, and checks the core continuity flow. It stores the instance under
-`~/.local/state/reckoning` by default. You only need to run setup once.
-
-If your Python installation does not allow system-wide packages, create a
-virtual environment first:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-After activating the virtual environment, run the three commands from the start
-section.
-
-## What you can use
-
-The browser interface has separate views for conversation, current priorities,
-planning, review, and local operational status. Confirmed continuity records
-survive a restart. Recent unconfirmed conversation messages stay in memory only.
-
-The Python code also contains domain services for:
-
-- personal context with correction and deletion history;
-- directions, goals, plans, and check-ins;
-- research, forecasts, routines, watches, and briefings;
-- connector permissions, external-content isolation, and data placement;
-- bounded delegation and persona selection.
-
-Some of these services are available through the Python API but do not yet have
-a complete browser workflow.
-
-## Connect Telegram
-
-The browser interface does not require Telegram. To connect a Telegram bot, run:
+You need Python 3.13 or newer. From the repository root:
 
 ```bash
-reckoning setup
+pipx install .        # or: uv tool install .
+reckoning setup       # first-run wizard; proves the core continuity loop
+reckoning             # web interface at http://127.0.0.1:8000
+reckoning gateway     # optional: run the channels you configured
 ```
 
-Choose **Telegram**, then choose a provider. **Fake** does not need a
-model-provider API key. **DeepSeek** and **OrcaRouter** ask for the provider's
-API key during setup (see the next section). The setup command then asks for
-your BotFather token and pairs one private chat. Start the connected bot with:
+If you cannot use pipx or uv, `python3 -m pip install .` works too, inside a
+virtual environment when your Python installation does not allow system-wide
+packages.
+
+## Commands
+
+`reckoning --help` prints this same table, grouped the same way.
+
+| Group | Command | What it does |
+| --- | --- | --- |
+| Run | `reckoning` | Run the web interface. |
+| Run | `reckoning gateway` | Run every configured channel (Telegram today). |
+| Setup | `reckoning setup` | First-run setup wizard; re-run to manage providers and channels. |
+| Setup | `reckoning doctor` | Report installation health and how to fix problems. |
+| Data | `reckoning backup` | Create an encrypted recovery archive. |
+| Data | `reckoning restore` | Restore into a clean installation. |
+| Data | `reckoning export` | Create an encrypted transfer export. |
+| Data | `reckoning migrate` | Migrate an encrypted transfer to the current format. |
+
+## Which command when
+
+- **Start the product** → `reckoning`
+- **Install or repair an installation** → `reckoning setup`
+- **Check whether the installation is healthy** → `reckoning doctor`
+- **Check a provider key live, right now** → `reckoning doctor --ping`
+- **Talk over Telegram** → `reckoning gateway`
+- **Protect the instance before maintenance** → `reckoning backup`
+- **Recover onto a clean machine** → `reckoning restore`
+- **Move state to another Reckoning instance** → `reckoning export`
+- **Upgrade an old transfer archive** → `reckoning migrate`
+
+## Setup
+
+`reckoning setup` runs a five-step wizard: instance (data directory and
+placement policy), desired-self persona preset (Simon, Steady, or an original
+you author), model provider, channels (Telegram, skippable), and an automatic
+proof step. The proof step sends one round-trip through the chosen provider,
+creates and confirms a continuity record, and re-opens the store to prove the
+record survives a restart. Setup only reports success when the proof passes;
+otherwise it reports the setup as incomplete and points at `reckoning doctor`.
+
+Re-running `reckoning setup` on a configured installation opens a management
+menu instead: add a provider, replace a key, remove a provider, or change the
+default. Pressing Enter at the key prompt keeps the current key.
+
+For scripts and CI, every wizard answer has a flag or environment variable:
 
 ```bash
-reckoning-telegram
+DEEPSEEK_API_KEY=replace-with-your-key reckoning setup \
+  --non-interactive \
+  --placement local \
+  --persona simon \
+  --provider deepseek
 ```
 
-Keep the command running while you use the bot. See
-[operations](docs/operations.md) for webhook and personal-server setup.
+Secrets are read from environment variables only — never from command-line
+flags. Non-interactive setup skips channel pairing, and any missing value
+fails with a clear message instead of prompting.
 
 ## Choose a model provider
 
 You do not need this section for the default fake provider.
 
-### Enter API keys during setup
-
-Run the setup command:
-
-```bash
-reckoning setup
-```
-
-Choose **Telegram**, then choose **DeepSeek** or **OrcaRouter** in the provider
-menu. Setup asks for the provider's API key with hidden input and verifies the
+Run `reckoning setup` and choose **DeepSeek** or **OrcaRouter** in the provider
+step. Setup asks for the provider's API key with hidden input and verifies the
 key against the provider. The key never echoes to the terminal. If verification
 fails, setup offers to re-enter the key, save it unverified, or abort without
 saving anything. After each provider, setup asks whether to add another one,
@@ -98,107 +110,40 @@ then asks which configured provider is the default.
 
 Keys are saved in `~/.config/reckoning/provider.json` with owner-only
 permissions. The file can hold one key per provider plus the default-provider
-marker. Keys are never written to the instance data.
+marker. Keys are never written to the instance data. Credential files saved by
+older versions migrate to the multi-provider format automatically.
 
-Then start the interface you use:
-
-```bash
-reckoning
-```
-
-or:
-
-```bash
-reckoning-telegram
-```
-
-Both commands use the saved default provider automatically; no `.env` file or
-`--provider` flag is needed.
-
-To manage providers later, re-run:
-
-```bash
-reckoning setup
-```
-
-When credentials already exist, setup opens a management menu instead of the
-first-run wizard. From there you can add a provider, replace a key, remove a
-provider, or change the default. Pressing Enter at the key prompt keeps the
-current key. Credential files saved by older versions migrate to the
-multi-provider format automatically.
-
-### Use environment variables instead
-
-You can still configure a provider with environment variables or an ignored
-`.env` file in the repository root. Those values take precedence over the
-saved credential. To use OrcaRouter:
-
-```dotenv
-ORCAROUTER_API_KEY=replace-with-your-key
-MODEL=orcarouter/auto
-```
-
-Start the server with an explicit provider:
-
-```bash
-reckoning --provider orcarouter
-```
-
-If OrcaRouter returns `model_access_denied`, allow the value of `MODEL` for that
-API key in the OrcaRouter console. This also applies to router aliases such as
-`orcarouter/auto`.
-
-To use DeepSeek, put these values in `.env`:
-
-```dotenv
-DEEPSEEK_API_KEY=replace-with-your-key
-DEEPSEEK_MODEL=deepseek-v4-flash
-```
-
-Then start the server:
-
-```bash
-reckoning --provider deepseek
-```
-
-The same flags work for the Telegram runtime:
-
-```bash
-reckoning-telegram --provider deepseek
-```
-
-Both providers use their official API URL by default. Use `BASE_URL` for
-OrcaRouter or `BASE_DEEPSEEK_URL` for DeepSeek only when you need to override
-that default.
-
-Reckoning reads only its documented provider variables from `.env`. It does not
-write API keys to the instance data. Each provider attempt records the provider,
-model calls, latency, retries, token usage, and failure status.
+`reckoning` and `reckoning gateway` use the saved default provider
+automatically; no `.env` file or `--provider` flag is needed. You can still
+override with environment variables or an ignored `.env` file in the
+repository root; those values take precedence over the saved credential. See
+[operations](docs/operations.md) for the variable names.
 
 ## Storage and access limits
 
 The default instance stores live state as plain JSON under
-`~/.local/state/reckoning`. Use `reckoning-ops backup` to create an encrypted
+`~/.local/state/reckoning`. Use `reckoning backup` to create an encrypted
 archive.
 
-The built-in web server accepts loopback addresses only and has no public login.
-Do not expose it directly to the internet. For remote access to a personal
-server, use an SSH tunnel.
+The built-in web server accepts loopback addresses only and has no public
+login. Do not expose it directly to the internet. For remote access to a
+personal server, use an SSH tunnel.
 
 Reckoning supports `local`, `personal-server`, and `hybrid` placement profiles.
 The local profile is the default. See [operations](docs/operations.md) for
-placement, diagnosis, encrypted backup, restore, and migration commands.
+placement, health checks, encrypted backup, restore, and migration details.
 
-## Diagnose a local instance
+## Check an installation
 
 Run:
 
 ```bash
-reckoning-ops diagnose
+reckoning doctor
 ```
 
-The command checks the instance configuration and JSON state files. It reports
-`healthy` when every required file is valid.
+The report covers the instance configuration and JSON state files, rendered as
+a table with a fix pointer for each problem. The default report makes no
+network calls; add `--ping` to verify the saved provider key live.
 
 ## Develop and test
 

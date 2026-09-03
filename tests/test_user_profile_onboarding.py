@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from collections.abc import Callable
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-import json
-from typing import Callable, cast
+from typing import cast
 from urllib.parse import urlencode
 
 import pytest
@@ -16,7 +17,7 @@ from reckoning.application import (
     PlacementState,
     ReckoningApplication,
 )
-from reckoning.cli import main as cli_main
+from reckoning.interfaces import create_local_interface_application
 from reckoning.operations import (
     OperationError,
     PlacementProfile,
@@ -26,15 +27,13 @@ from reckoning.operations import (
     restore_transfer,
     setup_instance,
 )
-from reckoning.interfaces import create_local_interface_application
 from reckoning.personal_context import (
     JsonFilePersonalContextRepository,
     PersonalContextService,
 )
 from reckoning.web import ReckoningWebApplication
 
-
-NOW = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 
 
 class FixedClock:
@@ -422,8 +421,8 @@ def test_invalid_profile_is_rejected_before_installation_is_created(
     assert not data_dir.exists()
 
 
-def test_setup_cli_accepts_profile_and_explains_the_review_step(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_setup_instance_imports_profile_proposals_without_keeping_the_raw_file(
+    tmp_path: Path,
 ) -> None:
     profile = tmp_path / "profile.md"
     profile.write_text(
@@ -431,20 +430,11 @@ def test_setup_cli_accepts_profile_and_explains_the_review_step(
     )
     data_dir = tmp_path / "instance"
 
-    result = cli_main(
-        [
-            "setup",
-            "--data-dir",
-            str(data_dir),
-            "--placement",
-            "local",
-            "--user-profile",
-            str(profile),
-        ]
-    )
+    configuration = setup_instance(data_dir, "local", user_profile=profile)
 
-    assert result == 0
-    output = capsys.readouterr().out
-    assert "Imported 1 private profile proposal" in output
-    assert "confirm, correct, or reject" in output
+    assert configuration["profile_bootstrap"] == {
+        "provided": True,
+        "proposal_count": 1,
+        "raw_profile_retained": False,
+    }
     assert not (data_dir / profile.name).exists()
