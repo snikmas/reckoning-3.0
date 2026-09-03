@@ -117,8 +117,8 @@ def test_setup_verifies_and_saves_a_deepseek_key_with_owner_only_permissions(
     credentials_path = tmp_path / "provider.json"
     assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
     assert json.loads(credentials_path.read_text(encoding="utf-8")) == {
-        "provider_name": "deepseek",
-        "api_key": "sk-deepseek-test",
+        "default_provider": "deepseek",
+        "providers": {"deepseek": "sk-deepseek-test"},
     }
     displayed = "\n".join(messages)
     assert "DeepSeek verified the API key." in displayed

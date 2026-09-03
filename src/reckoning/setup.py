@@ -7,7 +7,7 @@ from pathlib import Path
 
 from reckoning.config import (
     DEFAULT_PROVIDER_CREDENTIALS,
-    ProviderCredentials,
+    ProviderCredentialStore,
 )
 from reckoning.providers import verify_provider_api_key
 from reckoning.telegram import (
@@ -117,13 +117,13 @@ def setup_reckoning(
         line_reader=line_reader,
         output=output,
     )
-    credentials: ProviderCredentials | None = None
+    store: ProviderCredentialStore | None = None
     if provider_name == "fake":
         output(
             "Fake uses deterministic local replies, so it does not need an API key."
         )
     else:
-        credentials = _enter_provider_credentials(
+        store = _enter_provider_credentials(
             provider_name,
             secret_reader=secret_reader,
             key_verifier=key_verifier,
@@ -140,8 +140,8 @@ def setup_reckoning(
         gateway_name=gateway_name,
         provider_name=provider_name,
     )
-    if credentials is not None:
-        credentials.save(credentials_path)
+    if store is not None:
+        store.save(credentials_path)
         output(
             f"Provider credentials saved to {credentials_path} "
             "with owner-only permissions."
@@ -154,7 +154,7 @@ def _enter_provider_credentials(
     *,
     secret_reader: Callable[[str], str],
     key_verifier: Callable[[str, str], None],
-) -> ProviderCredentials:
+) -> ProviderCredentialStore:
     display_name = _PROVIDER_DISPLAY_NAMES[provider_name]
     api_key = secret_reader(
         f"Paste the {display_name} API key (input is hidden): "
@@ -162,4 +162,6 @@ def _enter_provider_credentials(
     if not api_key:
         raise ValueError(f"A {display_name} API key is required.")
     key_verifier(provider_name, api_key)
-    return ProviderCredentials(provider_name, api_key)
+    store = ProviderCredentialStore()
+    store.set_key(provider_name, api_key, make_default=True)
+    return store
