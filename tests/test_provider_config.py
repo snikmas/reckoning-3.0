@@ -84,9 +84,7 @@ def test_deepseek_settings_remain_available_for_existing_evidence_gate(
     assert settings.base_url == "https://api.deepseek.com"
 
 
-def write_legacy_credentials(
-    path: Path, provider_name: str, api_key: str
-) -> None:
+def write_legacy_credentials(path: Path, provider_name: str, api_key: str) -> None:
     path.write_text(
         json.dumps({"provider_name": provider_name, "api_key": api_key}),
         encoding="utf-8",
