@@ -9,13 +9,36 @@ from urllib.request import Request
 
 import pytest
 
-from reckoning.config import DeepSeekSettings, OrcaRouterSettings
+from reckoning.config import (
+    DeepSeekSettings,
+    OrcaRouterSettings,
+    ProviderCredentialStore,
+)
 from reckoning.operations import OperationError
 from reckoning.providers import (
     ProviderKeyVerificationError,
     verify_provider_api_key,
 )
 from reckoning.setup import setup_reckoning
+from reckoning.telegram import TelegramPollingSettings
+
+
+def seed_management_install(
+    tmp_path: Path,
+    providers: dict[str, str],
+    default: str,
+) -> None:
+    store = ProviderCredentialStore()
+    for name, key in providers.items():
+        store.set_key(name, key)
+    store.default_provider = default
+    store.save(tmp_path / "provider.json")
+    TelegramPollingSettings(
+        "bot-token",
+        ("42",),
+        "reckoning_test_bot",
+        provider_name=default,
+    ).save(tmp_path / "telegram.json")
 
 
 class PairingTelegramClient:
@@ -421,3 +444,159 @@ def test_verify_provider_api_key_explains_other_failures() -> None:
 def test_verify_provider_api_key_rejects_an_unknown_provider() -> None:
     with pytest.raises(ValueError, match="Unsupported model provider: fake"):
         verify_provider_api_key("fake", "key", transport=lambda r, t: b"")
+
+
+def test_management_menu_adds_a_provider_and_keeps_the_default_on_enter(
+    tmp_path: Path,
+) -> None:
+    seed_management_install(tmp_path, {"deepseek": "old-key"}, "deepseek")
+    verifier = RecordingKeyVerifier()
+
+    settings, _, messages = run_setup(
+        tmp_path,
+        ("1", "3", "n", "", "5"),
+        ("orca-key",),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == [("orcarouter", "orca-key")]
+    displayed = "\n".join(messages)
+    assert "What do you want to change?" in displayed
+    assert "DeepSeek (configured)" in displayed
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "deepseek",
+        "providers": {"deepseek": "old-key", "orcarouter": "orca-key"},
+    }
+    assert settings.provider_name == "deepseek"
+
+
+def test_management_menu_replaces_a_key_with_live_verification(
+    tmp_path: Path,
+) -> None:
+    seed_management_install(tmp_path, {"deepseek": "old-key"}, "deepseek")
+    verifier = RecordingKeyVerifier()
+
+    run_setup(
+        tmp_path,
+        ("2", "1", "5"),
+        ("new-key",),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == [("deepseek", "new-key")]
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "deepseek",
+        "providers": {"deepseek": "new-key"},
+    }
+
+
+def test_management_menu_replace_keeps_the_current_key_on_enter(
+    tmp_path: Path,
+) -> None:
+    seed_management_install(tmp_path, {"deepseek": "old-key"}, "deepseek")
+    verifier = RecordingKeyVerifier()
+
+    run_setup(
+        tmp_path,
+        ("2", "1", "5"),
+        ("",),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == []
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "deepseek",
+        "providers": {"deepseek": "old-key"},
+    }
+
+
+def test_management_menu_removing_the_default_reassigns_the_default(
+    tmp_path: Path,
+) -> None:
+    seed_management_install(
+        tmp_path,
+        {"deepseek": "sk-deepseek", "orcarouter": "sk-orca"},
+        "deepseek",
+    )
+    verifier = RecordingKeyVerifier()
+
+    settings, _, _ = run_setup(
+        tmp_path,
+        ("3", "1", "5"),
+        (),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == []
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "orcarouter",
+        "providers": {"orcarouter": "sk-orca"},
+    }
+    assert settings.provider_name == "orcarouter"
+    assert (
+        TelegramPollingSettings.load(tmp_path / "telegram.json").provider_name
+        == "orcarouter"
+    )
+
+
+def test_management_menu_changes_the_default_provider(tmp_path: Path) -> None:
+    seed_management_install(
+        tmp_path,
+        {"deepseek": "sk-deepseek", "orcarouter": "sk-orca"},
+        "deepseek",
+    )
+    verifier = RecordingKeyVerifier()
+
+    settings, _, _ = run_setup(
+        tmp_path,
+        ("4", "2", "5"),
+        (),
+        verifier=verifier,
+    )
+
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "orcarouter",
+        "providers": {"deepseek": "sk-deepseek", "orcarouter": "sk-orca"},
+    }
+    assert settings.provider_name == "orcarouter"
+
+
+def test_management_menu_done_keeps_everything_on_enter(tmp_path: Path) -> None:
+    seed_management_install(
+        tmp_path,
+        {"deepseek": "sk-deepseek", "orcarouter": "sk-orca"},
+        "orcarouter",
+    )
+    verifier = RecordingKeyVerifier()
+
+    settings, _, _ = run_setup(
+        tmp_path,
+        ("",),
+        (),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == []
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "orcarouter",
+        "providers": {"deepseek": "sk-deepseek", "orcarouter": "sk-orca"},
+    }
+    assert settings.provider_name == "orcarouter"
+
+
+def test_management_mode_without_telegram_config_runs_pairing(
+    tmp_path: Path,
+) -> None:
+    seed_management_install(tmp_path, {"deepseek": "sk-deepseek"}, "deepseek")
+    (tmp_path / "telegram.json").unlink()
+    verifier = RecordingKeyVerifier()
+
+    settings, _, _ = run_setup(
+        tmp_path,
+        ("5",),
+        ("bot-token",),
+        verifier=verifier,
+    )
+
+    assert settings.provider_name == "deepseek"
+    assert TelegramPollingSettings.load(tmp_path / "telegram.json") == settings
