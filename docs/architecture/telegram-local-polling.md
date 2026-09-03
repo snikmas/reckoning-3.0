@@ -12,7 +12,7 @@ reckoning setup
   -> ask the user to send a one-time /connect code
   -> record that private chat as the only allowed chat
 
-reckoning-telegram
+reckoning gateway
   -> load the local Telegram credential file
   -> long-poll Telegram for text messages
   -> pass each allowed message through TelegramGateway
@@ -85,5 +85,5 @@ Use polling as the default local runtime and keep `webhook` as an explicit
 deployment command. Store the bot token outside the repository in a mode-0600
 configuration file. Pair one private Telegram chat with a random one-time code
 instead of trusting the first pending update. Use the saved Fake provider when
-the user starts `reckoning-telegram` without `--provider`. Keep data placement
+the user starts `reckoning gateway` without `--provider`. Keep data placement
 unchanged.

@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import io
 import json
 import os
-from pathlib import Path
 import stat
-import subprocess
-import sys
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Self
+from unittest import mock
+from urllib.error import HTTPError
 
 import pytest
 
-import reckoning.operations as operations
+from reckoning import operations
+from reckoning.command import main as command_main
+from reckoning.config import ProviderCredentialStore
 from reckoning.operations import (
     NODE_MARKER,
+    PASSPHRASE_ENV,
     OperationError,
     PlacementProfile,
     load_installation_runtime,
@@ -20,26 +27,30 @@ from reckoning.operations import (
 from reckoning.personas import PersonaDefinition
 from reckoning.web import validate_bind_host
 
-
 PASSPHRASE = "correct-horse-battery-staple"
 
 
-def run_cli(
-    *arguments: str, passphrase: str | None = None
-) -> subprocess.CompletedProcess[str]:
-    environment = {
-        **os.environ,
-        "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
-    }
-    if passphrase is not None:
-        environment["RECKONING_TRANSFER_PASSPHRASE"] = passphrase
-    return subprocess.run(
-        [sys.executable, "-m", "reckoning.cli", *arguments],
-        capture_output=True,
-        check=False,
-        env=environment,
-        text=True,
-    )
+@dataclass(frozen=True)
+class CliResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def run_cli(*arguments: str, passphrase: str | None = None) -> CliResult:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    environment = {PASSPHRASE_ENV: passphrase} if passphrase is not None else {}
+    with (
+        mock.patch.dict(os.environ, environment),
+        redirect_stdout(stdout),
+        redirect_stderr(stderr),
+    ):
+        try:
+            returncode = command_main(list(arguments))
+        except SystemExit as error:
+            returncode = int(error.code or 0)
+    return CliResult(returncode, stdout.getvalue(), stderr.getvalue())
 
 
 def write_json(path: Path, payload: object) -> None:
@@ -222,7 +233,7 @@ def test_restore_reports_an_operating_system_failure_without_a_traceback(
     assert blocked_parent.read_text(encoding="utf-8") == "occupied"
 
 
-def test_setup_explains_single_user_operation_and_checks_the_continuity_loop(
+def test_setup_creates_a_single_user_instance_and_proves_the_continuity_loop(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "new-instance"
@@ -230,6 +241,7 @@ def test_setup_explains_single_user_operation_and_checks_the_continuity_loop(
 
     result = run_cli(
         "setup",
+        "--non-interactive",
         "--data-dir",
         str(data_dir),
         "--placement",
@@ -239,13 +251,17 @@ def test_setup_explains_single_user_operation_and_checks_the_continuity_loop(
     )
 
     assert result.returncode == 0, result.stderr
-    assert "single-user" in result.stdout.lower()
-    assert "Private data stays local" in result.stdout
-    assert "exact or standing permission" in result.stdout
-    assert "limited mode" in result.stdout
-    assert "built-in server listens only on loopback" in result.stdout
-    assert "backup" in result.stdout
-    assert "restore" in result.stdout
+    assert "Step 1 — instance:" in result.stdout
+    assert "hybrid placement" in result.stdout
+    assert "private data stays local" in result.stdout
+    assert "Step 2 — persona: Simon" in result.stdout
+    assert "Step 3 — provider: Fake (no API key)" in result.stdout
+    assert "Step 4 — channels: skipped" in result.stdout
+    assert "Step 5 — proof 1/3" in result.stdout
+    assert "proof 2/3" in result.stdout
+    assert "proof 3/3" in result.stdout
+    assert "survives a restart" in result.stdout
+    assert "Setup complete" in result.stdout
     configuration = json.loads(
         (data_dir / "instance.json").read_text(encoding="utf-8")
     )
@@ -301,7 +317,7 @@ def test_setup_commit_failure_preserves_existing_empty_roots(
     assert not tuple(tmp_path.glob(".atomic-server.original-*"))
 
 
-def test_personal_server_setup_explains_its_real_placement_and_release_block(
+def test_personal_server_setup_records_its_real_placement_and_release_block(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "personal-server-instance"
@@ -309,6 +325,7 @@ def test_personal_server_setup_explains_its_real_placement_and_release_block(
 
     result = run_cli(
         "setup",
+        "--non-interactive",
         "--data-dir",
         str(data_dir),
         "--placement",
@@ -318,11 +335,8 @@ def test_personal_server_setup_explains_its_real_placement_and_release_block(
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Private and confirmed state is stored on your personal server" in result.stdout
-    assert "Private data stays local" not in result.stdout
-    assert "built-in server listens only on loopback" in result.stdout
-    assert "BLOCKED" in result.stdout
-    assert "repeated_value" in result.stdout
+    assert "personal-server placement" in result.stdout
+    assert "private and confirmed state lives on your personal server" in result.stdout
     evidence = json.loads(
         (data_dir / "release-evidence.json").read_text(encoding="utf-8")
     )
@@ -346,6 +360,7 @@ def test_cli_requires_a_separate_explicit_server_root_and_reports_probe_health(
 
     missing_root = run_cli(
         "setup",
+        "--non-interactive",
         "--data-dir",
         str(tmp_path / "missing-root"),
         "--placement",
@@ -353,6 +368,7 @@ def test_cli_requires_a_separate_explicit_server_root_and_reports_probe_health(
     )
     shared_root = run_cli(
         "setup",
+        "--non-interactive",
         "--data-dir",
         str(tmp_path / "shared-root"),
         "--placement",
@@ -362,6 +378,7 @@ def test_cli_requires_a_separate_explicit_server_root_and_reports_probe_health(
     )
     setup = run_cli(
         "setup",
+        "--non-interactive",
         "--data-dir",
         str(local_root),
         "--placement",
@@ -371,13 +388,13 @@ def test_cli_requires_a_separate_explicit_server_root_and_reports_probe_health(
     )
 
     assert missing_root.returncode == 2
-    assert "requires --server-data-dir" in missing_root.stderr
+    assert "--server-data-dir is required" in missing_root.stderr
     assert shared_root.returncode == 2
     assert "roots must be separate" in shared_root.stderr
     assert setup.returncode == 0, setup.stderr
 
     healthy = run_cli(
-        "diagnose",
+        "doctor",
         "--data-dir",
         str(local_root),
         "--server-data-dir",
@@ -388,7 +405,7 @@ def test_cli_requires_a_separate_explicit_server_root_and_reports_probe_health(
     marker.replace(offline_marker)
     try:
         degraded = run_cli(
-            "diagnose",
+            "doctor",
             "--data-dir",
             str(local_root),
             "--server-data-dir",
@@ -398,11 +415,12 @@ def test_cli_requires_a_separate_explicit_server_root_and_reports_probe_health(
         offline_marker.replace(marker)
 
     assert healthy.returncode == 0, healthy.stderr
-    assert "status: healthy" in healthy.stdout
-    assert "server node: available" in healthy.stdout
+    assert "healthy" in healthy.stdout
+    assert "server node" in healthy.stdout
+    assert "available" in healthy.stdout
     assert degraded.returncode == 0, degraded.stderr
-    assert "status: degraded" in degraded.stdout
-    assert "server node: offline" in degraded.stdout
+    assert "degraded" in degraded.stdout
+    assert "offline" in degraded.stdout
     assert "approved-remote-sources" in degraded.stdout
 
 
@@ -419,50 +437,21 @@ def test_builtin_web_server_rejects_non_loopback_bind_addresses() -> None:
             raise AssertionError(f"non-loopback host was accepted: {exposed}")
 
 
-def test_setup_can_author_and_select_an_original_persona(tmp_path: Path) -> None:
-    data_dir = tmp_path / "original-persona-instance"
-
+def test_non_interactive_setup_rejects_an_original_persona_without_a_prompt(
+    tmp_path: Path,
+) -> None:
     result = run_cli(
         "setup",
+        "--non-interactive",
         "--data-dir",
-        str(data_dir),
+        str(tmp_path / "original-persona-instance"),
         "--persona",
         "original",
-        "--persona-id",
-        "clear-eyed",
-        "--persona-name",
-        "Clear Eyed",
-        "--voice",
-        "candid",
-        "--directness",
-        "direct",
-        "--warmth",
-        "balanced",
-        "--humor",
-        "dry",
-        "--challenge",
-        "uncomfortable",
-        "--sensitive-topic-handling",
-        "practical",
     )
 
-    assert result.returncode == 0, result.stderr
-    persona_state = json.loads(
-        (data_dir / "personas.json").read_text(encoding="utf-8")
-    )
-    assert persona_state["active_persona_id"] == "clear-eyed"
-    assert persona_state["authored"] == [
-        {
-            "id": "clear-eyed",
-            "name": "Clear Eyed",
-            "voice": "candid",
-            "directness": "direct",
-            "warmth": "balanced",
-            "humor": "dry",
-            "challenge": "uncomfortable",
-            "sensitive_topic_handling": "practical",
-        }
-    ]
+    assert result.returncode == 2
+    assert "--persona original is authored in the interactive wizard" in result.stderr
+    assert not (tmp_path / "original-persona-instance").exists()
 
 
 def test_runtime_uses_installed_persona_and_hybrid_placement(tmp_path: Path) -> None:
@@ -579,7 +568,7 @@ def test_release_readiness_remains_blocked_until_every_required_gate_exists(
         },
     )
 
-    blocked = run_cli("diagnose", "--release-evidence", str(evidence))
+    blocked = run_cli("doctor", "--release-evidence", str(evidence))
 
     assert blocked.returncode == 2
     assert "BLOCKED" in blocked.stdout
@@ -588,7 +577,7 @@ def test_release_readiness_remains_blocked_until_every_required_gate_exists(
     payload = json.loads(evidence.read_text(encoding="utf-8"))
     payload["recovery"] = True
     write_json(evidence, payload)
-    ready = run_cli("diagnose", "--release-evidence", str(evidence))
+    ready = run_cli("doctor", "--release-evidence", str(evidence))
 
     assert ready.returncode == 0
     assert "READY" in ready.stdout
@@ -603,6 +592,7 @@ def test_export_can_be_migrated_and_diagnosed_after_restore(tmp_path: Path) -> N
     migrated = tmp_path / "state-migrated.reckoning"
     setup = run_cli(
         "setup",
+        "--non-interactive",
         "--data-dir",
         str(source),
         "--placement",
@@ -663,7 +653,7 @@ def test_export_can_be_migrated_and_diagnosed_after_restore(tmp_path: Path) -> N
     )
     assert restore.returncode == 0, restore.stderr
     diagnosis = run_cli(
-        "diagnose",
+        "doctor",
         "--data-dir",
         str(restored),
         "--server-data-dir",
@@ -671,9 +661,9 @@ def test_export_can_be_migrated_and_diagnosed_after_restore(tmp_path: Path) -> N
     )
 
     assert diagnosis.returncode == 0, diagnosis.stderr
-    assert "status: healthy" in diagnosis.stdout
-    assert "instance: single-user" in diagnosis.stdout
-    assert "placement: personal-server" in diagnosis.stdout
+    assert "healthy" in diagnosis.stdout
+    assert "single-user" in diagnosis.stdout
+    assert "personal-server" in diagnosis.stdout
     assert json.loads(
         (restored / "local-state.json").read_text(encoding="utf-8")
     ) == {"location": "local"}
@@ -718,12 +708,163 @@ def test_export_can_be_migrated_and_diagnosed_after_restore(tmp_path: Path) -> N
     )
 
 
-def test_cli_contains_only_operational_commands() -> None:
+def test_top_level_help_groups_every_command_and_drops_the_old_binaries() -> None:
     result = run_cli("--help")
 
     assert result.returncode == 0
-    assert (
-        "{backup,diagnose,export,migrate,restore,setup}"
-        in result.stdout
+    for group in ("Run", "Setup", "Data"):
+        assert group in result.stdout
+    for command in (
+        "reckoning gateway",
+        "reckoning setup",
+        "reckoning doctor",
+        "reckoning backup",
+        "reckoning restore",
+        "reckoning export",
+        "reckoning migrate",
+    ):
+        assert command in result.stdout
+    assert "reckoning-ops" not in result.stdout
+    assert "reckoning-telegram" not in result.stdout
+
+
+def test_unknown_commands_fail_with_a_pointer_to_help() -> None:
+    result = run_cli("diagnose")
+
+    assert result.returncode == 2
+    assert "unknown command 'diagnose'" in result.stderr
+    assert "reckoning --help" in result.stderr
+
+
+def _seed_pingable_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    data_dir = tmp_path / "ping-instance"
+    setup = run_cli("setup", "--non-interactive", "--data-dir", str(data_dir))
+    assert setup.returncode == 0, setup.stderr
+    store = ProviderCredentialStore()
+    store.set_key("deepseek", "sk-live", make_default=True)
+    credentials_path = tmp_path / "provider.json"
+    store.save(credentials_path)
+    monkeypatch.setattr(
+        "reckoning.command.DEFAULT_PROVIDER_CREDENTIALS", credentials_path
     )
-    assert "release-readiness" not in result.stdout
+    return data_dir
+
+
+def test_doctor_makes_no_network_calls_without_ping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = _seed_pingable_install(tmp_path, monkeypatch)
+
+    def forbidden_network(request: object, timeout: float) -> bytes:
+        raise AssertionError("doctor contacted the network without --ping")
+
+    monkeypatch.setattr("reckoning.providers.urlopen", forbidden_network)
+
+    result = run_cli("doctor", "--data-dir", str(data_dir))
+
+    assert result.returncode == 0, result.stderr
+    assert "healthy" in result.stdout
+    assert "provider ping" not in result.stdout
+
+
+def test_doctor_ping_verifies_the_saved_key_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = _seed_pingable_install(tmp_path, monkeypatch)
+    requests: list[object] = []
+
+    class FakeResponse:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"data": []}'
+
+    def fake_network(request: object, timeout: float) -> FakeResponse:
+        requests.append(request)
+        return FakeResponse()
+
+    monkeypatch.setattr("reckoning.providers.urlopen", fake_network)
+
+    result = run_cli("doctor", "--data-dir", str(data_dir), "--ping")
+
+    assert result.returncode == 0, result.stderr
+    assert len(requests) == 1
+    assert "provider ping: deepseek verified the saved API key" in result.stdout
+
+
+def test_doctor_ping_reports_a_rejected_key_with_a_fix_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = _seed_pingable_install(tmp_path, monkeypatch)
+
+    def rejecting_network(request: object, timeout: float) -> bytes:
+        raise HTTPError("https://api.deepseek.com/models", 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr("reckoning.providers.urlopen", rejecting_network)
+
+    result = run_cli("doctor", "--data-dir", str(data_dir), "--ping")
+
+    assert result.returncode == 2
+    assert "rejected the API key" in result.stdout
+    assert "fix: run reckoning setup" in result.stdout
+
+
+def test_doctor_ping_skips_the_fake_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "fake-instance"
+    setup = run_cli("setup", "--non-interactive", "--data-dir", str(data_dir))
+    assert setup.returncode == 0, setup.stderr
+    monkeypatch.setattr(
+        "reckoning.command.DEFAULT_PROVIDER_CREDENTIALS",
+        tmp_path / "missing-provider.json",
+    )
+
+    def forbidden_network(request: object, timeout: float) -> bytes:
+        raise AssertionError("pinging the fake provider must not use the network")
+
+    monkeypatch.setattr("reckoning.providers.urlopen", forbidden_network)
+
+    result = run_cli("doctor", "--data-dir", str(data_dir), "--ping")
+
+    assert result.returncode == 0, result.stderr
+    assert "provider ping: skipped" in result.stdout
+
+
+def test_doctor_renders_a_structured_table_with_fix_pointers(
+    tmp_path: Path,
+) -> None:
+    empty = tmp_path / "empty-instance"
+    empty.mkdir()
+
+    result = run_cli("doctor", "--data-dir", str(empty))
+
+    assert result.returncode == 0, result.stderr
+    assert "╭" in result.stdout
+    assert "Check" in result.stdout
+    assert "Result" in result.stdout
+    assert "degraded" in result.stdout
+    assert (
+        "instance.json is missing; run setup or restore a backup" in result.stdout
+    )
+
+
+def test_setup_never_accepts_secrets_as_command_line_flags(tmp_path: Path) -> None:
+    result = run_cli(
+        "setup",
+        "--non-interactive",
+        "--data-dir",
+        str(tmp_path / "flag-secret-instance"),
+        "--provider",
+        "deepseek",
+        "--api-key",
+        "sk-flag-secret",
+    )
+
+    assert result.returncode == 2
+    assert "unrecognized arguments: --api-key" in result.stderr
+    assert not (tmp_path / "flag-secret-instance").exists()

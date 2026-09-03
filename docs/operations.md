@@ -1,65 +1,62 @@
 # Install and recover a single-user Reckoning instance
 
-Use `reckoning-ops` for setup, diagnosis, encrypted transfer, recovery, and
-release checks. The command does not provide conversation, planning, or other
-daily product work.
+The single `reckoning` binary owns setup, health checks, encrypted transfer,
+recovery, and release checks through its subcommands. This document covers
+those operational flows, not conversation, planning, or other daily product
+work.
 
-## Install the commands
+## Install the command
 
 Use Python 3.13 or later.
 
 ```bash
-python3 -m pip install .
+pipx install .
 ```
 
-The package installs `reckoning` for product setup and the local web interface,
-`reckoning-telegram` for the Telegram channel, and `reckoning-ops` for
-operations.
+`uv tool install .` and `python3 -m pip install .` work as well. The package
+installs exactly one command, `reckoning`.
 
 ## Use Reckoning through Telegram on this computer
 
 Create a bot with [BotFather](https://t.me/BotFather). Keep the token private.
 Anyone who has the token can control the bot.
 
-Run the setup command:
+Run the setup wizard:
 
 ```bash
 reckoning setup
 ```
 
-Choose **Telegram**, then choose a provider. The menu also shows Discord,
-WhatsApp, and Slack as future gateway choices. Only Telegram is available in
-this setup flow.
-
-Fake uses deterministic local replies and does not need a provider API key.
+The channels step is the last interactive step and is skippable. Fake uses
+deterministic local replies and does not need a provider API key.
 DeepSeek and OrcaRouter ask for the provider API key with hidden input and
 verify the key against the provider. If verification fails, the command offers
 to re-enter the key, save it unverified, or abort without saving. After each
 provider, the command asks whether to add another one, then asks which
 configured provider is the default. Keys are saved in
-`~/.config/reckoning/provider.json` with owner-only permissions. The command
-then asks for the BotFather token and hides it while you type. It verifies
+`~/.config/reckoning/provider.json` with owner-only permissions. The channels
+step then asks for the BotFather token and hides it while you type. It verifies
 the bot and asks you to send a one-time `/connect` code in a private chat.
-Reckoning saves the selected gateway, the selected provider, and the Telegram
+Reckoning saves the selected provider and the Telegram
 configuration in `~/.config/reckoning/telegram.json`. The file has owner-only
 permissions.
 
-Start the bot:
+Start the channel runner:
 
 ```bash
-reckoning-telegram
+reckoning gateway
 ```
 
-The bot reads the saved provider credential automatically. To run it with a
+The runner reads the saved provider credential automatically. To run it with a
 different provider than the configured one, pass explicit flags:
 
 ```bash
-reckoning-telegram --provider deepseek
+reckoning gateway --provider deepseek
 ```
 
 To add, replace, or remove a provider, or to change the default provider,
-re-run setup. When credentials already exist, setup opens a management menu
-instead of the first-run wizard:
+re-run setup. When the installation is already configured, setup opens a
+management menu instead of the first-run wizard:
 
 ```bash
 reckoning setup
@@ -80,7 +77,7 @@ chat IDs in the process environment. Do not put these values in the repository.
 export RECKONING_TELEGRAM_WEBHOOK_SECRET="replace-with-webhook-secret"
 export RECKONING_TELEGRAM_GATEWAY_TOKEN="replace-with-gateway-token"
 export RECKONING_TELEGRAM_ALLOWED_CHAT_IDS="123456789"
-reckoning-telegram webhook --port 8081
+reckoning gateway webhook --port 8081
 ```
 
 Configure Telegram to send updates to `/telegram/webhook` and to include
@@ -93,17 +90,20 @@ IDs even when Telegram supplies the correct webhook secret.
 
 ## Create an instance
 
-Choose one placement profile.
+Choose one placement profile. Unattended instance creation uses the
+non-interactive flag surface:
 
 ```bash
-reckoning-ops setup --placement local
+reckoning setup --non-interactive --placement local
 ```
 
 Setup selects Simon by default. Select the other bundled persona with
-`--persona steady`. To author an original persona, use `--persona original`
-with `--persona-id`, `--persona-name`, and the six style options shown by
-`reckoning-ops setup --help`. Persona options change style only. They cannot
-change protected privacy, authority, deletion, or safety rules.
+`--persona steady`. To author an original persona, run the interactive wizard
+and choose **Original**; the wizard asks only for an id and a display name and
+starts from balanced style defaults. Fine-grained style tuning lives in the
+`personas.json` instance file, not in the wizard or the flag surface. Persona
+options change style only. They cannot change protected privacy, authority,
+deletion, or safety rules.
 
 The default data directory is `~/.local/state/reckoning`. Use `--data-dir` to
 select a different directory.
@@ -111,19 +111,22 @@ select a different directory.
 For `personal-server` or `hybrid`, set a separate server root:
 
 ```bash
-reckoning-ops setup \
+reckoning setup --non-interactive \
   --placement hybrid \
   --server-data-dir /mnt/reckoning-server
 ```
 
-Pass the same `--server-data-dir` to backup, export, diagnosis, web, and
-Telegram commands. The local and server roots must not contain one another.
+Pass the same `--server-data-dir` to backup, export, doctor, web, and
+gateway commands. The local and server roots must not contain one another.
 Each source category has its own subdirectory under the assigned node root.
 
 Setup writes `instance.json` and runs a disposable continuity check with the
 deterministic fake provider. The check proposes and confirms a decision,
 resumes the decision, records an outcome, and resumes it after a restart. The
-check does not add synthetic records to the new instance.
+check does not add synthetic records to the new instance. The wizard's final
+proof step then repeats the loop through the chosen provider — one round-trip,
+a confirmed record, and a re-opened store — and reports the setup as
+incomplete with a pointer to `reckoning doctor` if any check fails.
 
 Setup builds the local and optional server roots in sibling staging
 directories. It moves them into place only after every required file is ready.
@@ -150,13 +153,13 @@ Setup also creates `release-evidence.json` with every public-release gate set to
 recovery, privacy, deletion, external-action, repeated-value, and
 developer-independent continuity evidence has actually been recorded.
 
-## Diagnose an instance
+## Check an instance's health
 
 ```bash
-reckoning-ops diagnose
+reckoning doctor
 ```
 
-The command validates each JSON state file. It reports `healthy` only when the
+The command validates each JSON state file and renders the report as a table with a fix pointer per problem. The default report makes no network calls; `reckoning doctor --ping` adds a live check of the saved provider key. It reports `healthy` only when the
 instance configuration exists and every state file contains a JSON object.
 
 ## Create an encrypted backup
@@ -166,7 +169,7 @@ Set the passphrase without putting it in the command history.
 ```bash
 read -rsp "Transfer passphrase: " RECKONING_TRANSFER_PASSPHRASE
 export RECKONING_TRANSFER_PASSPHRASE
-reckoning-ops backup --output "$PWD/reckoning-backup.reckoning"
+reckoning backup --output "$PWD/reckoning-backup.reckoning"
 ```
 
 Store the passphrase separately from the archive. The command cannot recover a
@@ -175,7 +178,7 @@ lost passphrase.
 For a personal-server or hybrid instance, pass the configured server root:
 
 ```bash
-reckoning-ops backup \
+reckoning backup \
   --server-data-dir /mnt/reckoning-server \
   --output "$PWD/reckoning-backup.reckoning"
 ```
@@ -188,7 +191,7 @@ and server roots that overlap.
 Restore only into a missing or empty data directory.
 
 ```bash
-reckoning-ops restore \
+reckoning restore \
   --input "$PWD/reckoning-backup.reckoning" \
   --data-dir "$PWD/restored-instance"
 ```
@@ -196,7 +199,7 @@ reckoning-ops restore \
 If the archive contains server state, supply a new server root:
 
 ```bash
-reckoning-ops restore \
+reckoning restore \
   --input "$PWD/reckoning-backup.reckoning" \
   --data-dir "$PWD/restored-instance" \
   --server-data-dir /mnt/restored-reckoning-server
@@ -214,7 +217,7 @@ new absolute server path. The restored instance does not retain the old path.
 After restore, diagnose the new instance.
 
 ```bash
-reckoning-ops diagnose \
+reckoning doctor \
   --data-dir "$PWD/restored-instance" \
   --server-data-dir /mnt/restored-reckoning-server
 ```
@@ -226,7 +229,7 @@ Omit `--server-data-dir` when you restore a local-only archive.
 Create an encrypted export with the same preservation contract as a backup.
 
 ```bash
-reckoning-ops export --output "$PWD/reckoning-export.reckoning"
+reckoning export --output "$PWD/reckoning-export.reckoning"
 ```
 
 For a personal-server or hybrid instance, also pass the configured
@@ -235,7 +238,7 @@ For a personal-server or hybrid instance, also pass the configured
 Validate and rewrite an archive in the current transfer format.
 
 ```bash
-reckoning-ops migrate \
+reckoning migrate \
   --input "$PWD/reckoning-export.reckoning" \
   --output "$PWD/reckoning-migrated.reckoning"
 ```
@@ -264,7 +267,7 @@ for that gate. Do not set a value to `true` based only on the setup self-check.
 Run the report.
 
 ```bash
-reckoning-ops diagnose --release-evidence release-evidence.json
+reckoning doctor --release-evidence release-evidence.json
 ```
 
 The command prints `BLOCKED` and exits with status 2 while any gate lacks

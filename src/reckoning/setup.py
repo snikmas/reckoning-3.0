@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from getpass import getpass
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import cast
 
+from reckoning.application import ReckoningApplication, create_local_application
 from reckoning.config import (
     DEFAULT_PROVIDER_CREDENTIALS,
     ProviderCredentialStore,
 )
-from reckoning.operations import OperationError
+from reckoning.operations import OperationError, PlacementProfile, setup_instance
+from reckoning.personas import DEFAULT_PERSONAS, PersonaDefinition
 from reckoning.providers import (
     ProviderKeyVerificationError,
     verify_provider_api_key,
@@ -22,6 +27,23 @@ from reckoning.telegram import (
     setup_telegram_polling,
 )
 
+DEFAULT_DATA_DIR = Path.home() / ".local" / "state" / "reckoning"
+
+PROVIDER_KEY_ENV = {
+    "deepseek": "DEEPSEEK_API_KEY",
+    "orcarouter": "ORCAROUTER_API_KEY",
+}
+
+
+class SetupIncompleteError(RuntimeError):
+    """Setup finished without proving the core continuity loop."""
+
+
+@dataclass(frozen=True)
+class SetupResult:
+    provider_name: str
+    telegram: TelegramPollingSettings | None
+
 
 @dataclass(frozen=True)
 class SetupMenuOption:
@@ -31,25 +53,31 @@ class SetupMenuOption:
     unavailable_message: str = ""
 
 
-GATEWAY_SETUP_OPTIONS = (
-    SetupMenuOption("telegram", "Telegram", True),
+PLACEMENT_SETUP_OPTIONS = (
     SetupMenuOption(
-        "discord",
-        "Discord (coming later)",
-        False,
-        "Discord is not available yet.",
+        "local",
+        "Local — private data stays on this device",
+        True,
     ),
     SetupMenuOption(
-        "whatsapp",
-        "WhatsApp (coming later)",
-        False,
-        "WhatsApp is not available yet.",
+        "personal-server",
+        "Personal server — private and confirmed state lives on your server",
+        True,
     ),
     SetupMenuOption(
-        "slack",
-        "Slack (coming later)",
-        False,
-        "Slack is not available yet.",
+        "hybrid",
+        "Hybrid — private data local, approved remote sources on your server",
+        True,
+    ),
+)
+
+PERSONA_PRESET_OPTIONS = (
+    SetupMenuOption("simon", "Simon — composed, direct, and demanding", True),
+    SetupMenuOption("steady", "Steady — reflective, warm, and probing", True),
+    SetupMenuOption(
+        "original",
+        "Original — author your own persona",
+        True,
     ),
 )
 
@@ -81,6 +109,12 @@ VERIFICATION_RECOVERY_OPTIONS = (
     ),
     SetupMenuOption("abort", "Abort setup without saving anything", True),
 )
+
+_PLACEMENT_REASONS = {
+    "local": "private data stays on this device",
+    "personal-server": "private and confirmed state lives on your personal server",
+    "hybrid": "private data stays local; approved remote sources live on your server",
+}
 
 
 def _choose_setup_option(
@@ -118,13 +152,23 @@ def _confirm(
     *,
     line_reader: Callable[[str], str],
     output: Callable[[str], None],
+    default: bool = False,
 ) -> bool:
     output(question)
-    return line_reader("").strip().casefold() in ("y", "yes")
+    answer = line_reader("").strip().casefold()
+    if not answer:
+        return default
+    return answer in ("y", "yes")
 
 
 def setup_reckoning(
     *,
+    data_dir: Path = DEFAULT_DATA_DIR,
+    server_data_dir: Path | None = None,
+    placement: PlacementProfile | None = None,
+    persona: str | None = None,
+    provider: str | None = None,
+    non_interactive: bool = False,
     config_path: Path = DEFAULT_TELEGRAM_CONFIG,
     credentials_path: Path = DEFAULT_PROVIDER_CREDENTIALS,
     secret_reader: Callable[[str], str] = getpass,
@@ -134,50 +178,343 @@ def setup_reckoning(
     key_verifier: Callable[[str, str], None] = verify_provider_api_key,
     pairing_code: str | None = None,
     maximum_polls: int = 12,
-) -> TelegramPollingSettings:
+    environ: Mapping[str, str] | None = None,
+    application_factory: Callable[..., ReckoningApplication] = create_local_application,
+) -> SetupResult:
     output("Reckoning setup")
     store = ProviderCredentialStore.load(credentials_path)
-    if store.providers:
-        fake_default = _manage_providers(
+    if (data_dir / "instance.json").exists() or store.providers:
+        if non_interactive:
+            raise OperationError(
+                "this installation is already configured; run reckoning setup "
+                "interactively to manage providers and channels"
+            )
+        return _manage_installation(
             store,
-            secret_reader=secret_reader,
-            line_reader=line_reader,
-            output=output,
-            key_verifier=key_verifier,
-        )
-        provider_name = (
-            "fake" if fake_default else store.default_provider or "fake"
-        )
-        settings = _ensure_telegram_settings(
-            provider_name,
             config_path=config_path,
+            credentials_path=credentials_path,
             secret_reader=secret_reader,
             line_reader=line_reader,
             output=output,
             api_factory=api_factory,
+            key_verifier=key_verifier,
             pairing_code=pairing_code,
             maximum_polls=maximum_polls,
         )
+
+    if non_interactive:
+        _preflight_non_interactive(
+            placement,
+            server_data_dir,
+            persona,
+            provider,
+            environ,
+        )
+    chosen_placement, chosen_server_dir = _resolve_placement(
+        placement,
+        server_data_dir,
+        non_interactive=non_interactive,
+        line_reader=line_reader,
+        output=output,
+    )
+    persona_definition = _resolve_persona(
+        persona,
+        non_interactive=non_interactive,
+        line_reader=line_reader,
+        output=output,
+    )
+    setup_instance(
+        data_dir,
+        chosen_placement,
+        persona_definition,
+        server_data_dir=chosen_server_dir,
+    )
+    output(
+        f"Step 1 — instance: created at {data_dir} with {chosen_placement} "
+        f"placement; {_PLACEMENT_REASONS[chosen_placement]}."
+    )
+    output(
+        f"Step 2 — persona: {persona_definition.name} is the desired-self "
+        "preset; fine-tuning lives in personas.json, not in this wizard."
+    )
+
+    provider_name = _resolve_provider(
+        provider,
+        store,
+        non_interactive=non_interactive,
+        environ=environ,
+        secret_reader=secret_reader,
+        line_reader=line_reader,
+        output=output,
+        key_verifier=key_verifier,
+    )
+    output(
+        f"Step 3 — provider: {_provider_label(provider_name)} answers reckoning runs."
+    )
+
+    telegram = _run_channels_step(
+        provider_name,
+        non_interactive=non_interactive,
+        config_path=config_path,
+        secret_reader=secret_reader,
+        line_reader=line_reader,
+        output=output,
+        api_factory=api_factory,
+        pairing_code=pairing_code,
+        maximum_polls=maximum_polls,
+    )
+
+    _run_proof(
+        provider_name,
+        store,
+        output=output,
+        application_factory=application_factory,
+    )
+    if store.providers:
         store.save(credentials_path)
         output(
             f"Provider credentials saved to {credentials_path} "
             "with owner-only permissions."
         )
-        return settings
-    gateway_name = _choose_setup_option(
-        "Choose a gateway:",
-        "Gateway [1]: ",
-        GATEWAY_SETUP_OPTIONS,
+    output(
+        "Setup complete: the core continuity loop is proven. "
+        "Run reckoning to start, or reckoning gateway for channels."
+    )
+    return SetupResult(provider_name=provider_name, telegram=telegram)
+
+
+def _manage_installation(
+    store: ProviderCredentialStore,
+    *,
+    config_path: Path,
+    credentials_path: Path,
+    secret_reader: Callable[[str], str],
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+    api_factory: Callable[[str], TelegramBotClient],
+    key_verifier: Callable[[str, str], None],
+    pairing_code: str | None,
+    maximum_polls: int,
+) -> SetupResult:
+    fake_default = _manage_providers(
+        store,
+        secret_reader=secret_reader,
         line_reader=line_reader,
         output=output,
+        key_verifier=key_verifier,
     )
-    provider_name = _run_provider_loop(
+    provider_name = "fake" if fake_default else store.default_provider or "fake"
+    telegram = _ensure_telegram_settings(
+        provider_name,
+        config_path=config_path,
+        secret_reader=secret_reader,
+        line_reader=line_reader,
+        output=output,
+        api_factory=api_factory,
+        pairing_code=pairing_code,
+        maximum_polls=maximum_polls,
+    )
+    store.save(credentials_path)
+    output(
+        f"Provider credentials saved to {credentials_path} with owner-only permissions."
+    )
+    return SetupResult(provider_name=provider_name, telegram=telegram)
+
+
+def _resolve_placement(
+    placement: PlacementProfile | None,
+    server_data_dir: Path | None,
+    *,
+    non_interactive: bool,
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+) -> tuple[PlacementProfile, Path | None]:
+    chosen = placement
+    if chosen is None:
+        if non_interactive:
+            chosen = "local"
+        else:
+            chosen = cast(
+                PlacementProfile,
+                _choose_setup_option(
+                    "Choose a placement policy:",
+                    "Placement [1]: ",
+                    PLACEMENT_SETUP_OPTIONS,
+                    line_reader=line_reader,
+                    output=output,
+                ),
+            )
+    if chosen == "local":
+        return chosen, server_data_dir
+    if server_data_dir is not None:
+        return chosen, server_data_dir
+    if non_interactive:
+        raise OperationError(
+            f"--server-data-dir is required for {chosen} placement in "
+            "non-interactive mode"
+        )
+    raw = line_reader("Personal-server data directory: ").strip()
+    if not raw:
+        raise ValueError(
+            f"A personal-server data directory is required for {chosen} placement."
+        )
+    return chosen, Path(raw)
+
+
+def _resolve_persona(
+    persona: str | None,
+    *,
+    non_interactive: bool,
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+) -> PersonaDefinition:
+    chosen = persona
+    if chosen is None:
+        if non_interactive:
+            chosen = "simon"
+        else:
+            chosen = _choose_setup_option(
+                "Choose a desired-self persona preset:",
+                "Persona [1]: ",
+                PERSONA_PRESET_OPTIONS,
+                line_reader=line_reader,
+                output=output,
+            )
+    if chosen != "original":
+        return next(item for item in DEFAULT_PERSONAS if item.id == chosen)
+    if non_interactive:
+        raise OperationError(
+            "--persona original is authored in the interactive wizard; "
+            "non-interactive setup accepts simon or steady"
+        )
+    persona_id = line_reader("Persona id (lowercase slug, e.g. clear-eyed): ").strip()
+    persona_name = line_reader("Persona display name: ").strip()
+    definition = PersonaDefinition(
+        id=persona_id,
+        name=persona_name,
+        voice="composed",
+        directness="balanced",
+        warmth="balanced",
+        humor="none",
+        challenge="probing",
+        sensitive_topic_handling="calm",
+    )
+    output(
+        "Original persona starts from balanced defaults; tune its style "
+        "fields in personas.json."
+    )
+    return definition
+
+
+def _preflight_non_interactive(
+    placement: PlacementProfile | None,
+    server_data_dir: Path | None,
+    persona: str | None,
+    provider: str | None,
+    environ: Mapping[str, str] | None,
+) -> None:
+    """Fail on missing non-interactive values before anything is written."""
+    chosen_placement = placement or "local"
+    if chosen_placement != "local" and server_data_dir is None:
+        raise OperationError(
+            f"--server-data-dir is required for {chosen_placement} placement "
+            "in non-interactive mode"
+        )
+    if persona == "original":
+        raise OperationError(
+            "--persona original is authored in the interactive wizard; "
+            "non-interactive setup accepts simon or steady"
+        )
+    chosen_provider = provider or "fake"
+    if chosen_provider != "fake":
+        env_name = PROVIDER_KEY_ENV[chosen_provider]
+        values = os.environ if environ is None else environ
+        if not values.get(env_name, "").strip():
+            raise OperationError(
+                f"{env_name} is required for --provider {chosen_provider} in "
+                "non-interactive mode; secrets are accepted via environment "
+                "variables only, never command-line flags"
+            )
+
+
+def _resolve_provider(
+    provider: str | None,
+    store: ProviderCredentialStore,
+    *,
+    non_interactive: bool,
+    environ: Mapping[str, str] | None,
+    secret_reader: Callable[[str], str],
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+    key_verifier: Callable[[str, str], None],
+) -> str:
+    if non_interactive:
+        name = provider or "fake"
+        if name == "fake":
+            return "fake"
+        env_name = PROVIDER_KEY_ENV[name]
+        values = os.environ if environ is None else environ
+        api_key = values.get(env_name, "").strip()
+        if not api_key:
+            raise OperationError(
+                f"{env_name} is required for --provider {name} in "
+                "non-interactive mode; secrets are accepted via environment "
+                "variables only, never command-line flags"
+            )
+        store.set_key(name, api_key)
+        return name
+    if provider is not None:
+        if provider == "fake":
+            output(
+                "Fake uses deterministic local replies, so it does not need an API key."
+            )
+            return "fake"
+        api_key = _enter_provider_key(
+            provider,
+            secret_reader=secret_reader,
+            key_verifier=key_verifier,
+            line_reader=line_reader,
+            output=output,
+        )
+        store.set_key(provider, api_key)
+        return provider
+    return _run_provider_loop(
         secret_reader=secret_reader,
         line_reader=line_reader,
         output=output,
         key_verifier=key_verifier,
         store=store,
     )
+
+
+def _run_channels_step(
+    provider_name: str,
+    *,
+    non_interactive: bool,
+    config_path: Path,
+    secret_reader: Callable[[str], str],
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+    api_factory: Callable[[str], TelegramBotClient],
+    pairing_code: str | None,
+    maximum_polls: int,
+) -> TelegramPollingSettings | None:
+    if non_interactive:
+        output(
+            "Step 4 — channels: skipped; unattended setup cannot pair "
+            "Telegram. Re-run reckoning setup interactively to add it."
+        )
+        return None
+    if not _confirm(
+        "Set up the Telegram channel now? [Y/n]",
+        line_reader=line_reader,
+        output=output,
+        default=True,
+    ):
+        output(
+            "Step 4 — channels: skipped; re-run reckoning setup to add Telegram later."
+        )
+        return None
     settings = setup_telegram_polling(
         config_path=config_path,
         secret_reader=secret_reader,
@@ -186,16 +523,64 @@ def setup_reckoning(
         api_factory=api_factory,
         pairing_code=pairing_code,
         maximum_polls=maximum_polls,
-        gateway_name=gateway_name,
+        gateway_name="telegram",
         provider_name=provider_name,
     )
-    if store.providers:
-        store.save(credentials_path)
-        output(
-            f"Provider credentials saved to {credentials_path} "
-            "with owner-only permissions."
-        )
+    output(
+        f"Step 4 — channels: Telegram is paired as @{settings.bot_username}; "
+        "reckoning gateway runs every configured channel."
+    )
     return settings
+
+
+def _run_proof(
+    provider_name: str,
+    store: ProviderCredentialStore,
+    *,
+    output: Callable[[str], None],
+    application_factory: Callable[..., ReckoningApplication],
+) -> None:
+    try:
+        with TemporaryDirectory(prefix="reckoning-setup-proof-") as temporary:
+            state_path = Path(temporary) / "continuity.json"
+
+            def build_application() -> ReckoningApplication:
+                return application_factory(
+                    state_path,
+                    provider_name=provider_name,
+                    orcarouter_api_key=store.api_key_for("orcarouter"),
+                    deepseek_api_key=store.api_key_for("deepseek"),
+                )
+
+            application = build_application()
+            decision = application.start_reckoning(
+                "Protect one fixed commitment while keeping one smaller task alive."
+            )
+            output(
+                f"Step 5 — proof 1/3: {_provider_label(provider_name)} "
+                "answered a live round-trip."
+            )
+            confirmed = application.confirm_reckoning(decision.id)
+            if confirmed.status != "confirmed":
+                raise _proof_failure("the continuity record did not confirm")
+            output("Step 5 — proof 2/3: a continuity record was created and confirmed.")
+            resumed = build_application().resume_decision(decision.id)
+            if resumed.decision.id != decision.id:
+                raise _proof_failure("the record did not survive a restart")
+            output(
+                "Step 5 — proof 3/3: the store re-opened; the record "
+                "survives a restart."
+            )
+    except SetupIncompleteError:
+        raise
+    except Exception as error:
+        raise _proof_failure(str(error)) from error
+
+
+def _proof_failure(detail: str) -> SetupIncompleteError:
+    return SetupIncompleteError(
+        f"Setup is incomplete: {detail}. Run reckoning doctor to find the problem."
+    )
 
 
 def _manage_providers(
@@ -377,8 +762,7 @@ def _run_provider_loop(
         )
         if provider_name == "fake":
             output(
-                "Fake uses deterministic local replies, "
-                "so it does not need an API key."
+                "Fake uses deterministic local replies, so it does not need an API key."
             )
         else:
             api_key = _enter_provider_key(
@@ -418,8 +802,7 @@ def _choose_default_provider(
         default_name = configured[0]
     else:
         options = tuple(
-            SetupMenuOption(name, _provider_label(name), True)
-            for name in configured
+            SetupMenuOption(name, _provider_label(name), True) for name in configured
         )
         default_index = (
             configured.index(current_default) + 1

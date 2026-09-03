@@ -159,12 +159,13 @@ def test_telegram_runtime_reads_only_explicit_process_configuration() -> None:
         )
 
 
-def test_package_installs_a_separate_bounded_telegram_command() -> None:
+def test_telegram_runtime_runs_behind_the_gateway_command() -> None:
     configuration = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    scripts = configuration["project"]["scripts"]
 
-    assert configuration["project"]["scripts"]["reckoning-telegram"] == (
-        "reckoning.telegram:main"
-    )
+    assert "reckoning-telegram" not in scripts
+    assert "reckoning-ops" not in scripts
+    assert scripts == {"reckoning": "reckoning.command:main"}
 
 
 class RecordingTelegramClient:
@@ -202,7 +203,7 @@ class RecordingTelegramClient:
         self.sent.append((chat_id, text))
 
 
-def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
+def test_terminal_setup_runs_the_five_steps_and_pairs_the_channel(
     tmp_path: Path,
 ) -> None:
     client = RecordingTelegramClient(
@@ -218,7 +219,7 @@ def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
             )
         ]
     )
-    answers = iter(("2", "1", "1", ""))
+    answers = iter(("1", "1", "1", "n", ""))
     prompts: list[str] = []
     messages: list[str] = []
 
@@ -233,7 +234,8 @@ def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
         return "bot-token"
 
     config_path = tmp_path / "telegram.json"
-    settings = setup_reckoning(
+    result = setup_reckoning(
+        data_dir=tmp_path / "data",
         config_path=config_path,
         credentials_path=tmp_path / "provider.json",
         secret_reader=read_secret,
@@ -245,24 +247,29 @@ def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
     )
 
     displayed = "\n".join(messages)
-    assert "1. Telegram" in displayed
-    assert "2. Discord (coming later)" in displayed
-    assert "3. WhatsApp (coming later)" in displayed
-    assert "4. Slack (coming later)" in displayed
-    assert "1. Fake (no API key)" in displayed
-    assert "2. DeepSeek" in displayed
-    assert "3. OrcaRouter" in displayed
-    assert "Discord is not available yet." in displayed
+    assert displayed.index("Step 1 — instance:") < displayed.index("Step 2 — persona:")
+    assert displayed.index("Step 2 — persona:") < displayed.index("Step 3 — provider:")
+    assert displayed.index("Step 3 — provider:") < displayed.index("Step 4 — channels:")
+    assert displayed.index("Step 4 — channels:") < displayed.index("Step 5 — proof 1/3")
+    assert "Step 2 — persona: Simon" in displayed
+    assert "Step 3 — provider: Fake (no API key)" in displayed
+    assert "Telegram is paired as @reckoning_test_bot" in displayed
+    assert "Setup complete" in displayed
     assert prompts == [
-        "Gateway [1]: ",
-        "Gateway [1]: ",
+        "Placement [1]: ",
+        "Persona [1]: ",
         "Provider [1]: ",
+        "",
         "",
     ]
     assert secret_prompts == ["Paste the BotFather token (input is hidden): "]
-    assert settings.gateway_name == "telegram"
-    assert settings.provider_name == "fake"
-    assert TelegramPollingSettings.load(config_path) == settings
+    telegram = result.telegram
+    assert telegram is not None
+    assert telegram.gateway_name == "telegram"
+    assert telegram.provider_name == "fake"
+    assert result.provider_name == "fake"
+    assert TelegramPollingSettings.load(config_path) == telegram
+    assert (tmp_path / "data" / "instance.json").is_file()
 
 
 def test_polling_uses_the_bounded_gateway_and_acknowledges_denied_chats() -> None:

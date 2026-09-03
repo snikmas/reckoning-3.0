@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from html import escape
 from ipaddress import ip_address
 from pathlib import Path
@@ -533,9 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
 
     try:
         host = validate_bind_host(arguments.host)

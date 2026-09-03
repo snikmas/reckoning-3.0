@@ -1,3 +1,3 @@
 from reckoning.command import main
 
-main()
+raise SystemExit(main())

@@ -5,7 +5,7 @@ import json
 import os
 import secrets
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from getpass import getpass
 from hmac import compare_digest
@@ -756,9 +756,13 @@ def _create_interface(
     )
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str = "reckoning gateway") -> int:
     parser = argparse.ArgumentParser(
-        description="Run Reckoning through Telegram."
+        prog=prog,
+        description=(
+            "Run every configured channel in one process. Telegram is the "
+            "available channel today; future channels attach here."
+        ),
     )
     parser.add_argument(
         "command",
@@ -787,7 +791,7 @@ def main() -> None:
         default=DEFAULT_TELEGRAM_CONFIG,
         help="Local credential file used by Telegram polling.",
     )
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
 
     try:
         if arguments.command == "webhook":
@@ -831,7 +835,7 @@ def main() -> None:
                 server.serve_forever()
             except KeyboardInterrupt:
                 print("\nTelegram webhook stopped.")
-        return
+        return 0
 
     polling = TelegramPollingApplication(
         TelegramUpdateAdapter(gateway, authentication_token=gateway_token),
@@ -844,7 +848,8 @@ def main() -> None:
         )
     except KeyboardInterrupt:
         print("\nTelegram polling stopped.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
