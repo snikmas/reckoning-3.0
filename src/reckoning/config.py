@@ -94,6 +94,18 @@ def _credential_api_key(
     return ProviderCredentialStore.load(credential_file).api_key_for(provider_name)
 
 
+def default_provider_name(
+    credential_file: Path = DEFAULT_PROVIDER_CREDENTIALS,
+) -> str | None:
+    """The setup-saved default provider, when it has a usable key."""
+    store = ProviderCredentialStore.load(credential_file)
+    if store.default_provider is None:
+        return None
+    if store.api_key_for(store.default_provider) is None:
+        return None
+    return store.default_provider
+
+
 @dataclass(frozen=True)
 class OrcaRouterSettings:
     api_key: str | None

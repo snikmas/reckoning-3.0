@@ -102,7 +102,7 @@ def test_setup_verifies_and_saves_a_deepseek_key_with_owner_only_permissions(
 
     settings, secret_prompts, messages = run_setup(
         tmp_path,
-        ("1", "2"),
+        ("1", "2", "n"),
         ("sk-deepseek-test", "bot-token"),
         verifier=verifier,
     )
@@ -137,7 +137,7 @@ def test_setup_verifies_and_saves_an_orcarouter_key(tmp_path: Path) -> None:
 
     settings, _, _ = run_setup(
         tmp_path,
-        ("1", "3"),
+        ("1", "3", "n"),
         ("orca-key", "bot-token"),
         verifier=verifier,
     )
@@ -152,6 +152,105 @@ def test_setup_verifies_and_saves_an_orcarouter_key(tmp_path: Path) -> None:
     assert loaded.api_key == "orca-key"
 
 
+def test_setup_configures_two_providers_in_one_session_with_an_explicit_default(
+    tmp_path: Path,
+) -> None:
+    verifier = RecordingKeyVerifier()
+
+    settings, _, messages = run_setup(
+        tmp_path,
+        ("1", "2", "y", "3", "n", "2"),
+        ("sk-deepseek-test", "orca-key", "bot-token"),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == [
+        ("deepseek", "sk-deepseek-test"),
+        ("orcarouter", "orca-key"),
+    ]
+    assert settings.provider_name == "orcarouter"
+
+    credentials_path = tmp_path / "provider.json"
+    assert json.loads(credentials_path.read_text(encoding="utf-8")) == {
+        "default_provider": "orcarouter",
+        "providers": {
+            "deepseek": "sk-deepseek-test",
+            "orcarouter": "orca-key",
+        },
+    }
+    displayed = "\n".join(messages)
+    assert "Add another provider? [y/N]" in displayed
+    assert "DeepSeek (configured)" in displayed
+    assert "Which provider is the default?" in displayed
+
+    orcarouter = OrcaRouterSettings.load(
+        tmp_path / "missing.env", environ={}, credential_file=credentials_path
+    )
+    deepseek = DeepSeekSettings.load(
+        tmp_path / "missing.env", environ={}, credential_file=credentials_path
+    )
+    assert orcarouter.api_key == "orca-key"
+    assert deepseek.api_key == "sk-deepseek-test"
+
+
+def test_setup_with_a_single_provider_does_not_ask_for_the_default(
+    tmp_path: Path,
+) -> None:
+    verifier = RecordingKeyVerifier()
+
+    settings, _, messages = run_setup(
+        tmp_path,
+        ("1", "2", "n"),
+        ("sk-deepseek-test", "bot-token"),
+        verifier=verifier,
+    )
+
+    assert settings.provider_name == "deepseek"
+    assert "Which provider is the default?" not in "\n".join(messages)
+
+
+def test_setup_can_default_to_fake_after_configuring_a_real_provider(
+    tmp_path: Path,
+) -> None:
+    verifier = RecordingKeyVerifier()
+
+    settings, secret_prompts, _ = run_setup(
+        tmp_path,
+        ("1", "1", "y", "2", "n", "1"),
+        ("sk-deepseek-test", "bot-token"),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == [("deepseek", "sk-deepseek-test")]
+    assert secret_prompts == [
+        "Paste the DeepSeek API key (input is hidden): ",
+        "Paste the BotFather token (input is hidden): ",
+    ]
+    assert settings.provider_name == "fake"
+    assert json.loads((tmp_path / "provider.json").read_text(encoding="utf-8")) == {
+        "default_provider": "deepseek",
+        "providers": {"deepseek": "sk-deepseek-test"},
+    }
+
+
+def test_setup_with_only_fake_needs_no_key_and_saves_no_credentials(
+    tmp_path: Path,
+) -> None:
+    verifier = RecordingKeyVerifier()
+
+    settings, secret_prompts, _ = run_setup(
+        tmp_path,
+        ("1", "1", "n"),
+        ("bot-token",),
+        verifier=verifier,
+    )
+
+    assert verifier.calls == []
+    assert secret_prompts == ["Paste the BotFather token (input is hidden): "]
+    assert settings.provider_name == "fake"
+    assert not (tmp_path / "provider.json").exists()
+
+
 def test_setup_refuses_a_key_the_provider_rejects(tmp_path: Path) -> None:
     verifier = RecordingKeyVerifier(
         ProviderKeyVerificationError(
@@ -162,7 +261,7 @@ def test_setup_refuses_a_key_the_provider_rejects(tmp_path: Path) -> None:
     with pytest.raises(ProviderKeyVerificationError, match="rejected the API key"):
         run_setup(
             tmp_path,
-            ("1", "2"),
+            ("1", "2", "n"),
             ("bad-key", "bot-token"),
             verifier=verifier,
         )
@@ -177,7 +276,7 @@ def test_setup_requires_a_non_empty_api_key(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="A DeepSeek API key is required."):
         run_setup(
             tmp_path,
-            ("1", "2"),
+            ("1", "2", "n"),
             ("   ", "bot-token"),
             verifier=verifier,
         )
@@ -192,7 +291,7 @@ def test_an_aborted_pairing_leaves_no_partial_credential(tmp_path: Path) -> None
     with pytest.raises(OperationError, match="Telegram setup was not saved"):
         run_setup(
             tmp_path,
-            ("1", "2"),
+            ("1", "2", "n"),
             ("sk-deepseek-test", "bot-token"),
             verifier=verifier,
             updates=(),

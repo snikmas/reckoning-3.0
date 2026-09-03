@@ -218,7 +218,7 @@ def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
             )
         ]
     )
-    answers = iter(("2", "1", "1"))
+    answers = iter(("2", "1", "1", ""))
     prompts: list[str] = []
     messages: list[str] = []
 
@@ -257,6 +257,7 @@ def test_terminal_setup_lists_future_choices_and_configures_the_available_path(
         "Gateway [1]: ",
         "Gateway [1]: ",
         "Provider [1]: ",
+        "",
     ]
     assert secret_prompts == ["Paste the BotFather token (input is hidden): "]
     assert settings.gateway_name == "telegram"
