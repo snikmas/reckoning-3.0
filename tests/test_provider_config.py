@@ -8,6 +8,7 @@ from reckoning.config import (
     DeepSeekSettings,
     OrcaRouterSettings,
     ProviderCredentialStore,
+    default_provider_name,
 )
 
 
@@ -266,3 +267,29 @@ def test_an_empty_credential_store_saves_with_a_null_default(
         "default_provider": None,
         "providers": {},
     }
+
+
+def test_default_provider_name_returns_the_saved_default(tmp_path: Path) -> None:
+    credentials_path = tmp_path / "provider.json"
+    store = ProviderCredentialStore()
+    store.set_key("deepseek", "sk-deepseek")
+    store.set_key("orcarouter", "sk-orca")
+    store.default_provider = "orcarouter"
+    store.save(credentials_path)
+
+    assert default_provider_name(credentials_path) == "orcarouter"
+
+
+def test_default_provider_name_reads_the_legacy_single_slot_file(
+    tmp_path: Path,
+) -> None:
+    credentials_path = tmp_path / "provider.json"
+    write_legacy_credentials(credentials_path, "deepseek", "legacy-key")
+
+    assert default_provider_name(credentials_path) == "deepseek"
+
+
+def test_default_provider_name_is_none_without_a_credential_file(
+    tmp_path: Path,
+) -> None:
+    assert default_provider_name(tmp_path / "provider.json") is None

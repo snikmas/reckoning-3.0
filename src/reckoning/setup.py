@@ -90,6 +90,16 @@ def _choose_setup_option(
         return option.name
 
 
+def _confirm(
+    question: str,
+    *,
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+) -> bool:
+    output(question)
+    return line_reader("").strip().casefold() in ("y", "yes")
+
+
 def setup_reckoning(
     *,
     config_path: Path = DEFAULT_TELEGRAM_CONFIG,
@@ -110,25 +120,14 @@ def setup_reckoning(
         line_reader=line_reader,
         output=output,
     )
-    provider_name = _choose_setup_option(
-        "Choose a provider:",
-        "Provider [1]: ",
-        PROVIDER_SETUP_OPTIONS,
+    store = ProviderCredentialStore()
+    provider_name = _run_provider_loop(
+        secret_reader=secret_reader,
         line_reader=line_reader,
         output=output,
+        key_verifier=key_verifier,
+        store=store,
     )
-    store: ProviderCredentialStore | None = None
-    if provider_name == "fake":
-        output(
-            "Fake uses deterministic local replies, so it does not need an API key."
-        )
-    else:
-        store = _enter_provider_credentials(
-            provider_name,
-            secret_reader=secret_reader,
-            key_verifier=key_verifier,
-        )
-        output(f"{_PROVIDER_DISPLAY_NAMES[provider_name]} verified the API key.")
     settings = setup_telegram_polling(
         config_path=config_path,
         secret_reader=secret_reader,
@@ -140,7 +139,7 @@ def setup_reckoning(
         gateway_name=gateway_name,
         provider_name=provider_name,
     )
-    if store is not None:
+    if store.providers:
         store.save(credentials_path)
         output(
             f"Provider credentials saved to {credentials_path} "
@@ -149,12 +148,102 @@ def setup_reckoning(
     return settings
 
 
-def _enter_provider_credentials(
+def _run_provider_loop(
+    *,
+    secret_reader: Callable[[str], str],
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+    key_verifier: Callable[[str, str], None],
+    store: ProviderCredentialStore,
+) -> str:
+    """Configure providers until declined; return the chosen default."""
+    configured: list[str] = list(store.providers)
+    while True:
+        options = tuple(
+            SetupMenuOption(
+                option.name,
+                f"{option.label} (configured)"
+                if option.name in configured and option.name != "fake"
+                else option.label,
+                option.available,
+                option.unavailable_message,
+            )
+            for option in PROVIDER_SETUP_OPTIONS
+        )
+        provider_name = _choose_setup_option(
+            "Choose a provider:",
+            "Provider [1]: ",
+            options,
+            line_reader=line_reader,
+            output=output,
+        )
+        if provider_name == "fake":
+            output(
+                "Fake uses deterministic local replies, "
+                "so it does not need an API key."
+            )
+        else:
+            api_key = _enter_provider_key(
+                provider_name,
+                secret_reader=secret_reader,
+                key_verifier=key_verifier,
+            )
+            store.set_key(provider_name, api_key)
+            output(f"{_PROVIDER_DISPLAY_NAMES[provider_name]} verified the API key.")
+        if provider_name not in configured:
+            configured.append(provider_name)
+        if not _confirm(
+            "Add another provider? [y/N]",
+            line_reader=line_reader,
+            output=output,
+        ):
+            break
+    return _choose_default_provider(
+        configured,
+        store,
+        line_reader=line_reader,
+        output=output,
+    )
+
+
+def _choose_default_provider(
+    configured: list[str],
+    store: ProviderCredentialStore,
+    *,
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+) -> str:
+    if len(configured) == 1:
+        default_name = configured[0]
+    else:
+        options = tuple(
+            SetupMenuOption(name, _provider_label(name), True)
+            for name in configured
+        )
+        default_name = _choose_setup_option(
+            "Which provider is the default?",
+            "Default provider [1]: ",
+            options,
+            line_reader=line_reader,
+            output=output,
+        )
+    if default_name in store.providers:
+        store.default_provider = default_name
+    return default_name
+
+
+def _provider_label(provider_name: str) -> str:
+    if provider_name == "fake":
+        return "Fake (no API key)"
+    return _PROVIDER_DISPLAY_NAMES[provider_name]
+
+
+def _enter_provider_key(
     provider_name: str,
     *,
     secret_reader: Callable[[str], str],
     key_verifier: Callable[[str, str], None],
-) -> ProviderCredentialStore:
+) -> str:
     display_name = _PROVIDER_DISPLAY_NAMES[provider_name]
     api_key = secret_reader(
         f"Paste the {display_name} API key (input is hidden): "
@@ -162,6 +251,4 @@ def _enter_provider_credentials(
     if not api_key:
         raise ValueError(f"A {display_name} API key is required.")
     key_verifier(provider_name, api_key)
-    store = ProviderCredentialStore()
-    store.set_key(provider_name, api_key, make_default=True)
-    return store
+    return api_key

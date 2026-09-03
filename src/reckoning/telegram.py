@@ -21,6 +21,7 @@ from reckoning.config import (
     DEFAULT_PROVIDER_CREDENTIALS,
     DeepSeekSettings,
     OrcaRouterSettings,
+    default_provider_name,
 )
 from reckoning.interfaces import (
     ReckoningInterfaceApplication,
@@ -710,16 +711,27 @@ def _create_interface(
         deepseek_settings = DeepSeekSettings.load(
             credential_file=DEFAULT_PROVIDER_CREDENTIALS
         )
-        if orcarouter_settings.api_key:
-            provider_name = "orcarouter"
-            orcarouter_api_key = orcarouter_settings.api_key
-            model_name = model_name or orcarouter_settings.model
-            base_url = base_url or orcarouter_settings.base_url
-        elif deepseek_settings.api_key:
-            provider_name = "deepseek"
-            deepseek_api_key = deepseek_settings.api_key
-            model_name = model_name or deepseek_settings.model
-            base_url = base_url or deepseek_settings.base_url
+        settings_by_provider: dict[str, OrcaRouterSettings | DeepSeekSettings] = {
+            "orcarouter": orcarouter_settings,
+            "deepseek": deepseek_settings,
+        }
+        default_name = default_provider_name()
+        candidates = (
+            ((default_name,) if default_name else ())
+            + ("orcarouter", "deepseek")
+        )
+        for candidate in candidates:
+            candidate_settings = settings_by_provider[candidate]
+            if not candidate_settings.api_key:
+                continue
+            provider_name = candidate
+            if candidate == "orcarouter":
+                orcarouter_api_key = candidate_settings.api_key
+            else:
+                deepseek_api_key = candidate_settings.api_key
+            model_name = model_name or candidate_settings.model
+            base_url = base_url or candidate_settings.base_url
+            break
         else:
             provider_name = "fake"
 

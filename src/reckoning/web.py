@@ -14,6 +14,7 @@ from reckoning.config import (
     DEFAULT_PROVIDER_CREDENTIALS,
     DeepSeekSettings,
     OrcaRouterSettings,
+    default_provider_name,
 )
 from reckoning.interfaces import (
     ControlView,
@@ -551,12 +552,21 @@ def main() -> None:
     deepseek_settings = DeepSeekSettings.load(
         credential_file=DEFAULT_PROVIDER_CREDENTIALS
     )
-    provider_name = arguments.provider or (
-        "orcarouter"
-        if orcarouter_settings.api_key
-        else "deepseek"
-        if deepseek_settings.api_key
-        else "fake"
+    settings_by_provider: dict[str, OrcaRouterSettings | DeepSeekSettings] = {
+        "orcarouter": orcarouter_settings,
+        "deepseek": deepseek_settings,
+    }
+    default_name = default_provider_name()
+    provider_candidates = (
+        ((default_name,) if default_name else ()) + ("orcarouter", "deepseek")
+    )
+    provider_name = arguments.provider or next(
+        (
+            name
+            for name in provider_candidates
+            if settings_by_provider[name].api_key
+        ),
+        "fake",
     )
     settings = (
         deepseek_settings if provider_name == "deepseek" else orcarouter_settings
