@@ -18,6 +18,7 @@ from wsgiref.types import StartResponse, WSGIEnvironment
 
 from reckoning.application import create_local_application
 from reckoning.config import (
+    CREDENTIAL_PROVIDER_NAMES,
     DEFAULT_PROVIDER_CREDENTIALS,
     DeepSeekSettings,
     OrcaRouterSettings,
@@ -32,6 +33,10 @@ from reckoning.operations import OperationError, load_installation_runtime
 from reckoning.web import validate_bind_host
 
 DEFAULT_TELEGRAM_CONFIG = Path.home() / ".config" / "reckoning" / "telegram.json"
+
+TelegramConnectorStatus = Literal[
+    "not-configured", "bot-verified", "verified-not-paired", "ready", "error"
+]
 
 
 class TelegramBotApiError(RuntimeError):
@@ -69,26 +74,37 @@ class TelegramPollingSettings:
         data = read_json(path, default={})
         token = str(data.get("bot_token", "")).strip()
         username = str(data.get("bot_username", "")).strip()
-        raw_chat_ids = data.get("allowed_chat_ids", [])
         next_update_offset = data.get("next_update_offset")
         gateway_name = str(data.get("gateway_name", "telegram")).strip().casefold()
         provider_name = str(data.get("provider_name", "fake")).strip().casefold()
-        if not token or not username or not isinstance(raw_chat_ids, list):
+        if not token or not username:
             raise ValueError(
                 "Telegram is not configured. Run reckoning setup first."
             )
         if gateway_name != "telegram":
             raise ValueError("The configured messaging gateway is not supported.")
-        if provider_name not in ("fake", "deepseek", "orcarouter"):
+        if provider_name not in CREDENTIAL_PROVIDER_NAMES + ("fake",):
             raise ValueError("The configured model provider is not supported.")
         if next_update_offset is not None and type(next_update_offset) is not int:
             raise ValueError("Telegram polling offset is invalid.")
-        chat_ids = tuple(
-            str(item).strip() for item in raw_chat_ids if str(item).strip()
-        )
+        chat_ids: tuple[str, ...]
+        if "paired_chat_id" in data:
+            # Connector format v2: one paired private chat or none.
+            paired = str(data.get("paired_chat_id") or "").strip()
+            chat_ids = (paired,) if paired else ()
+        else:
+            raw_chat_ids = data.get("allowed_chat_ids", [])
+            if not isinstance(raw_chat_ids, list):
+                raise ValueError(
+                    "Telegram is not configured. Run reckoning setup first."
+                )
+            chat_ids = tuple(
+                str(item).strip() for item in raw_chat_ids if str(item).strip()
+            )
         if not chat_ids:
             raise ValueError(
-                "Telegram is not configured. Run reckoning setup first."
+                "Telegram is verified but not paired; run reckoning setup or "
+                "reckoning channel to pair an owner chat."
             )
         return cls(
             token,
@@ -112,6 +128,146 @@ class TelegramPollingSettings:
             },
         )
         path.chmod(0o600)
+
+
+@dataclass(frozen=True)
+class TelegramConnectorConfig:
+    """Connector state as setup manages it; pairing may still be pending."""
+
+    bot_token: str = field(repr=False)
+    bot_username: str = ""
+    paired_chat_id: str | None = None
+    provider_name: str = "fake"
+
+    @property
+    def status(self) -> TelegramConnectorStatus:
+        if self.paired_chat_id:
+            return "ready"
+        return "verified-not-paired"
+
+    @classmethod
+    def load(cls, path: Path = DEFAULT_TELEGRAM_CONFIG) -> TelegramConnectorConfig:
+        data = read_json(path, default={})
+        token = str(data.get("bot_token", "")).strip()
+        username = str(data.get("bot_username", "")).strip()
+        if not token or not username:
+            raise ValueError("Telegram is not configured.")
+        provider_name = str(data.get("provider_name", "fake")).strip().casefold()
+        if "paired_chat_id" in data:
+            paired = str(data.get("paired_chat_id") or "").strip() or None
+        else:
+            raw_chat_ids = data.get("allowed_chat_ids", [])
+            chat_ids = (
+                tuple(str(item).strip() for item in raw_chat_ids if str(item).strip())
+                if isinstance(raw_chat_ids, list)
+                else ()
+            )
+            paired = chat_ids[0] if chat_ids else None
+        return cls(token, username, paired, provider_name)
+
+    def save(self, path: Path = DEFAULT_TELEGRAM_CONFIG) -> None:
+        atomic_write_json(
+            path,
+            {
+                "schema_version": 2,
+                "bot_token": self.bot_token,
+                "bot_username": self.bot_username,
+                "paired_chat_id": self.paired_chat_id,
+                "gateway_name": "telegram",
+                "provider_name": self.provider_name,
+            },
+        )
+        path.chmod(0o600)
+
+    def polling_settings(self) -> TelegramPollingSettings:
+        if not self.paired_chat_id:
+            raise ValueError(
+                "Telegram is verified but not paired; pair an owner chat first."
+            )
+        return TelegramPollingSettings(
+            self.bot_token,
+            (self.paired_chat_id,),
+            self.bot_username,
+            provider_name=self.provider_name,
+        )
+
+
+def telegram_connector_status(
+    path: Path = DEFAULT_TELEGRAM_CONFIG,
+) -> TelegramConnectorStatus:
+    if not path.exists():
+        return "not-configured"
+    try:
+        return TelegramConnectorConfig.load(path).status
+    except (ValueError, RuntimeError):
+        return "error"
+
+
+def verify_telegram_bot(
+    bot_token: str,
+    *,
+    api_factory: Callable[[str], TelegramBotClient] | None = None,
+) -> str:
+    """Validate a bot token with getMe; returns the bot username."""
+    token = bot_token.strip()
+    if not token:
+        raise ValueError("A Telegram bot token is required.")
+    client = (api_factory or TelegramBotApi)(token)
+    bot = client.get_me()
+    username = str(bot.get("username", "")).strip()
+    if not username:
+        raise TelegramBotApiError("Telegram getMe did not return a bot username.")
+    return username
+
+
+def pair_telegram_owner(
+    bot_token: str,
+    *,
+    pairing_code: str | None = None,
+    maximum_polls: int = 12,
+    api_factory: Callable[[str], TelegramBotClient] | None = None,
+    output: Callable[[str], None] = print,
+) -> str:
+    """Wait for one matching private /connect message and confirm two-way access."""
+    client = (api_factory or TelegramBotApi)(bot_token)
+    webhook = client.get_webhook_info()
+    if str(webhook.get("url", "")).strip():
+        client.delete_webhook()
+    code = pairing_code or secrets.token_hex(3)
+    output(f"Open the bot in Telegram and send: /connect {code}")
+    output("Waiting for that message for up to five minutes...")
+
+    offset: int | None = None
+    paired_chat_id = ""
+    for _ in range(maximum_polls):
+        updates = client.get_updates(offset=offset, timeout=25)
+        for update in updates:
+            update_id = update.get("update_id")
+            if isinstance(update_id, int):
+                offset = max(offset or 0, update_id + 1)
+            message = update.get("message")
+            if not isinstance(message, dict):
+                continue
+            chat = message.get("chat")
+            if not isinstance(chat, dict) or chat.get("type") != "private":
+                continue
+            if str(message.get("text", "")).strip() != f"/connect {code}":
+                continue
+            paired_chat_id = str(chat.get("id", "")).strip()
+            if paired_chat_id:
+                break
+        if paired_chat_id:
+            break
+    if not paired_chat_id:
+        raise OperationError(
+            "No matching private /connect message arrived. The bot stays "
+            "verified but not paired."
+        )
+    client.send_message(
+        paired_chat_id,
+        "Reckoning is connected. Return to the terminal and start the bot.",
+    )
+    return paired_chat_id
 
 
 class TelegramBotApi:
