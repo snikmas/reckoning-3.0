@@ -74,6 +74,10 @@ def test_subprocess_help_matches_the_dispatcher_seam() -> None:
 def test_every_subcommand_accepts_help() -> None:
     for command in (
         "setup",
+        "provider",
+        "persona",
+        "channel",
+        "reset",
         "gateway",
         "doctor",
         "backup",
@@ -110,20 +114,47 @@ def test_help_renders_rich_panels() -> None:
     assert "╭" in stdout
 
 
-def test_the_interactive_wizard_renders_through_rich(
+def setup_paths(tmp_path: Path) -> tuple[str, ...]:
+    return (
+        "--credentials",
+        str(tmp_path / "provider.json"),
+        "--telegram-config",
+        str(tmp_path / "telegram.json"),
+        "--draft-path",
+        str(tmp_path / "setup-draft.json"),
+    )
+
+
+def test_the_interactive_wizard_uses_the_plain_text_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    answers = iter(("1", "1", "1", "n", "5"))
+    answers = iter(
+        (
+            "quick",
+            "simon",
+            "y",
+            "browse",
+            "fake",
+            "skip",
+            "skip",
+            "I want to protect my study time.",
+            "accept",
+            "y",
+        )
+    )
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
 
     returncode, stdout, _ = run_dispatcher(
-        "setup", "--data-dir", str(tmp_path / "wizard-instance")
+        "setup",
+        "--data-dir",
+        str(tmp_path / "wizard-instance"),
+        *setup_paths(tmp_path),
     )
 
     assert returncode == 0
-    assert "╭" in stdout
-    assert "Reckoning setup" in stdout
-    assert "Step 5 — proof 3/3" in stdout
+    assert "== RECKONING setup ==" in stdout
+    assert "Step 1/6" in stdout
+    assert "Demo mode" in stdout
     assert "Setup complete" in stdout
 
 
@@ -135,11 +166,50 @@ def test_non_interactive_setup_stays_plain_for_scripts(
         "--non-interactive",
         "--data-dir",
         str(tmp_path / "scripted-instance"),
+        *setup_paths(tmp_path),
     )
 
     assert returncode == 0
     assert "╭" not in stdout
     assert "Setup complete" in stdout
+
+
+def test_non_interactive_setup_reports_stable_json(tmp_path: Path) -> None:
+    import json as jsonlib
+
+    returncode, stdout, _ = run_dispatcher(
+        "setup",
+        "--non-interactive",
+        "--json",
+        "--data-dir",
+        str(tmp_path / "json-instance"),
+        *setup_paths(tmp_path),
+    )
+
+    assert returncode == 0
+    payload = jsonlib.loads(stdout.strip().splitlines()[-1])
+    assert payload["status"] == "activated"
+    assert payload["provider"] == "fake"
+    assert payload["demo"] is True
+
+
+def test_non_interactive_setup_requires_env_references_for_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    returncode, _, stderr = run_dispatcher(
+        "setup",
+        "--non-interactive",
+        "--provider",
+        "deepseek",
+        "--data-dir",
+        str(tmp_path / "env-instance"),
+        *setup_paths(tmp_path),
+    )
+
+    assert returncode == 2
+    assert "DEEPSEEK_API_KEY is required" in stderr
+    assert not (tmp_path / "env-instance").exists()
 
 
 def test_gateway_rejects_product_setup() -> None:

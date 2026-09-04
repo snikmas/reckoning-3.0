@@ -29,19 +29,31 @@ BACK_KEYWORDS = ("back", "b")
 EXIT_KEYWORDS = ("exit", "quit", "q")
 
 
+def _default_line_reader(prompt: str) -> str:
+    return input(prompt)
+
+
+def _default_secret_reader(prompt: str) -> str:
+    return getpass(prompt)
+
+
+def _default_output(text: str) -> None:
+    print(text)
+
+
 class PlainTextUI:
     """The no-color, no-Unicode, numbered-prompt fallback."""
 
     def __init__(
         self,
         *,
-        line_reader: Callable[[str], str] = input,
-        secret_reader: Callable[[str], str] = getpass,
-        output: Callable[[str], None] = print,
+        line_reader: Callable[[str], str] | None = None,
+        secret_reader: Callable[[str], str] | None = None,
+        output: Callable[[str], None] | None = None,
     ) -> None:
-        self._read = line_reader
-        self._read_secret = secret_reader
-        self._output = output
+        self._read = line_reader or _default_line_reader
+        self._read_secret = secret_reader or _default_secret_reader
+        self._output = output or _default_output
 
     def banner(self) -> None:
         self._output(BRAND_LINE)
@@ -149,9 +161,9 @@ class InteractiveUI(PlainTextUI):
     def __init__(
         self,
         *,
-        line_reader: Callable[[str], str] = input,
-        secret_reader: Callable[[str], str] = getpass,
-        output: Callable[[str], None] = print,
+        line_reader: Callable[[str], str] | None = None,
+        secret_reader: Callable[[str], str] | None = None,
+        output: Callable[[str], None] | None = None,
         stream: Any = None,
         no_color: bool = False,
     ) -> None:
@@ -285,10 +297,10 @@ class NonInteractiveUI:
         self,
         answers: Mapping[str, str],
         *,
-        output: Callable[[str], None] = print,
+        output: Callable[[str], None] | None = None,
     ) -> None:
         self._answers = answers
-        self._output = output
+        self._output = output or _default_output
 
     def banner(self) -> None:
         self._output(BRAND_LINE)

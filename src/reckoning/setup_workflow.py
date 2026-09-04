@@ -470,7 +470,12 @@ class SetupWorkflow:
     def run(self) -> SetupOutcome:
         self._ui.banner()
         if (self._paths.data_dir / "instance.json").exists():
-            return self._run_configured()
+            try:
+                return self._run_configured()
+            except SetupExit:
+                return SetupOutcome(
+                    status="managed", data_dir=self._paths.data_dir
+                )
         existing: SetupDraft | None = None
         if self._paths.draft_path.exists():
             existing = SetupDraft.load(self._paths.draft_path)
@@ -523,8 +528,18 @@ class SetupWorkflow:
             steps = QUICK_STEPS if self._draft.mode == "quick" else CUSTOM_STEPS
             if self._draft.mode == "quick" and self._draft.placement is None:
                 self._ui.info(QUICK_EXPLANATION)
-                self._ui.info(PLACEMENT_LOCAL_DEFAULT)
-                self._draft.placement = "local"
+                if "placement" in self._preselected:
+                    chosen = self._preselected["placement"]
+                    server_dir = self._preselected.get("server-data-dir") or None
+                    if chosen != "local" and not server_dir:
+                        raise SetupInputError(
+                            f"server-data-dir is required for {chosen} placement"
+                        )
+                    self._draft.placement = chosen
+                    self._draft.server_data_dir = server_dir
+                else:
+                    self._ui.info(PLACEMENT_LOCAL_DEFAULT)
+                    self._draft.placement = "local"
             index = 0
             while index < len(steps):
                 step = steps[index]
@@ -1548,6 +1563,18 @@ class SetupWorkflow:
             "Activation failed at the reopen check: the accepted first "
             "conversation is missing from the installed state."
         )
+
+    def manage_section(self, section: str) -> SetupOutcome:
+        """Focused entry point for `reckoning provider/persona/channel`."""
+        if section not in ("persona", "provider", "profile", "connectors"):
+            raise SetupInputError(f"Unknown section: {section}")
+        if not (self._paths.data_dir / "instance.json").exists():
+            raise OperationError(
+                "No installation is configured; run reckoning setup first."
+            )
+        self._ui.banner()
+        self._edit_section(section)
+        return SetupOutcome(status="managed", data_dir=self._paths.data_dir)
 
     # ------------------------------------------------------- configured state
 
