@@ -496,6 +496,11 @@ class PersonaService:
             raise KeyError(f"Unknown persona: {persona_id}") from error
 
 
+def persona_from_data(data: dict[str, Any]) -> PersonaDefinition:
+    """Validate a stored or drafted persona definition."""
+    return _definition_from_data(data)
+
+
 def _definition_from_data(data: dict[str, Any]) -> PersonaDefinition:
     if set(data) != _PERSONA_DEFINITION_FIELDS:
         raise ValueError("A stored persona may contain only style fields.")
