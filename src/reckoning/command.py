@@ -345,15 +345,19 @@ def _run_setup(rest: Sequence[str]) -> int:
     if arguments.server_data_dir is not None:
         preselected["server-data-dir"] = str(arguments.server_data_dir)
     lines: list[str] = []
+    # Interactive output must reach the terminal before setup waits for
+    # input; buffer only when a stable JSON result must print afterwards.
+    buffered = arguments.non_interactive or arguments.json
+    output = lines.append if buffered else None
     try:
         ui: PlainTextUI | NonInteractiveUI
         if arguments.non_interactive:
             answers = _non_interactive_answers(arguments, paths)
             ui = NonInteractiveUI(answers, output=lines.append)
         elif arguments.plain or not sys.stdin.isatty():
-            ui = PlainTextUI(output=lines.append)
+            ui = PlainTextUI(output=output)
         else:
-            ui = InteractiveUI(no_color=arguments.no_color, output=lines.append)
+            ui = InteractiveUI(no_color=arguments.no_color, output=output)
         workflow = SetupWorkflow(
             paths=paths,
             ui=ui,
