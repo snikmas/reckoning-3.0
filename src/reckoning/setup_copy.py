@@ -8,10 +8,7 @@ from __future__ import annotations
 
 LOCALE = "en"
 
-BRANDING = (
-    "┌─ RECKONING ─┐",
-    "  setup",
-)
+BRANDING = ("┌─ RECKONING ─┐", "  setup")
 
 BRAND_LINE = "== RECKONING setup =="
 
@@ -29,18 +26,24 @@ PLACEMENT_TITLE = "Choose where your data lives"
 PLACEMENT_OPTIONS = {
     "local": (
         "Local — everything stays on this device",
-        "Personal context, confirmed state, and approved sources are stored "
-        "and processed locally.",
+        (
+            "Personal context, confirmed state, and approved sources are stored "
+            "and processed locally."
+        ),
     ),
     "personal-server": (
         "Personal server — private state lives on your server",
-        "Personal context and confirmed state are stored and processed on "
-        "your own server.",
+        (
+            "Personal context and confirmed state are stored and processed on "
+            "your own server."
+        ),
     ),
     "hybrid": (
         "Hybrid — private data local, approved remote sources on your server",
-        "Private context stays local; approved remote sources live on your "
-        "server.",
+        (
+            "Private context stays local; approved remote sources live on your "
+            "server."
+        ),
     ),
 }
 PLACEMENT_LOCAL_DEFAULT = (

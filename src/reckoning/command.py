@@ -21,7 +21,6 @@ from reckoning.operations import (
     restore_transfer,
 )
 from reckoning.presentation import (
-    error_output,
     render_doctor,
     render_help,
     render_release_readiness,
@@ -368,7 +367,7 @@ def _run_setup(rest: Sequence[str]) -> int:
     except ProviderVerificationError as error:
         _report_failure(arguments, str(error))
         return 2
-    except Exception as error:  # unexpected: concise by default
+    except Exception as error:  # noqa: BLE001 — top-level concise boundary
         _report_failure(
             arguments,
             f"unexpected failure: {error}",

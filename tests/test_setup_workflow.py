@@ -402,6 +402,7 @@ DEEPSEEK_ANSWERS: list[tuple[str, str]] = [
     ("provider-key", "sk-test-deepseek"),
     ("provider-model", "recommended"),
     ("provider-verify-consent", "y"),
+    ("persona-live-sample", "n"),
     ("profile", "skip"),
     ("connectors", "skip"),
     ("first-message", "Help me plan the semester."),
@@ -459,6 +460,7 @@ def test_an_environment_reference_is_reused_without_copying_its_value(
             ("provider-key-source", "env-ref"),
             ("provider-model", "recommended"),
             ("provider-verify-consent", "y"),
+            ("persona-live-sample", "n"),
             ("profile", "skip"),
             ("connectors", "skip"),
             ("first-message", "Hello."),
@@ -922,3 +924,37 @@ def test_non_interactive_setup_fails_loudly_on_a_missing_answer(
     with pytest.raises(SetupInputError, match="provider-preference"):
         workflow.run()
     assert not (tmp_path / "data").exists()
+
+
+def test_the_optional_live_persona_sample_runs_after_verification(
+    tmp_path: Path,
+) -> None:
+    transport, calls = chat_transport("I am Simon, your Reckoning agent.")
+    outcome, ui = run_workflow(
+        tmp_path,
+        [
+            ("mode", "quick"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
+            ("provider-preference", "direct"),
+            ("provider-use-recommendation", "y"),
+            ("provider-key-source", "new"),
+            ("provider-key", "sk-sample"),
+            ("provider-model", "recommended"),
+            ("provider-verify-consent", "y"),
+            ("persona-live-sample", "y"),
+            ("persona-live-sample-keep", "y"),
+            ("profile", "skip"),
+            ("connectors", "skip"),
+            ("first-message", "Hello."),
+            ("first-message-action", "accept"),
+            ("review-confirm", "y"),
+        ],
+        services=offline_services(transport=transport),
+    )
+
+    assert outcome.status == "activated"
+    displayed = "\n".join(ui.lines)
+    assert "I am Simon, your Reckoning agent." in displayed
+    # Verification, live sample, and first conversation: three requests.
+    assert len(calls) == 3

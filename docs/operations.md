@@ -21,28 +21,39 @@ installs exactly one command, `reckoning`.
 Create a bot with [BotFather](https://t.me/BotFather). Keep the token private.
 Anyone who has the token can control the bot.
 
-Run the setup wizard:
+Run guided setup:
 
 ```bash
 reckoning setup
 ```
 
-The channels step is the last interactive step and is skippable. It lists
-Telegram, Discord, WhatsApp, and Slack; only Telegram is selectable today, the
-others report that they are coming later, and Skip finishes setup without
-channels. Fake uses
-deterministic local replies and does not need a provider API key.
-DeepSeek and OrcaRouter ask for the provider API key with hidden input and
-verify the key against the provider. If verification fails, the command offers
-to re-enter the key, save it unverified, or abort without saving. After each
-provider, the command asks whether to add another one, then asks which
-configured provider is the default. Keys are saved in
-`~/.config/reckoning/provider.json` with owner-only permissions. The channels
-step then asks for the BotFather token and hides it while you type. It verifies
-the bot and asks you to send a one-time `/connect` code in a private chat.
-Reckoning saves the selected provider and the Telegram
-configuration in `~/.config/reckoning/telegram.json`. The file has owner-only
-permissions.
+Fresh installations offer **Quick Setup** (desired-self persona and one
+primary provider, with local placement shown as the visible default) and
+**Custom Setup** (every placement, persona, provider, profile, and connector
+choice in order). Providers come from the bundled, versioned registry grouped
+as Direct, Gateway, Local, and Custom; entries that have not passed the shared
+provider contract sit in a dim, non-selectable *Coming soon* section. Setup
+detects configured environment references and reachable localhost runtimes
+without displaying secret values, and asks before any live provider test.
+
+A provider becomes active only after one small real completion with a fixed,
+non-personal prompt; the test screen names the provider, model, destination
+domain, and any possible paid charge first. A failed test offers Retry, Edit,
+Back, Save for later (the credential stays inactive), or Exit. Verified keys
+are saved in `~/.config/reckoning/provider.json` with owner-only permissions;
+environment references are stored as references, never copied. After the
+provider works, optional profile onboarding (skip, guided questions, or a
+UTF-8 Markdown import that saves reviewable, unconfirmed proposals) and the
+Telegram connector follow. Telegram verification reports *Bot verified*;
+optional `/connect` pairing records one authorized private chat and reports
+*Ready*. Setup never starts the Gateway; it prints the exact command.
+
+Setup ends with a real first message answered by the selected persona and
+provider (tools, external writes, routines, and memory confirmation are
+disabled). Only an accepted exchange becomes the first durable conversation.
+Activation is atomic and re-opens the installed state to prove persistence
+before reporting completion. Interrupting setup saves a non-secret draft and
+resumes where it stopped.
 
 Start the channel runner:
 
@@ -57,12 +68,17 @@ different provider than the configured one, pass explicit flags:
 reckoning gateway --provider deepseek
 ```
 
-To add, replace, or remove a provider, or to change the default provider,
-re-run setup. When the installation is already configured, setup opens a
-management menu instead of the first-run wizard:
+To manage an existing installation, re-run setup; it opens the
+installation status view (loaded without network access) with an explicit
+**Verify all** action, failure-first repair, and section-specific editing.
+Focused commands manage one section directly:
 
 ```bash
-reckoning setup
+reckoning setup      # status, verify, repair, edit one section
+reckoning provider   # add or verify providers, change the primary model
+reckoning persona    # select, author, edit, duplicate, rename, remove
+reckoning channel    # Telegram setup and owner pairing
+reckoning reset      # remove installation state after a previewed confirmation
 ```
 
 Keep the command running while you use the bot. Stop it with `Ctrl+C`. The bot
@@ -101,12 +117,16 @@ reckoning setup --non-interactive --placement local
 ```
 
 Setup selects Simon by default. Select the other bundled persona with
-`--persona steady`. To author an original persona, run the interactive wizard
-and choose **Original**; the wizard asks only for an id and a display name and
-starts from balanced style defaults. Fine-grained style tuning lives in the
-`personas.json` instance file, not in the wizard or the flag surface. Persona
-options change style only. They cannot change protected privacy, authority,
-deletion, or safety rules.
+`--persona steady`. To author an original persona, run interactive setup and
+choose to author one: start from a preset or a blank template, then tune voice,
+directness, warmth, humor, challenge, and sensitive-topic handling, each with
+plain-language explanations and examples. A deterministic preview shows the
+result before any provider is involved; after provider verification, one
+optional live sample is available. Built-in presets stay immutable but can be
+duplicated; authored personas can be edited, renamed, and removed (the active
+persona must be replaced first). The autonomy floor — truthfulness,
+permissions, memory confirmation authority, user authority, and the protected
+relational rules — is shown separately and no persona can change it.
 
 The default data directory is `~/.local/state/reckoning`. Use `--data-dir` to
 select a different directory.
@@ -124,12 +144,13 @@ gateway commands. The local and server roots must not contain one another.
 Each source category has its own subdirectory under the assigned node root.
 
 Setup writes `instance.json` and runs a disposable continuity check with the
-deterministic fake provider. The check proposes and confirms a decision,
-resumes the decision, records an outcome, and resumes it after a restart. The
-check does not add synthetic records to the new instance. The wizard's final
-proof step then repeats the loop through the chosen provider — one round-trip,
-a confirmed record, and a re-opened store — and reports the setup as
-incomplete with a pointer to `reckoning doctor` if any check fails.
+deterministic fake provider; the check adds no synthetic records to the new
+instance. Activation then proves the selected provider with a real completion,
+persists the accepted first conversation, and re-opens the installed state
+before reporting completion — a disposable proof store is never treated as the
+installation. Failures name the failing step, a safe cause, and the next
+actions; `reckoning doctor` reports health, and `--debug` keeps tracebacks
+available locally.
 
 Setup builds the local and optional server roots in sibling staging
 directories. It moves them into place only after every required file is ready.

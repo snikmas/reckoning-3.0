@@ -256,15 +256,73 @@ class OpenAICompatibleAdapter:
             raise ProviderVerificationError(
                 f"{self._definition.display_name} needs a model ID."
             )
+        return self._chat(
+            config,
+            model,
+            (("user", VERIFICATION_PROMPT),),
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            timer=timer,
+            max_tokens=VERIFICATION_MAX_TOKENS,
+        )
+
+    def complete(
+        self,
+        config: AdapterConfig,
+        messages: tuple[tuple[str, str], ...],
+        *,
+        transport: Transport = urlopen_transport,
+        timeout_seconds: float = 60.0,
+        max_retries: int = 2,
+        timer: Callable[[], float] = monotonic,
+    ) -> ChatCompletion:
+        """One chat completion with normalized errors and bounded retries."""
+        model = (config.model or self._definition.recommended_model or "").strip()
+        if not model:
+            raise ProviderVerificationError(
+                f"{self._definition.display_name} needs a model ID."
+            )
+        verification = self._chat(
+            config,
+            model,
+            messages,
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            timer=timer,
+        )
+        return ChatCompletion(
+            content=verification.content,
+            model=verification.model,
+            latency_ms=verification.latency_ms,
+            retries=verification.retries,
+            usage=verification.usage,
+        )
+
+    def _chat(
+        self,
+        config: AdapterConfig,
+        model: str,
+        messages: tuple[tuple[str, str], ...],
+        *,
+        transport: Transport,
+        timeout_seconds: float,
+        max_retries: int,
+        timer: Callable[[], float],
+        max_tokens: int | None = None,
+    ) -> ProviderVerification:
         base_url = _validated_base_url(self._definition, config.base_url)
-        payload = json.dumps(
-            {
-                "model": model,
-                "messages": [{"role": "user", "content": VERIFICATION_PROMPT}],
-                "max_tokens": VERIFICATION_MAX_TOKENS,
-                "stream": False,
-            }
-        ).encode("utf-8")
+        body: dict[str, object] = {
+            "model": model,
+            "messages": [
+                {"role": role, "content": content} for role, content in messages
+            ],
+            "stream": False,
+        }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        payload = json.dumps(body).encode("utf-8")
         started = timer()
         last_error = "The provider did not return a response."
         for attempt in range(max(0, max_retries) + 1):
@@ -281,74 +339,6 @@ class OpenAICompatibleAdapter:
                 raw = transport(request, timeout_seconds)
                 return self._parse_completion(
                     raw, model=model, started=started, attempt=attempt, timer=timer
-                )
-            except HTTPError as error:
-                last_error = self._http_error_message(error, config.api_key)
-                if error.code < 500 and error.code != 429:
-                    break
-            except (URLError, TimeoutError, OSError) as error:
-                reason = getattr(error, "reason", error)
-                last_error = (
-                    f"{self._definition.display_name} could not be reached: {reason}"
-                )
-            except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
-                last_error = (
-                    f"{self._definition.display_name} returned an invalid response."
-                )
-                break
-        raise ProviderVerificationError(
-            _redact(last_error, config.api_key)
-        )
-
-    def complete(
-        self,
-        config: AdapterConfig,
-        messages: tuple[tuple[str, str], ...],
-        *,
-        transport: Transport = urlopen_transport,
-        timeout_seconds: float = 60.0,
-        max_retries: int = 2,
-        timer: Callable[[], float] = monotonic,
-    ) -> "ChatCompletion":
-        """One chat completion with normalized errors and bounded retries."""
-        model = (config.model or self._definition.recommended_model or "").strip()
-        if not model:
-            raise ProviderVerificationError(
-                f"{self._definition.display_name} needs a model ID."
-            )
-        base_url = _validated_base_url(self._definition, config.base_url)
-        payload = json.dumps(
-            {
-                "model": model,
-                "messages": [
-                    {"role": role, "content": content} for role, content in messages
-                ],
-                "stream": False,
-            }
-        ).encode("utf-8")
-        started = timer()
-        last_error = "The provider did not return a response."
-        for attempt in range(max(0, max_retries) + 1):
-            request = Request(
-                f"{base_url}/chat/completions",
-                data=payload,
-                headers={
-                    **self._headers(config.api_key),
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            try:
-                raw = transport(request, timeout_seconds)
-                verification = self._parse_completion(
-                    raw, model=model, started=started, attempt=attempt, timer=timer
-                )
-                return ChatCompletion(
-                    content=verification.content,
-                    model=verification.model,
-                    latency_ms=verification.latency_ms,
-                    retries=verification.retries,
-                    usage=verification.usage,
                 )
             except HTTPError as error:
                 last_error = self._http_error_message(error, config.api_key)

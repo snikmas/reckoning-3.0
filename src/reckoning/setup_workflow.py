@@ -93,6 +93,7 @@ from reckoning.setup_copy import (
     PROVIDER_COMING_SOON,
     PROVIDER_DETECTED_TITLE,
     PROVIDER_FAILURE_ACTIONS,
+    PROVIDER_LIVE_SAMPLE,
     PROVIDER_LOCAL_MISSING,
     PROVIDER_MODEL_MANUAL,
     PROVIDER_MODEL_TITLE,
@@ -921,6 +922,7 @@ class SetupWorkflow:
                     )
                     return
                 if self._verify_provider(definition, config):
+                    self._offer_live_persona_sample(definition, config)
                     return
             except (ProviderVerificationError, ModelDiscoveryError) as error:
                 self._ui.failure(str(error))
@@ -930,6 +932,33 @@ class SetupWorkflow:
                 if action == "edit":
                     continue
                 raise SetupBack
+
+    def _offer_live_persona_sample(
+        self, definition: ProviderDefinition, config: AdapterConfig
+    ) -> None:
+        """One optional generated sample after verification; never required."""
+        if not self._ui.confirm(
+            "persona-live-sample",
+            PROVIDER_LIVE_SAMPLE,
+            default=False,
+        ):
+            return
+        persona = self._persona_definition()
+        responder = self._services.responder(persona, definition.id, config)
+        try:
+            sample = responder.respond(
+                "Introduce yourself in two sentences as my Reckoning agent."
+            )
+        except (ProviderVerificationError, RuntimeError) as error:
+            self._ui.warning(f"The live sample failed: {error}")
+            return
+        self._ui.info(sample)
+        if not self._ui.confirm(
+            "persona-live-sample-keep",
+            f"Keep {persona.name} as your persona?",
+            default=True,
+        ):
+            self._step_persona()
 
     def _collect_provider_config(
         self, definition: ProviderDefinition
