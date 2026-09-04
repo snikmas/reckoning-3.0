@@ -43,8 +43,8 @@ def test_ollama_live_completion_when_a_model_is_served() -> None:
     adapter = setup_adapter_for("ollama")
     try:
         models = adapter.discover_models(AdapterConfig())
-    except Exception:
-        pytest.skip("no Ollama runtime responded at the documented address")
+    except Exception as error:  # noqa: BLE001 — any failure means skip
+        pytest.skip(f"no Ollama runtime responded at the documented address: {error}")
     if not models:
         pytest.skip("no Ollama model is pulled")
     result = adapter.verify(AdapterConfig(model=models[0]))

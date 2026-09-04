@@ -15,16 +15,15 @@ import pytest
 
 from reckoning.config import ProviderCredentialStore
 from reckoning.operations import setup_instance
+from reckoning.provider_adapters import urlopen_transport
 from reckoning.setup_workflow import (
     MenuOption,
-    SetupDraft,
     SetupInputError,
     SetupOutcome,
     SetupPaths,
     SetupServices,
     SetupWorkflow,
 )
-from reckoning.provider_adapters import urlopen_transport
 from reckoning.telegram import TelegramConnectorConfig
 
 
@@ -214,7 +213,7 @@ def test_installed_state_survives_a_fresh_application_load(tmp_path: Path) -> No
 def test_exit_writes_a_non_secret_draft_and_resume_skips_completed_steps(
     tmp_path: Path,
 ) -> None:
-    outcome, ui = run_workflow(
+    outcome, _ = run_workflow(
         tmp_path,
         [
             ("mode", "quick"),
@@ -255,7 +254,7 @@ def test_exit_writes_a_non_secret_draft_and_resume_skips_completed_steps(
 
 
 def test_back_changes_no_committed_state(tmp_path: Path) -> None:
-    outcome, ui = run_workflow(
+    outcome, _ui = run_workflow(
         tmp_path,
         [
             ("mode", "quick"),
@@ -320,7 +319,7 @@ def test_start_over_removes_the_draft_but_preserves_credentials(
          ("provider-test-detected", "n"), ("provider", "__exit__")],
     )
 
-    outcome, ui = run_workflow(
+    outcome, _ui = run_workflow(
         tmp_path,
         [
             ("resume", "start-over"),

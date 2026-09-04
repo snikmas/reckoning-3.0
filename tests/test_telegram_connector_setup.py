@@ -5,13 +5,13 @@ from pathlib import Path
 
 import pytest
 
+from reckoning.operations import OperationError
 from reckoning.telegram import (
     TelegramConnectorConfig,
     pair_telegram_owner,
     telegram_connector_status,
     verify_telegram_bot,
 )
-from reckoning.operations import OperationError
 
 
 class StubBotClient:

@@ -37,7 +37,7 @@ def cli_paths(tmp_path: Path) -> tuple[str, ...]:
 
 def quick_setup(tmp_path: Path, name: str = "instance") -> Path:
     data_dir = tmp_path / name
-    returncode, stdout, stderr = run_cli(
+    returncode, _stdout, stderr = run_cli(
         "setup",
         "--non-interactive",
         "--data-dir",
