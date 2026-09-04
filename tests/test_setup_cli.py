@@ -206,3 +206,43 @@ def test_an_interrupted_setup_exits_with_an_incomplete_status(
     draft = json.loads((tmp_path / "setup-draft.json").read_text())
     assert draft["completed"] == ["persona"]
     assert not (tmp_path / "paused").exists()
+
+
+def test_the_persona_command_edits_only_the_persona_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = quick_setup(tmp_path)
+    answers = iter(("select", "steady"))
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+
+    returncode, stdout, _ = run_cli(
+        "persona",
+        "--data-dir",
+        str(data_dir),
+        "--credentials",
+        str(tmp_path / "provider.json"),
+        "--telegram-config",
+        str(tmp_path / "telegram.json"),
+    )
+
+    assert returncode == 0
+    assert "Active persona: Steady" in stdout
+    personas = json.loads((data_dir / "personas.json").read_text())
+    assert personas["active_persona_id"] == "steady"
+    # Nothing else was touched.
+    instance = json.loads((data_dir / "instance.json").read_text())
+    assert instance["activation"]["provider"] == "fake"
+
+
+def test_focused_commands_refuse_an_unconfigured_installation(
+    tmp_path: Path,
+) -> None:
+    returncode, _, stderr = run_cli(
+        "persona",
+        "--data-dir",
+        str(tmp_path / "absent"),
+        "--credentials",
+        str(tmp_path / "provider.json"),
+    )
+    assert returncode == 2
+    assert "run reckoning setup first" in stderr

@@ -1,0 +1,51 @@
+"""Opt-in live smoke tests; excluded from the default suite.
+
+Each Available provider needs recorded evidence of one real completion.
+Run with RECKONING_LIVE_SMOKE=1 and the provider's key in its documented
+environment variable. These never run in CI by default.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from reckoning.provider_adapters import AdapterConfig, setup_adapter_for
+
+LIVE = os.environ.get("RECKONING_LIVE_SMOKE") == "1"
+
+pytestmark = pytest.mark.skipif(
+    not LIVE, reason="opt-in live smoke tests; set RECKONING_LIVE_SMOKE=1"
+)
+
+
+def test_deepseek_live_completion() -> None:
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not key:
+        pytest.skip("DEEPSEEK_API_KEY is not set")
+    adapter = setup_adapter_for("deepseek")
+    result = adapter.verify(AdapterConfig(api_key=key))
+    assert result.demo is False
+    assert result.latency_ms > 0
+
+
+def test_orcarouter_live_completion() -> None:
+    key = os.environ.get("ORCAROUTER_API_KEY", "").strip()
+    if not key:
+        pytest.skip("ORCAROUTER_API_KEY is not set")
+    adapter = setup_adapter_for("orcarouter")
+    result = adapter.verify(AdapterConfig(api_key=key))
+    assert result.demo is False
+
+
+def test_ollama_live_completion_when_a_model_is_served() -> None:
+    adapter = setup_adapter_for("ollama")
+    try:
+        models = adapter.discover_models(AdapterConfig())
+    except Exception:
+        pytest.skip("no Ollama runtime responded at the documented address")
+    if not models:
+        pytest.skip("no Ollama model is pulled")
+    result = adapter.verify(AdapterConfig(model=models[0]))
+    assert result.demo is False
