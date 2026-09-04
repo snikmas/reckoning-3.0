@@ -10,6 +10,7 @@ from reckoning.providers import (
     verify_provider_api_key,
 )
 
+
 def test_verify_provider_api_key_accepts_a_key_the_provider_recognizes() -> None:
     requests: list[Request] = []
 
