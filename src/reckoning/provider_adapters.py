@@ -26,7 +26,7 @@ from reckoning.providers import ProviderUsage
 Transport = Callable[[Request, float], bytes]
 
 
-def _urlopen_transport(request: Request, timeout: float) -> bytes:
+def urlopen_transport(request: Request, timeout: float) -> bytes:
     with urlopen(request, timeout=timeout) as response:
         return response.read()
 
@@ -59,6 +59,16 @@ class ProviderVerification:
     retries: int
     usage: ProviderUsage
     demo: bool = False
+    content: str = ""
+
+
+@dataclass(frozen=True)
+class ChatCompletion:
+    content: str
+    model: str
+    latency_ms: int
+    retries: int
+    usage: ProviderUsage
 
 
 @dataclass(frozen=True)
@@ -94,7 +104,7 @@ class SetupProviderAdapter(Protocol):
         self,
         config: AdapterConfig,
         *,
-        transport: Transport = _urlopen_transport,
+        transport: Transport = urlopen_transport,
         timeout_seconds: float = 15.0,
     ) -> tuple[str, ...]: ...
 
@@ -102,11 +112,22 @@ class SetupProviderAdapter(Protocol):
         self,
         config: AdapterConfig,
         *,
-        transport: Transport = _urlopen_transport,
+        transport: Transport = urlopen_transport,
         timeout_seconds: float = 30.0,
         max_retries: int = 1,
         timer: Callable[[], float] = monotonic,
     ) -> ProviderVerification: ...
+
+    def complete(
+        self,
+        config: AdapterConfig,
+        messages: tuple[tuple[str, str], ...],
+        *,
+        transport: Transport = urlopen_transport,
+        timeout_seconds: float = 60.0,
+        max_retries: int = 2,
+        timer: Callable[[], float] = monotonic,
+    ) -> ChatCompletion: ...
 
 
 def _redact(message: str, api_key: str | None) -> str:
@@ -176,7 +197,7 @@ class OpenAICompatibleAdapter:
         self,
         config: AdapterConfig,
         *,
-        transport: Transport = _urlopen_transport,
+        transport: Transport = urlopen_transport,
         timeout_seconds: float = 15.0,
     ) -> tuple[str, ...]:
         base_url = _validated_base_url(self._definition, config.base_url)
@@ -220,7 +241,7 @@ class OpenAICompatibleAdapter:
         self,
         config: AdapterConfig,
         *,
-        transport: Transport = _urlopen_transport,
+        transport: Transport = urlopen_transport,
         timeout_seconds: float = 30.0,
         max_retries: int = 1,
         timer: Callable[[], float] = monotonic,
@@ -258,23 +279,8 @@ class OpenAICompatibleAdapter:
             )
             try:
                 raw = transport(request, timeout_seconds)
-                parsed = json.loads(raw.decode("utf-8"))
-                content = str(parsed["choices"][0]["message"]["content"]).strip()
-                if not content:
-                    raise ValueError("empty content")
-                usage_data = parsed.get("usage") or {}
-                return ProviderVerification(
-                    provider=self._definition.id,
-                    model=str(parsed.get("model", model)),
-                    latency_ms=round((timer() - started) * 1000),
-                    retries=attempt,
-                    usage=ProviderUsage(
-                        input_tokens=int(usage_data.get("prompt_tokens", 0) or 0),
-                        output_tokens=int(
-                            usage_data.get("completion_tokens", 0) or 0
-                        ),
-                        total_tokens=int(usage_data.get("total_tokens", 0) or 0),
-                    ),
+                return self._parse_completion(
+                    raw, model=model, started=started, attempt=attempt, timer=timer
                 )
             except HTTPError as error:
                 last_error = self._http_error_message(error, config.api_key)
@@ -292,6 +298,101 @@ class OpenAICompatibleAdapter:
                 break
         raise ProviderVerificationError(
             _redact(last_error, config.api_key)
+        )
+
+    def complete(
+        self,
+        config: AdapterConfig,
+        messages: tuple[tuple[str, str], ...],
+        *,
+        transport: Transport = urlopen_transport,
+        timeout_seconds: float = 60.0,
+        max_retries: int = 2,
+        timer: Callable[[], float] = monotonic,
+    ) -> "ChatCompletion":
+        """One chat completion with normalized errors and bounded retries."""
+        model = (config.model or self._definition.recommended_model or "").strip()
+        if not model:
+            raise ProviderVerificationError(
+                f"{self._definition.display_name} needs a model ID."
+            )
+        base_url = _validated_base_url(self._definition, config.base_url)
+        payload = json.dumps(
+            {
+                "model": model,
+                "messages": [
+                    {"role": role, "content": content} for role, content in messages
+                ],
+                "stream": False,
+            }
+        ).encode("utf-8")
+        started = timer()
+        last_error = "The provider did not return a response."
+        for attempt in range(max(0, max_retries) + 1):
+            request = Request(
+                f"{base_url}/chat/completions",
+                data=payload,
+                headers={
+                    **self._headers(config.api_key),
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                raw = transport(request, timeout_seconds)
+                verification = self._parse_completion(
+                    raw, model=model, started=started, attempt=attempt, timer=timer
+                )
+                return ChatCompletion(
+                    content=verification.content,
+                    model=verification.model,
+                    latency_ms=verification.latency_ms,
+                    retries=verification.retries,
+                    usage=verification.usage,
+                )
+            except HTTPError as error:
+                last_error = self._http_error_message(error, config.api_key)
+                if error.code < 500 and error.code != 429:
+                    break
+            except (URLError, TimeoutError, OSError) as error:
+                reason = getattr(error, "reason", error)
+                last_error = (
+                    f"{self._definition.display_name} could not be reached: {reason}"
+                )
+            except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+                last_error = (
+                    f"{self._definition.display_name} returned an invalid response."
+                )
+                break
+        raise ProviderVerificationError(
+            _redact(last_error, config.api_key)
+        )
+
+    def _parse_completion(
+        self,
+        raw: bytes,
+        *,
+        model: str,
+        started: float,
+        attempt: int,
+        timer: Callable[[], float],
+    ) -> ProviderVerification:
+        parsed = json.loads(raw.decode("utf-8"))
+        content = str(parsed["choices"][0]["message"]["content"]).strip()
+        if not content:
+            raise ValueError("empty content")
+        usage_data = parsed.get("usage") or {}
+        return ProviderVerification(
+            provider=self._definition.id,
+            model=str(parsed.get("model", model)),
+            content=content,
+            latency_ms=round((timer() - started) * 1000),
+            retries=attempt,
+            usage=ProviderUsage(
+                input_tokens=int(usage_data.get("prompt_tokens", 0) or 0),
+                output_tokens=int(usage_data.get("completion_tokens", 0) or 0),
+                total_tokens=int(usage_data.get("total_tokens", 0) or 0),
+            ),
         )
 
     def _http_error_message(self, error: HTTPError, api_key: str | None) -> str:
@@ -339,7 +440,7 @@ class FakeProviderAdapter:
         self,
         config: AdapterConfig,
         *,
-        transport: Transport = _urlopen_transport,
+        transport: Transport = urlopen_transport,
         timeout_seconds: float = 15.0,
     ) -> tuple[str, ...]:
         return ("deterministic-fake",)
@@ -348,7 +449,7 @@ class FakeProviderAdapter:
         self,
         config: AdapterConfig,
         *,
-        transport: Transport = _urlopen_transport,
+        transport: Transport = urlopen_transport,
         timeout_seconds: float = 30.0,
         max_retries: int = 1,
         timer: Callable[[], float] = monotonic,
@@ -360,6 +461,28 @@ class FakeProviderAdapter:
             retries=0,
             usage=ProviderUsage(),
             demo=True,
+        )
+
+    def complete(
+        self,
+        config: AdapterConfig,
+        messages: tuple[tuple[str, str], ...],
+        *,
+        transport: Transport = urlopen_transport,
+        timeout_seconds: float = 60.0,
+        max_retries: int = 2,
+        timer: Callable[[], float] = monotonic,
+    ) -> ChatCompletion:
+        last_user = next(
+            (content for role, content in reversed(messages) if role == "user"),
+            "",
+        )
+        return ChatCompletion(
+            content=f'Reckoning received your message: "{last_user}"',
+            model="deterministic-fake",
+            latency_ms=0,
+            retries=0,
+            usage=ProviderUsage(),
         )
 
 

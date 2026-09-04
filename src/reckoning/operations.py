@@ -213,6 +213,9 @@ def setup_instance(
     *,
     server_data_dir: Path | None = None,
     user_profile: Path | None = None,
+    profile_entries: tuple[UserProfileEntry, ...] | None = None,
+    first_conversation: tuple[str, str] | None = None,
+    activation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     local_root = data_dir.expanduser().resolve()
     _require_empty_setup_root(local_root, "data")
@@ -227,9 +230,10 @@ def setup_instance(
     ):
         raise OperationError("an original persona cannot replace a default persona")
     try:
-        profile_entries = read_user_profile(user_profile) if user_profile else ()
+        file_entries = read_user_profile(user_profile) if user_profile else ()
     except (OSError, ValueError) as error:
         raise OperationError(str(error)) from error
+    all_entries = tuple(file_entries) + tuple(profile_entries or ())
     _check_core_continuity_loop()
     selected_persona = persona or DEFAULT_PERSONAS[0]
     created_at = datetime.now(timezone.utc)
@@ -260,12 +264,14 @@ def setup_instance(
             "provider": "deterministic-fake",
         },
         "profile_bootstrap": {
-            "provided": bool(profile_entries),
-            "proposal_count": len(profile_entries),
+            "provided": bool(all_entries),
+            "proposal_count": len(all_entries),
             "raw_profile_retained": False,
         },
         "created_at": created_at.isoformat(),
     }
+    if activation is not None:
+        configuration["activation"] = activation
 
     local_staging: Path | None = None
     server_staging: Path | None = None
@@ -279,8 +285,9 @@ def setup_instance(
             placement,
             selected_persona,
             configuration,
-            profile_entries,
+            all_entries,
             created_at,
+            first_conversation=first_conversation,
         )
         staged_roots = [(local_root, local_staging)]
         if server_root is not None and server_staging is not None:
@@ -318,6 +325,8 @@ def _write_staged_setup(
     configuration: dict[str, Any],
     profile_entries: tuple[UserProfileEntry, ...],
     created_at: datetime,
+    *,
+    first_conversation: tuple[str, str] | None = None,
 ) -> None:
     routes = _state_routes(
         placement,
@@ -364,6 +373,32 @@ def _write_staged_setup(
             source=entry.source,
             created_at=created_at,
             processing_location=processing_location,
+        )
+    if first_conversation is not None:
+        from reckoning.interfaces import (
+            ChannelMessage,
+            ChannelSession,
+            InterfaceState,
+            JsonFileInterfaceRepository,
+        )
+
+        confirmed_route = next(
+            route for route in routes if route.category == "confirmed-state"
+        )
+        user_text, assistant_text = first_conversation
+        JsonFileInterfaceRepository(confirmed_route.root / "interfaces.json").save(
+            InterfaceState(
+                sessions=(
+                    ChannelSession(
+                        "web",
+                        "",
+                        (
+                            ChannelMessage("user", user_text),
+                            ChannelMessage("assistant", assistant_text),
+                        ),
+                    ),
+                )
+            )
         )
     atomic_write_json(
         local_staging / "release-evidence.json",
