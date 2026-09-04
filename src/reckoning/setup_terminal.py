@@ -38,7 +38,9 @@ def _default_secret_reader(prompt: str) -> str:
 
 
 def _default_output(text: str) -> None:
-    print(text)
+    # Flush so interactive output lands before the workflow blocks on input;
+    # the arrow-key menu reads with os.read and never flushes stdio itself.
+    print(text, flush=True)
 
 
 class PlainTextUI:

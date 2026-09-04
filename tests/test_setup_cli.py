@@ -11,6 +11,7 @@ import pytest
 
 from reckoning.command import main
 from reckoning.config import ProviderCredentialStore
+from reckoning.setup_copy import BRAND_LINE
 
 
 def run_cli(*arguments: str, stdin: io.StringIO | None = None):
@@ -206,6 +207,33 @@ def test_an_interrupted_setup_exits_with_an_incomplete_status(
     draft = json.loads((tmp_path / "setup-draft.json").read_text())
     assert draft["completed"] == ["persona"]
     assert not (tmp_path / "paused").exists()
+
+
+def test_interactive_setup_prints_each_step_before_waiting_for_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout = io.StringIO()
+    snapshots: list[str] = []
+    answers = iter(("quick", "exit"))
+
+    def fake_input(prompt: str) -> str:
+        snapshots.append(stdout.getvalue())
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    with redirect_stdout(stdout):
+        returncode = main(
+            ["setup", "--data-dir", str(tmp_path / "paused"), *cli_paths(tmp_path)]
+        )
+
+    assert returncode == 1
+    assert len(snapshots) == 2
+    # The banner and the first menu are visible before the first key is read.
+    assert BRAND_LINE in snapshots[0]
+    assert "Quick Setup" in snapshots[0]
+    # The next step renders before setup waits again.
+    assert len(snapshots[1]) > len(snapshots[0])
+    assert "persona" in snapshots[1].lower()
 
 
 def test_the_persona_command_edits_only_the_persona_section(
