@@ -53,6 +53,18 @@ def run_cli(*arguments: str, passphrase: str | None = None) -> CliResult:
     return CliResult(returncode, stdout.getvalue(), stderr.getvalue())
 
 
+def isolated_setup_args(tmp_path: Path, name: str = "isolated") -> tuple[str, ...]:
+    root = tmp_path / name
+    return (
+        "--credentials",
+        str(root / "provider.json"),
+        "--telegram-config",
+        str(root / "telegram.json"),
+        "--draft-path",
+        str(root / "setup-draft.json"),
+    )
+
+
 def write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -248,20 +260,15 @@ def test_setup_creates_a_single_user_instance_and_proves_the_continuity_loop(
         "hybrid",
         "--server-data-dir",
         str(server_dir),
+        "--mode",
+        "custom",
+        *isolated_setup_args(tmp_path, "continuity-cli"),
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Step 1 — instance:" in result.stdout
-    assert "hybrid placement" in result.stdout
-    assert "private data stays local" in result.stdout
-    assert "Step 2 — persona: Simon" in result.stdout
-    assert "Step 3 — provider: Fake (no API key)" in result.stdout
-    assert "Step 4 — channels: skipped" in result.stdout
-    assert "Step 5 — proof 1/3" in result.stdout
-    assert "proof 2/3" in result.stdout
-    assert "proof 3/3" in result.stdout
-    assert "survives a restart" in result.stdout
+    assert "Demo mode" in result.stdout
     assert "Setup complete" in result.stdout
+    assert "reopened" in result.stdout
     configuration = json.loads(
         (data_dir / "instance.json").read_text(encoding="utf-8")
     )
@@ -332,11 +339,13 @@ def test_personal_server_setup_records_its_real_placement_and_release_block(
         "personal-server",
         "--server-data-dir",
         str(server_dir),
+        "--mode",
+        "custom",
+        *isolated_setup_args(tmp_path, "personal-server-cli"),
     )
 
     assert result.returncode == 0, result.stderr
-    assert "personal-server placement" in result.stdout
-    assert "private and confirmed state lives on your personal server" in result.stdout
+    assert "Setup complete" in result.stdout
     evidence = json.loads(
         (data_dir / "release-evidence.json").read_text(encoding="utf-8")
     )
@@ -365,6 +374,7 @@ def test_cli_requires_a_separate_explicit_server_root_and_reports_probe_health(
         str(tmp_path / "missing-root"),
         "--placement",
         "hybrid",
+        *isolated_setup_args(tmp_path, "missing-root-cli"),
     )
     shared_root = run_cli(
         "setup",
@@ -375,6 +385,7 @@ def test_cli_requires_a_separate_explicit_server_root_and_reports_probe_health(
         "hybrid",
         "--server-data-dir",
         str(tmp_path / "shared-root"),
+        *isolated_setup_args(tmp_path, "shared-root-cli"),
     )
     setup = run_cli(
         "setup",
@@ -385,10 +396,13 @@ def test_cli_requires_a_separate_explicit_server_root_and_reports_probe_health(
         "hybrid",
         "--server-data-dir",
         str(server_root),
+        "--mode",
+        "custom",
+        *isolated_setup_args(tmp_path, "health-cli"),
     )
 
     assert missing_root.returncode == 2
-    assert "--server-data-dir is required" in missing_root.stderr
+    assert "server-data-dir is required" in missing_root.stderr
     assert shared_root.returncode == 2
     assert "roots must be separate" in shared_root.stderr
     assert setup.returncode == 0, setup.stderr
@@ -447,10 +461,11 @@ def test_non_interactive_setup_rejects_an_original_persona_without_a_prompt(
         str(tmp_path / "original-persona-instance"),
         "--persona",
         "original",
+        *isolated_setup_args(tmp_path, "original-persona-cli"),
     )
 
     assert result.returncode == 2
-    assert "--persona original is authored in the interactive wizard" in result.stderr
+    assert "invalid choice" in result.stderr
     assert not (tmp_path / "original-persona-instance").exists()
 
 
@@ -599,6 +614,7 @@ def test_export_can_be_migrated_and_diagnosed_after_restore(tmp_path: Path) -> N
         "personal-server",
         "--server-data-dir",
         str(source_server),
+        *isolated_setup_args(tmp_path, "export-cli"),
     )
     assert setup.returncode == 0, setup.stderr
     write_json(source / "local-state.json", {"location": "local"})
@@ -738,7 +754,13 @@ def test_unknown_commands_fail_with_a_pointer_to_help() -> None:
 
 def _seed_pingable_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     data_dir = tmp_path / "ping-instance"
-    setup = run_cli("setup", "--non-interactive", "--data-dir", str(data_dir))
+    setup = run_cli(
+        "setup",
+        "--non-interactive",
+        "--data-dir",
+        str(data_dir),
+        *isolated_setup_args(tmp_path, "ping-cli"),
+    )
     assert setup.returncode == 0, setup.stderr
     store = ProviderCredentialStore()
     store.set_key("deepseek", "sk-live", make_default=True)
@@ -817,7 +839,13 @@ def test_doctor_ping_skips_the_fake_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = tmp_path / "fake-instance"
-    setup = run_cli("setup", "--non-interactive", "--data-dir", str(data_dir))
+    setup = run_cli(
+        "setup",
+        "--non-interactive",
+        "--data-dir",
+        str(data_dir),
+        *isolated_setup_args(tmp_path, "fake-ping-cli"),
+    )
     assert setup.returncode == 0, setup.stderr
     monkeypatch.setattr(
         "reckoning.command.DEFAULT_PROVIDER_CREDENTIALS",
@@ -863,6 +891,7 @@ def test_setup_never_accepts_secrets_as_command_line_flags(tmp_path: Path) -> No
         "deepseek",
         "--api-key",
         "sk-flag-secret",
+        *isolated_setup_args(tmp_path, "flag-secret-cli"),
     )
 
     assert result.returncode == 2

@@ -57,25 +57,6 @@ def render_release_readiness(
     )
 
 
-def wizard_output(*, console: Console | None = None) -> Callable[[str], None]:
-    """Render wizard lines through rich; menus and prompts stay plain text."""
-    console = console or Console()
-
-    def emit(text: str) -> None:
-        if text == "Reckoning setup":
-            console.print(Panel(text, border_style="blue"))
-        elif text.startswith("Step "):
-            console.print(text, style="green", markup=False, highlight=False)
-        elif text.startswith("Setup complete"):
-            console.print(text, style="bold green", markup=False, highlight=False)
-        elif text.startswith("Setup is incomplete"):
-            console.print(text, style="bold red", markup=False, highlight=False)
-        else:
-            console.print(text, markup=False, highlight=False)
-
-    return emit
-
-
 def error_output(*, console: Console | None = None) -> Callable[[str], None]:
     console = console or Console(stderr=True)
 

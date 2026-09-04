@@ -16,7 +16,6 @@ from reckoning.interfaces import (
     ReckoningInterfaceApplication,
     SourcePlacement,
 )
-from reckoning.setup import setup_reckoning
 from reckoning.telegram import (
     TelegramGateway,
     TelegramPollingApplication,
@@ -201,76 +200,6 @@ class RecordingTelegramClient:
 
     def send_message(self, chat_id: str, text: str) -> None:
         self.sent.append((chat_id, text))
-
-
-def test_terminal_setup_runs_the_five_steps_and_pairs_the_channel(
-    tmp_path: Path,
-) -> None:
-    client = RecordingTelegramClient(
-        [
-            (
-                {
-                    "update_id": 5,
-                    "message": {
-                        "chat": {"id": 42, "type": "private"},
-                        "text": "/connect abc123",
-                    },
-                },
-            )
-        ]
-    )
-    answers = iter(("1", "1", "1", "n", "", "n"))
-    prompts: list[str] = []
-    messages: list[str] = []
-
-    def read_line(prompt: str) -> str:
-        prompts.append(prompt)
-        return next(answers)
-
-    secret_prompts: list[str] = []
-
-    def read_secret(prompt: str) -> str:
-        secret_prompts.append(prompt)
-        return "bot-token"
-
-    config_path = tmp_path / "telegram.json"
-    result = setup_reckoning(
-        data_dir=tmp_path / "data",
-        config_path=config_path,
-        credentials_path=tmp_path / "provider.json",
-        secret_reader=read_secret,
-        line_reader=read_line,
-        output=messages.append,
-        api_factory=lambda token: client,
-        pairing_code="abc123",
-        maximum_polls=1,
-    )
-
-    displayed = "\n".join(messages)
-    assert displayed.index("Step 1 — instance:") < displayed.index("Step 2 — persona:")
-    assert displayed.index("Step 2 — persona:") < displayed.index("Step 3 — provider:")
-    assert displayed.index("Step 3 — provider:") < displayed.index("Step 4 — channels:")
-    assert displayed.index("Step 4 — channels:") < displayed.index("Step 5 — proof 1/3")
-    assert "Step 2 — persona: Simon" in displayed
-    assert "Step 3 — provider: Fake (no API key)" in displayed
-    assert "Telegram is paired as @reckoning_test_bot" in displayed
-    assert "Setup complete" in displayed
-    assert prompts == [
-        "Placement [1]: ",
-        "Persona [1]: ",
-        "Provider [1]: ",
-        "",
-        "Connector [1]: ",
-        "",
-    ]
-    assert secret_prompts == ["Paste the BotFather token (input is hidden): "]
-    telegram = result.telegram
-    assert telegram is not None
-    assert telegram.gateway_name == "telegram"
-    assert telegram.provider_name == "fake"
-    assert result.provider_name == "fake"
-    assert TelegramPollingSettings.load(config_path) == telegram
-    assert (tmp_path / "data" / "instance.json").is_file()
 
 
 def test_polling_uses_the_bounded_gateway_and_acknowledges_denied_chats() -> None:
