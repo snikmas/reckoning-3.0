@@ -110,6 +110,29 @@ VERIFICATION_RECOVERY_OPTIONS = (
     SetupMenuOption("abort", "Abort setup without saving anything", True),
 )
 
+CONNECTOR_SETUP_OPTIONS = (
+    SetupMenuOption("telegram", "Telegram", True),
+    SetupMenuOption(
+        "discord",
+        "Discord",
+        False,
+        "Discord is coming later; only Telegram can be set up today.",
+    ),
+    SetupMenuOption(
+        "whatsapp",
+        "WhatsApp",
+        False,
+        "WhatsApp is coming later; only Telegram can be set up today.",
+    ),
+    SetupMenuOption(
+        "slack",
+        "Slack",
+        False,
+        "Slack is coming later; only Telegram can be set up today.",
+    ),
+    SetupMenuOption("skip", "Skip — set up channels later", True),
+)
+
 _PLACEMENT_REASONS = {
     "local": "private data stays on this device",
     "personal-server": "private and confirmed state lives on your personal server",
@@ -505,17 +528,8 @@ def _run_channels_step(
             "Telegram. Re-run reckoning setup interactively to add it."
         )
         return None
-    if not _confirm(
-        "Set up the Telegram channel now? [Y/n]",
-        line_reader=line_reader,
-        output=output,
-        default=True,
-    ):
-        output(
-            "Step 4 — channels: skipped; re-run reckoning setup to add Telegram later."
-        )
-        return None
-    settings = setup_telegram_polling(
+    settings = _run_connector_loop(
+        provider_name,
         config_path=config_path,
         secret_reader=secret_reader,
         line_reader=line_reader,
@@ -523,14 +537,60 @@ def _run_channels_step(
         api_factory=api_factory,
         pairing_code=pairing_code,
         maximum_polls=maximum_polls,
-        gateway_name="telegram",
-        provider_name=provider_name,
     )
+    if settings is None:
+        output(
+            "Step 4 — channels: skipped; re-run reckoning setup to add Telegram later."
+        )
+        return None
     output(
         f"Step 4 — channels: Telegram is paired as @{settings.bot_username}; "
         "reckoning gateway runs every configured channel."
     )
     return settings
+
+
+def _run_connector_loop(
+    provider_name: str,
+    *,
+    config_path: Path,
+    secret_reader: Callable[[str], str],
+    line_reader: Callable[[str], str],
+    output: Callable[[str], None],
+    api_factory: Callable[[str], TelegramBotClient],
+    pairing_code: str | None,
+    maximum_polls: int,
+) -> TelegramPollingSettings | None:
+    """Set up channel connectors until skipped; only Telegram works today."""
+    settings: TelegramPollingSettings | None = None
+    while True:
+        connector = _choose_setup_option(
+            "Choose a channel connector:",
+            "Connector [1]: ",
+            CONNECTOR_SETUP_OPTIONS,
+            line_reader=line_reader,
+            output=output,
+        )
+        if connector == "skip":
+            return settings
+        settings = setup_telegram_polling(
+            config_path=config_path,
+            secret_reader=secret_reader,
+            line_reader=line_reader,
+            output=output,
+            api_factory=api_factory,
+            pairing_code=pairing_code,
+            maximum_polls=maximum_polls,
+            gateway_name="telegram",
+            provider_name=provider_name,
+        )
+        output(f"Telegram is paired as @{settings.bot_username}.")
+        if not _confirm(
+            "Set up another channel? [y/N]",
+            line_reader=line_reader,
+            output=output,
+        ):
+            return settings
 
 
 def _run_proof(

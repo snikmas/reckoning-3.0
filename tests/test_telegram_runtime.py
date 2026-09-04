@@ -219,7 +219,7 @@ def test_terminal_setup_runs_the_five_steps_and_pairs_the_channel(
             )
         ]
     )
-    answers = iter(("1", "1", "1", "n", ""))
+    answers = iter(("1", "1", "1", "n", "", "n"))
     prompts: list[str] = []
     messages: list[str] = []
 
@@ -260,6 +260,7 @@ def test_terminal_setup_runs_the_five_steps_and_pairs_the_channel(
         "Persona [1]: ",
         "Provider [1]: ",
         "",
+        "Connector [1]: ",
         "",
     ]
     assert secret_prompts == ["Paste the BotFather token (input is hidden): "]

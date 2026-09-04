@@ -155,7 +155,7 @@ def test_setup_verifies_and_saves_a_deepseek_key_with_owner_only_permissions(
 
     result, secret_prompts, messages = run_setup(
         tmp_path,
-        ("1", "1", "2", "n", ""),
+        ("1", "1", "2", "n", "", "n"),
         ("sk-deepseek-test", "bot-token"),
         verifier=verifier,
     )
@@ -190,7 +190,7 @@ def test_setup_verifies_and_saves_an_orcarouter_key(tmp_path: Path) -> None:
 
     result, _, _ = run_setup(
         tmp_path,
-        ("1", "1", "3", "n", ""),
+        ("1", "1", "3", "n", "", "n"),
         ("orca-key", "bot-token"),
         verifier=verifier,
     )
@@ -212,7 +212,7 @@ def test_setup_configures_two_providers_in_one_session_with_an_explicit_default(
 
     result, _, messages = run_setup(
         tmp_path,
-        ("1", "1", "2", "y", "3", "n", "2", ""),
+        ("1", "1", "2", "y", "3", "n", "2", "", "n"),
         ("sk-deepseek-test", "orca-key", "bot-token"),
         verifier=verifier,
     )
@@ -253,7 +253,7 @@ def test_setup_with_a_single_provider_does_not_ask_for_the_default(
 
     result, _, messages = run_setup(
         tmp_path,
-        ("1", "1", "2", "n", ""),
+        ("1", "1", "2", "n", "", "n"),
         ("sk-deepseek-test", "bot-token"),
         verifier=verifier,
     )
@@ -269,7 +269,7 @@ def test_setup_can_default_to_fake_after_configuring_a_real_provider(
 
     result, secret_prompts, _ = run_setup(
         tmp_path,
-        ("1", "1", "1", "y", "2", "n", "1", ""),
+        ("1", "1", "1", "y", "2", "n", "1", "", "n"),
         ("sk-deepseek-test", "bot-token"),
         verifier=verifier,
     )
@@ -293,7 +293,7 @@ def test_setup_with_only_fake_needs_no_key_and_saves_no_credentials(
 
     result, secret_prompts, _ = run_setup(
         tmp_path,
-        ("1", "1", "1", "n", ""),
+        ("1", "1", "1", "n", "", "n"),
         ("bot-token",),
         verifier=verifier,
     )
@@ -316,7 +316,7 @@ def test_setup_retries_a_rejected_key_and_verifies_the_next_one(
 
     result, secret_prompts, messages = run_setup(
         tmp_path,
-        ("1", "1", "2", "1", "n", ""),
+        ("1", "1", "2", "1", "n", "", "n"),
         ("bad-key", "good-key", "bot-token"),
         verifier=verifier,
     )
@@ -346,7 +346,7 @@ def test_setup_can_save_a_key_the_provider_could_not_verify(
 
     result, _, messages = run_setup(
         tmp_path,
-        ("1", "1", "2", "2", "n", ""),
+        ("1", "1", "2", "2", "n", "", "n"),
         ("unverified-key", "bot-token"),
         verifier=verifier,
     )
@@ -414,7 +414,7 @@ def test_the_channels_step_is_explicitly_skippable(tmp_path: Path) -> None:
 
     result, secret_prompts, messages = run_setup(
         tmp_path,
-        ("1", "1", "1", "n", "n"),
+        ("1", "1", "1", "n", "5"),
         (),
         verifier=verifier,
     )
@@ -430,12 +430,55 @@ def test_the_channels_step_is_explicitly_skippable(tmp_path: Path) -> None:
     assert "Setup complete" in displayed
 
 
+def test_the_connector_loop_lists_connectors_and_refuses_unavailable_ones(
+    tmp_path: Path,
+) -> None:
+    verifier = RecordingKeyVerifier()
+
+    result, _, messages = run_setup(
+        tmp_path,
+        ("1", "1", "1", "n", "2", "", "n"),
+        ("bot-token",),
+        verifier=verifier,
+    )
+
+    displayed = "\n".join(messages)
+    assert "Choose a channel connector:" in displayed
+    assert "1. Telegram" in displayed
+    assert "2. Discord" in displayed
+    assert "3. WhatsApp" in displayed
+    assert "4. Slack" in displayed
+    assert "5. Skip" in displayed
+    assert "Discord is coming later" in displayed
+    assert "Telegram is paired as @reckoning_test_bot" in displayed
+    assert result.telegram is not None
+    assert TelegramPollingSettings.load(tmp_path / "telegram.json") == result.telegram
+
+
+def test_the_connector_loop_can_set_up_another_channel_after_telegram(
+    tmp_path: Path,
+) -> None:
+    verifier = RecordingKeyVerifier()
+
+    result, _, messages = run_setup(
+        tmp_path,
+        ("1", "1", "1", "n", "", "y", "3", "5"),
+        ("bot-token",),
+        verifier=verifier,
+    )
+
+    displayed = "\n".join(messages)
+    assert "WhatsApp is coming later" in displayed
+    assert result.telegram is not None
+    assert "Setup complete" in displayed
+
+
 def test_the_persona_step_offers_only_the_three_presets(tmp_path: Path) -> None:
     verifier = RecordingKeyVerifier()
 
     _, _, messages = run_setup(
         tmp_path,
-        ("1", "2", "1", "n", "n"),
+        ("1", "2", "1", "n", "5"),
         (),
         verifier=verifier,
     )
@@ -459,7 +502,7 @@ def test_the_wizard_authors_an_original_persona_without_tuning_prompts(
 
     result, _, messages = run_setup(
         tmp_path,
-        ("1", "3", "clear-eyed", "Clear Eyed", "1", "n", "n"),
+        ("1", "3", "clear-eyed", "Clear Eyed", "1", "n", "5"),
         (),
         verifier=verifier,
     )
@@ -497,7 +540,7 @@ def test_the_proof_step_reports_incomplete_and_points_at_doctor(
     with pytest.raises(SetupIncompleteError) as failure:
         run_setup(
             tmp_path,
-            ("1", "1", "1", "n", "n"),
+            ("1", "1", "1", "n", "5"),
             (),
             verifier=verifier,
             application_factory=failing_factory,
@@ -524,7 +567,7 @@ def test_the_proof_step_fails_when_the_record_does_not_confirm(
     with pytest.raises(SetupIncompleteError, match="did not confirm"):
         run_setup(
             tmp_path,
-            ("1", "1", "1", "n", "n"),
+            ("1", "1", "1", "n", "5"),
             (),
             verifier=verifier,
             application_factory=unconfirmable_factory,
@@ -549,7 +592,7 @@ def test_the_proof_step_fails_when_the_store_does_not_survive_reopening(
     with pytest.raises(SetupIncompleteError, match="incomplete"):
         run_setup(
             tmp_path,
-            ("1", "1", "1", "n", "n"),
+            ("1", "1", "1", "n", "5"),
             (),
             verifier=verifier,
             application_factory=losing_store_factory,
@@ -618,7 +661,7 @@ def test_non_interactive_setup_matches_the_interactive_on_disk_result(
     interactive_root.mkdir()
     run_setup(
         interactive_root,
-        ("1", "1", "1", "n", "n"),
+        ("1", "1", "1", "n", "5"),
         (),
         verifier=verifier,
     )

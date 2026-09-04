@@ -113,7 +113,7 @@ def test_help_renders_rich_panels() -> None:
 def test_the_interactive_wizard_renders_through_rich(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    answers = iter(("1", "1", "1", "n", "n"))
+    answers = iter(("1", "1", "1", "n", "5"))
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
 
     returncode, stdout, _ = run_dispatcher(
