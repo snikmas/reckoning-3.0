@@ -27,7 +27,10 @@ Run the setup wizard:
 reckoning setup
 ```
 
-The channels step is the last interactive step and is skippable. Fake uses
+The channels step is the last interactive step and is skippable. It lists
+Telegram, Discord, WhatsApp, and Slack; only Telegram is selectable today, the
+others report that they are coming later, and Skip finishes setup without
+channels. Fake uses
 deterministic local replies and does not need a provider API key.
 DeepSeek and OrcaRouter ask for the provider API key with hidden input and
 verify the key against the provider. If verification fails, the command offers
