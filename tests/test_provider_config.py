@@ -168,16 +168,15 @@ def test_credential_store_round_trips_providers_and_the_default(
     store.save(credentials_path)
 
     assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
-    assert json.loads(credentials_path.read_text(encoding="utf-8")) == {
-        "default_provider": "orcarouter",
-        "providers": {
-            "deepseek": "sk-deepseek",
-            "orcarouter": "sk-orca",
-        },
-    }
+    saved = json.loads(credentials_path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+    assert saved["default_provider"] == "orcarouter"
+    assert saved["providers"]["deepseek"]["secret"] == "sk-deepseek"
+    assert saved["providers"]["deepseek"]["verified"] is True
+    assert saved["providers"]["orcarouter"]["secret"] == "sk-orca"
 
     loaded = ProviderCredentialStore.load(credentials_path)
-    assert loaded.providers == {"deepseek": "sk-deepseek", "orcarouter": "sk-orca"}
+    assert set(loaded.providers) == {"deepseek", "orcarouter"}
     assert loaded.default_provider == "orcarouter"
     assert loaded.api_key_for("deepseek") == "sk-deepseek"
     assert loaded.api_key_for("orcarouter") == "sk-orca"
@@ -200,16 +199,17 @@ def test_credential_store_loads_and_migrates_the_legacy_single_slot_file(
     write_legacy_credentials(credentials_path, "deepseek", "legacy-key")
 
     loaded = ProviderCredentialStore.load(credentials_path)
-    assert loaded.providers == {"deepseek": "legacy-key"}
+    assert loaded.api_key_for("deepseek") == "legacy-key"
     assert loaded.default_provider == "deepseek"
 
     loaded.set_key("orcarouter", "new-key")
     loaded.save(credentials_path)
 
-    assert json.loads(credentials_path.read_text(encoding="utf-8")) == {
-        "default_provider": "deepseek",
-        "providers": {"deepseek": "legacy-key", "orcarouter": "new-key"},
-    }
+    saved = json.loads(credentials_path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+    assert saved["default_provider"] == "deepseek"
+    assert saved["providers"]["deepseek"]["secret"] == "legacy-key"
+    assert saved["providers"]["orcarouter"]["secret"] == "new-key"
     migrated = DeepSeekSettings.load(
         tmp_path / "missing.env", environ={}, credential_file=credentials_path
     )
@@ -226,7 +226,8 @@ def test_credential_store_removes_a_provider_and_recovers_the_default(
 
     assert store.remove("deepseek") is True
     assert store.remove("deepseek") is False
-    assert store.providers == {"orcarouter": "sk-orca"}
+    assert set(store.providers) == {"orcarouter"}
+    assert store.api_key_for("orcarouter") == "sk-orca"
     assert store.default_provider == "orcarouter"
 
 
@@ -250,7 +251,8 @@ def test_credential_store_ignores_unknown_providers_and_missing_keys(
 
     loaded = ProviderCredentialStore.load(credentials_path)
 
-    assert loaded.providers == {"orcarouter": "sk-orca"}
+    assert set(loaded.providers) == {"orcarouter"}
+    assert loaded.api_key_for("orcarouter") == "sk-orca"
     assert loaded.default_provider == "orcarouter"
 
 
@@ -262,6 +264,7 @@ def test_an_empty_credential_store_saves_with_a_null_default(
     ProviderCredentialStore().save(credentials_path)
 
     assert json.loads(credentials_path.read_text(encoding="utf-8")) == {
+        "schema_version": 2,
         "default_provider": None,
         "providers": {},
     }
@@ -291,3 +294,55 @@ def test_default_provider_name_is_none_without_a_credential_file(
     tmp_path: Path,
 ) -> None:
     assert default_provider_name(tmp_path / "provider.json") is None
+
+
+def test_an_environment_reference_is_stored_without_copying_its_value(
+    tmp_path: Path,
+) -> None:
+    credentials_path = tmp_path / "provider.json"
+    store = ProviderCredentialStore()
+    store.set_env_reference("deepseek", "DEEPSEEK_API_KEY")
+    store.save(credentials_path)
+
+    raw = credentials_path.read_text(encoding="utf-8")
+    assert "sk-real-secret" not in raw
+    assert "env:DEEPSEEK_API_KEY" in raw
+
+    loaded = ProviderCredentialStore.load(credentials_path)
+    assert loaded.api_key_for("deepseek") is None
+    assert (
+        loaded.api_key_for("deepseek", environ={"DEEPSEEK_API_KEY": "sk-real-secret"})
+        == "sk-real-secret"
+    )
+
+
+def test_an_unverified_credential_is_inactive_until_verified(tmp_path: Path) -> None:
+    store = ProviderCredentialStore()
+    store.set_key("deepseek", "sk-pending", verified=False)
+
+    assert store.api_key_for("deepseek") == "sk-pending"
+    assert store.is_active("deepseek") is False
+
+    store.mark_verified("deepseek")
+    assert store.is_active("deepseek") is True
+
+    store.save(tmp_path / "provider.json")
+    loaded = ProviderCredentialStore.load(tmp_path / "provider.json")
+    assert loaded.is_active("deepseek") is True
+    assert loaded.credential_for("deepseek") is not None
+    assert loaded.credential_for("deepseek").verified_at  # type: ignore[union-attr]
+
+
+def test_an_unverified_saved_credential_survives_a_round_trip(tmp_path: Path) -> None:
+    credentials_path = tmp_path / "provider.json"
+    store = ProviderCredentialStore()
+    store.set_key("deepseek", "sk-pending", model="deepseek-chat", verified=False)
+    store.save(credentials_path)
+
+    loaded = ProviderCredentialStore.load(credentials_path)
+    entry = loaded.credential_for("deepseek")
+    assert entry is not None
+    assert entry.verified is False
+    assert entry.verified_at is None
+    assert entry.model == "deepseek-chat"
+    assert loaded.is_active("deepseek") is False
