@@ -148,6 +148,27 @@ def run_setup(
     return result, secret_prompts, messages
 
 
+def test_saved_credentials_alone_do_not_make_a_fresh_installation_configured(
+    tmp_path: Path,
+) -> None:
+    credentials = ProviderCredentialStore(
+        providers={"deepseek": "saved-key"},
+        default_provider="deepseek",
+    )
+    credentials.save(tmp_path / "provider.json")
+
+    result, _, messages = run_setup(
+        tmp_path,
+        ("1", "1", "1", "n", "5"),
+        (),
+        verifier=RecordingKeyVerifier(),
+    )
+
+    assert result.provider_name == "fake"
+    assert "What do you want to change?" not in "\n".join(messages)
+    assert (tmp_path / "data" / "instance.json").exists()
+
+
 def test_setup_verifies_and_saves_a_deepseek_key_with_owner_only_permissions(
     tmp_path: Path,
 ) -> None:
