@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
@@ -68,6 +68,128 @@ _SENSITIVE_INSTRUCTIONS: dict[SensitiveTopicHandling, str] = {
     "calm": "On sensitive topics, use a calm and steady tone.",
     "practical": "On sensitive topics, focus on practical next steps.",
 }
+
+
+@dataclass(frozen=True)
+class PersonaAxisChoice:
+    value: str
+    explanation: str
+    example: str
+
+
+@dataclass(frozen=True)
+class PersonaAxis:
+    field: str
+    label: str
+    choices: tuple[PersonaAxisChoice, ...]
+
+
+PERSONA_AXES: tuple[PersonaAxis, ...] = (
+    PersonaAxis(
+        "voice",
+        "Voice — how the agent sounds overall",
+        (
+            PersonaAxisChoice("composed", "Calm and measured.", "“Here is the situation, plainly.”"),
+            PersonaAxisChoice("reflective", "Thinks out loud with you.", "“Let us look at what changed.”"),
+            PersonaAxisChoice("formal", "Precise and structured.", "“Your options are as follows.”"),
+            PersonaAxisChoice("candid", "Casual and unvarnished.", "“Honestly, that plan is thin.”"),
+            PersonaAxisChoice("energetic", "Upbeat and forward-moving.", "“Good — now the next move.”"),
+        ),
+    ),
+    PersonaAxis(
+        "directness",
+        "Directness — how plainly it states recommendations",
+        (
+            PersonaAxisChoice("gentle", "Softens recommendations.", "“You might consider waiting.”"),
+            PersonaAxisChoice("balanced", "Plain without pressure.", "“Waiting is the safer option.”"),
+            PersonaAxisChoice("direct", "States the recommendation.", "“Wait. Do not commit yet.”"),
+            PersonaAxisChoice("severe", "Attacks weak reasoning hard.", "“That argument does not hold.”"),
+        ),
+    ),
+    PersonaAxis(
+        "warmth",
+        "Warmth — how much personal warmth it shows",
+        (
+            PersonaAxisChoice("reserved", "Keeps distance.", "“Noted. Continue.”"),
+            PersonaAxisChoice("balanced", "Friendly but focused.", "“Good progress. Continue.”"),
+            PersonaAxisChoice("warm", "Openly supportive.", "“That was a hard week — well held.”"),
+        ),
+    ),
+    PersonaAxis(
+        "humor",
+        "Humor — whether it jokes",
+        (
+            PersonaAxisChoice("none", "No humor.", "“The deadline moved to Friday.”"),
+            PersonaAxisChoice("dry", "Occasional dry wit.", "“Friday, again. Predictably.”"),
+            PersonaAxisChoice("light", "Light humor when it helps.", "“Friday has escaped once more.”"),
+        ),
+    ),
+    PersonaAxis(
+        "challenge",
+        "Challenge — how hard it pushes your reasoning",
+        (
+            PersonaAxisChoice("supportive", "Encourages first.", "“You have thought this through.”"),
+            PersonaAxisChoice("probing", "Asks pointed questions.", "“What evidence changed?”"),
+            PersonaAxisChoice("demanding", "Requires solid reasons.", "“Show me why this works.”"),
+            PersonaAxisChoice("uncomfortable", "Names what you avoid.", "“You are avoiding the real choice.”"),
+        ),
+    ),
+    PersonaAxis(
+        "sensitive_topic_handling",
+        "Sensitive topics — how it handles hard personal subjects",
+        (
+            PersonaAxisChoice("warm", "Warm and concrete.", "“That sounds painful; here is what helps.”"),
+            PersonaAxisChoice("calm", "Calm and steady.", "“We can take this one step at a time.”"),
+            PersonaAxisChoice("practical", "Focuses on next steps.", "“The practical next step is this.”"),
+        ),
+    ),
+)
+
+AUTONOMY_FLOOR: tuple[str, ...] = (
+    "Truthfulness: the agent does not lie to you, whatever the persona.",
+    "Permissions: no persona can widen what the agent may do.",
+    "Memory confirmation: personal records are confirmed only by you.",
+    "User authority: you always keep the final decision.",
+    "Relational rules: no dependence, exclusivity, or isolation — ever.",
+)
+
+
+def blank_persona_template(persona_id: str, name: str) -> PersonaDefinition:
+    """A balanced starting point for an authored persona."""
+    return PersonaDefinition(
+        id=persona_id,
+        name=name,
+        voice="composed",
+        directness="balanced",
+        warmth="balanced",
+        humor="none",
+        challenge="probing",
+        sensitive_topic_handling="calm",
+    )
+
+
+def persona_from_preset(
+    preset_id: str,
+    new_id: str,
+    new_name: str,
+    *,
+    defaults: tuple[PersonaDefinition, ...] | None = None,
+) -> PersonaDefinition:
+    presets = DEFAULT_PERSONAS if defaults is None else defaults
+    preset = next((item for item in presets if item.id == preset_id), None)
+    if preset is None:
+        raise KeyError(f"Unknown persona preset: {preset_id}")
+    return replace(preset, id=new_id, name=new_name)
+
+
+def describe_persona(definition: PersonaDefinition) -> tuple[str, ...]:
+    """A deterministic plain-language preview; no provider is involved."""
+    lines = [f"{definition.name} speaks like this:"]
+    for axis in PERSONA_AXES:
+        value = getattr(definition, axis.field)
+        choice = next(item for item in axis.choices if item.value == value)
+        lines.append(f"- {axis.label.split(' — ')[0]}: {choice.explanation} {choice.example}")
+    return tuple(lines)
 
 
 def _allowed(value: str, options: Collection[str], label: str) -> None:
@@ -197,6 +319,8 @@ class PersonaRepository(Protocol):
 
     def list_authored(self) -> tuple[PersonaDefinition, ...]: ...
 
+    def remove_authored(self, persona_id: str) -> bool: ...
+
     def set_active(self, persona_id: str) -> None: ...
 
     def active_id(self) -> str | None: ...
@@ -212,6 +336,9 @@ class InMemoryPersonaRepository:
 
     def list_authored(self) -> tuple[PersonaDefinition, ...]:
         return tuple(self._authored.values())
+
+    def remove_authored(self, persona_id: str) -> bool:
+        return self._authored.pop(persona_id, None) is not None
 
     def set_active(self, persona_id: str) -> None:
         self._active_id = persona_id
@@ -259,6 +386,12 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
         super().save_authored(definition)
         self._flush()
 
+    def remove_authored(self, persona_id: str) -> bool:
+        removed = super().remove_authored(persona_id)
+        if removed:
+            self._flush()
+        return removed
+
     def set_active(self, persona_id: str) -> None:
         super().set_active(persona_id)
         self._flush()
@@ -296,6 +429,49 @@ class PersonaService:
             raise ValueError("An authored persona cannot replace a default persona.")
         self._repository.save_authored(definition)
         return self.select(definition.id)
+
+    def is_default(self, persona_id: str) -> bool:
+        return persona_id in self._defaults
+
+    def duplicate(
+        self, source_id: str, new_id: str, new_name: str
+    ) -> PersonaDefinition:
+        """Copy any persona into an authored one; presets stay immutable."""
+        source = self._find(source_id)
+        if new_id in self._defaults:
+            raise ValueError("A duplicate cannot replace a default persona.")
+        authored = {item.id: item for item in self._repository.list_authored()}
+        if new_id in authored:
+            raise ValueError(f"A persona already exists with id: {new_id}")
+        copy = replace(source, id=new_id, name=new_name)
+        self._repository.save_authored(copy)
+        return copy
+
+    def update_authored(self, definition: PersonaDefinition) -> None:
+        if definition.id in self._defaults:
+            raise ValueError("Built-in persona presets are immutable.")
+        authored = {item.id: item for item in self._repository.list_authored()}
+        if definition.id not in authored:
+            raise KeyError(f"Unknown persona: {definition.id}")
+        self._repository.save_authored(definition)
+
+    def rename_authored(self, persona_id: str, new_name: str) -> PersonaDefinition:
+        definition = self._find(persona_id)
+        if persona_id in self._defaults:
+            raise ValueError("Built-in persona presets are immutable.")
+        renamed = replace(definition, name=new_name)
+        self._repository.save_authored(renamed)
+        return renamed
+
+    def remove_authored(self, persona_id: str) -> None:
+        if persona_id in self._defaults:
+            raise ValueError("Built-in persona presets cannot be removed.")
+        if self._repository.active_id() == persona_id:
+            raise ValueError(
+                "The active persona must be replaced before it can be removed."
+            )
+        if not self._repository.remove_authored(persona_id):
+            raise KeyError(f"Unknown persona: {persona_id}")
 
     def select(self, persona_id: str) -> SelectedPersona:
         definition = self._find(persona_id)
