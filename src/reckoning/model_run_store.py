@@ -8,12 +8,12 @@ from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from reckoning.json_store import atomic_write_json, read_json
 
 if TYPE_CHECKING:
-    from reckoning.application import ModelRunRecord
+    from reckoning.application import ModelRunRecord, ModelRunUsageStatus
 
 
 ROOT_DATABASE_FILENAME = "reckoning.sqlite3"
@@ -50,8 +50,9 @@ class SQLiteModelRunRepository:
                     input_tokens,
                     output_tokens,
                     billable_units,
+                    usage_status,
                     failure
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.id,
@@ -65,6 +66,7 @@ class SQLiteModelRunRepository:
                     run.input_tokens,
                     run.output_tokens,
                     run.billable_units,
+                    run.usage_status,
                     run.failure,
                 ),
             )
@@ -87,6 +89,7 @@ class SQLiteModelRunRepository:
                     input_tokens,
                     output_tokens,
                     billable_units,
+                    usage_status,
                     failure
                 FROM model_runs
                 ORDER BY sequence
@@ -105,7 +108,8 @@ class SQLiteModelRunRepository:
                 input_tokens=int(row[8]),
                 output_tokens=int(row[9]),
                 billable_units=int(row[10]),
-                failure=str(row[11]) if row[11] is not None else None,
+                usage_status=row[11],
+                failure=str(row[12]) if row[12] is not None else None,
             )
             for row in rows
         )
@@ -276,6 +280,9 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
             output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
             billable_units INTEGER NOT NULL CHECK (billable_units >= 0),
+            usage_status TEXT NOT NULL CHECK (
+                usage_status IN ('reported', 'not-billable', 'unknown')
+            ),
             failure TEXT
         )
         """
@@ -333,7 +340,12 @@ def _load_legacy_runs(
     data = read_json(path, default={})
     if data.get("schema_version") == 2 and data.get("authority") == "sqlite":
         data = read_json(_rollback_path(path), default={})
-    if data.get("schema_version") != 1 or not isinstance(data.get("runs"), list):
+    raw_runs = data.get("runs")
+    if (
+        data.get("schema_version") != 1
+        or not isinstance(raw_runs, list)
+        or any(not isinstance(item, dict) for item in raw_runs)
+    ):
         raise RuntimeError("Unsupported model-run storage schema.")
     runs = tuple(
         ModelRunRecord(
@@ -348,9 +360,10 @@ def _load_legacy_runs(
             input_tokens=int(item["input_tokens"]),
             output_tokens=int(item["output_tokens"]),
             billable_units=int(item["billable_units"]),
+            usage_status=_legacy_usage_status(item),
             failure=str(item["failure"]) if item.get("failure") else None,
         )
-        for item in data["runs"]
+        for item in raw_runs
     )
     _validate_records(runs)
     canonical = json.dumps(
@@ -367,6 +380,7 @@ def _validate_records(runs: tuple[ModelRunRecord, ...]) -> None:
         raise ValueError("Model-run identifiers must be unique and nonempty.")
     if any(
         run.status not in {"succeeded", "failed", "limited"}
+        or run.usage_status not in {"reported", "not-billable", "unknown"}
         or not run.provider
         or not run.model
         or min(
@@ -391,6 +405,22 @@ def _preserve_legacy_rollback(path: Path, data: dict[str, Any]) -> None:
         return
     atomic_write_json(rollback, data)
     rollback.chmod(0o400)
+
+
+def _legacy_usage_status(item: dict[str, Any]) -> ModelRunUsageStatus:
+    stored = item.get("usage_status")
+    if stored in {"reported", "not-billable", "unknown"}:
+        return cast("ModelRunUsageStatus", stored)
+    usage = (
+        int(item["input_tokens"]),
+        int(item["output_tokens"]),
+        int(item["billable_units"]),
+    )
+    if any(value > 0 for value in usage):
+        return "reported"
+    if str(item["provider"]) == "fake":
+        return "not-billable"
+    return "unknown"
 
 
 def _rollback_path(path: Path) -> Path:
@@ -437,8 +467,8 @@ def _insert_run(connection: sqlite3.Connection, run: ModelRunRecord) -> None:
         """
         INSERT INTO model_runs (
             id, requested_at, status, provider, model, model_calls, latency_ms,
-            retries, input_tokens, output_tokens, billable_units, failure
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            retries, input_tokens, output_tokens, billable_units, usage_status, failure
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             values["id"],
@@ -452,6 +482,7 @@ def _insert_run(connection: sqlite3.Connection, run: ModelRunRecord) -> None:
             values["input_tokens"],
             values["output_tokens"],
             values["billable_units"],
+            values["usage_status"],
             values["failure"],
         ),
     )
