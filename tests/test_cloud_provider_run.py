@@ -108,6 +108,7 @@ def test_orcarouter_uses_same_boundary_and_records_billable_units() -> None:
         "input_tokens": 120,
         "output_tokens": 9,
         "billable_units": 129,
+        "usage_status": "reported",
         "failure": None,
     }
 
@@ -166,6 +167,7 @@ def test_provider_failure_is_recorded_and_never_becomes_a_completed_answer() -> 
     assert run.status == "failed"
     assert run.model_calls == 2
     assert run.retries == 1
+    assert run.usage_status == "unknown"
     assert run.failure == "OrcaRouter could not be reached: offline"
     assert [message.role for message in application.open_session()] == ["user"]
 

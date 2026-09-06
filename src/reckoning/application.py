@@ -119,6 +119,7 @@ class ConversationStorage(Protocol):
 
 
 ModelRunStatus = Literal["succeeded", "failed", "limited"]
+ModelRunUsageStatus = Literal["reported", "not-billable", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ class ModelRunRecord:
     input_tokens: int
     output_tokens: int
     billable_units: int
+    usage_status: ModelRunUsageStatus
     failure: str | None = None
 
 
@@ -365,20 +367,7 @@ class ReckoningApplication:
                 )
             except ProviderFailure as error:
                 self._dependencies.model_runs.save_run(
-                    ModelRunRecord(
-                        id=self._dependencies.identifiers.new(),
-                        requested_at=requested_at,
-                        status="failed",
-                        provider=error.provider,
-                        model=error.model,
-                        model_calls=error.model_calls,
-                        latency_ms=error.latency_ms,
-                        retries=error.retries,
-                        input_tokens=0,
-                        output_tokens=0,
-                        billable_units=0,
-                        failure=str(error),
-                    )
+                    self._failed_run_record(error, requested_at=requested_at)
                 )
                 if persist_session:
                     self._dependencies.storage.append(
@@ -816,6 +805,12 @@ class ReckoningApplication:
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
             billable_units=response.usage.total_tokens,
+            usage_status=self._usage_status(
+                response.provider,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                response.usage.total_tokens,
+            ),
             failure=failure,
         )
 
@@ -839,6 +834,12 @@ class ReckoningApplication:
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
             billable_units=result.billable_units,
+            usage_status=self._usage_status(
+                result.provider,
+                result.input_tokens,
+                result.output_tokens,
+                result.billable_units,
+            ),
             failure=failure,
         )
 
@@ -857,8 +858,22 @@ class ReckoningApplication:
             input_tokens=0,
             output_tokens=0,
             billable_units=0,
+            usage_status="unknown",
             failure=str(error),
         )
+
+    @staticmethod
+    def _usage_status(
+        provider: str,
+        input_tokens: int,
+        output_tokens: int,
+        billable_units: int,
+    ) -> ModelRunUsageStatus:
+        if any(value > 0 for value in (input_tokens, output_tokens, billable_units)):
+            return "reported"
+        if provider == "fake":
+            return "not-billable"
+        return "unknown"
 
 
 class SystemClock:

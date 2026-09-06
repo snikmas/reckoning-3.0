@@ -81,6 +81,7 @@ def test_independent_applications_preserve_each_model_run(tmp_path: Path) -> Non
     assert len({run.id for run in runs}) == 2
     assert [run.status for run in runs] == ["succeeded", "succeeded"]
     assert [run.provider for run in runs] == ["fake", "fake"]
+    assert [run.usage_status for run in runs] == ["not-billable", "not-billable"]
     assert len(first.inspect_model_runs()) == 2
 
 
@@ -169,6 +170,7 @@ def test_existing_receipts_migrate_once_without_losing_fields(tmp_path: Path) ->
             "input_tokens": 11,
             "output_tokens": 7,
             "billable_units": 18,
+            "usage_status": "reported",
             "failure": None,
         },
         {
@@ -183,6 +185,7 @@ def test_existing_receipts_migrate_once_without_losing_fields(tmp_path: Path) ->
             "input_tokens": 11,
             "output_tokens": 7,
             "billable_units": 18,
+            "usage_status": "reported",
             "failure": "Provider outcome and cost are uncertain.",
         },
     ]
