@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import stat
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
-import json
-import os
 from pathlib import Path, PurePosixPath
-import shutil
-import stat
 from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any, Literal, Protocol
 
@@ -16,7 +16,11 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
-from reckoning.application import PersonaSettings, PlacementState, create_local_application
+from reckoning.application import (
+    PersonaSettings,
+    PlacementState,
+    create_local_application,
+)
 from reckoning.interfaces import (
     NodeAvailabilitySource,
     NodeName,
@@ -24,17 +28,22 @@ from reckoning.interfaces import (
     SourcePlacement,
 )
 from reckoning.json_store import atomic_write_json, read_json
-from reckoning.personas import (
-    DEFAULT_PERSONAS,
-    JsonFilePersonaRepository,
-    PersonaDefinition,
-    PersonaService,
+from reckoning.model_run_store import (
+    ROOT_DATABASE_FILENAME,
+    snapshot_database,
+    validate_database_bytes,
 )
 from reckoning.personal_context import (
     JsonFilePersonalContextRepository,
     PersonalContextService,
     UserProfileEntry,
     read_user_profile,
+)
+from reckoning.personas import (
+    DEFAULT_PERSONAS,
+    JsonFilePersonaRepository,
+    PersonaDefinition,
+    PersonaService,
 )
 
 TRANSFER_FORMAT = "reckoning-encrypted-transfer"
@@ -478,14 +487,22 @@ def create_transfer(
     rooted_files = tuple(
         (root_name, root, path)
         for root_name, root in roots
-        for path in _state_files(root)
+        for path in _transfer_state_files(root)
     )
     if not rooted_files:
-        raise OperationError("no JSON state files were found")
+        raise OperationError("no state files were found")
     entries: list[dict[str, Any]] = []
     for root_name, root, path in rooted_files:
-        _read_state_file(path)
-        content = _portable_state_content(path, root_name=root_name)
+        if path.name == ROOT_DATABASE_FILENAME:
+            try:
+                content = snapshot_database(path)
+            except (OSError, RuntimeError) as error:
+                raise OperationError(
+                    f"invalid placement-root database: {root_name}"
+                ) from error
+        else:
+            _read_state_file(path)
+            content = _portable_state_content(path, root_name=root_name)
         entries.append(
             {
                 "root": root_name,
@@ -838,6 +855,18 @@ def _state_files(data_dir: Path) -> tuple[Path, ...]:
     return files
 
 
+def _transfer_state_files(data_dir: Path) -> tuple[Path, ...]:
+    files = list(_state_files(data_dir))
+    database = data_dir / ROOT_DATABASE_FILENAME
+    if database.exists():
+        if database.is_symlink() or not database.is_file():
+            raise OperationError(
+                "the placement-root database must be a regular file"
+            )
+        files.append(database)
+    return tuple(sorted(files))
+
+
 def _read_state_file(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -966,7 +995,10 @@ def _validated_transfer_files(
             not relative_text
             or relative.is_absolute()
             or ".." in relative.parts
-            or relative.suffix != ".json"
+            or (
+                relative.suffix != ".json"
+                and relative_text != ROOT_DATABASE_FILENAME
+            )
             or f"{root_name}:{relative_text}" in seen
         ):
             raise OperationError("the transfer contains an unsafe state path")
@@ -980,12 +1012,22 @@ def _validated_transfer_files(
             "sha256"
         ):
             raise OperationError("the transfer state checksum does not match")
-        try:
-            data = json.loads(content.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise OperationError("the transfer contains invalid JSON state") from error
-        if not isinstance(data, dict):
-            raise OperationError("transferred JSON state must be an object")
+        if relative_text == ROOT_DATABASE_FILENAME:
+            try:
+                validate_database_bytes(content)
+            except RuntimeError as error:
+                raise OperationError(
+                    "the transfer contains an invalid placement-root database"
+                ) from error
+        else:
+            try:
+                data = json.loads(content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise OperationError(
+                    "the transfer contains invalid JSON state"
+                ) from error
+            if not isinstance(data, dict):
+                raise OperationError("transferred JSON state must be an object")
         seen.add(f"{root_name}:{relative_text}")
         validated.append((root_name, Path(*relative.parts), content))
     roots_with_files = {root_name for root_name, _, _ in validated}

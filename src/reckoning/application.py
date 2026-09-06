@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
@@ -22,7 +22,6 @@ from reckoning.continuity import (
 )
 from reckoning.providers import ProviderFailure, ProviderResponse, ProviderUsage
 from reckoning.external_content import ExternalContentResult
-from reckoning.json_store import atomic_write_json, read_json
 from reckoning.personal_context import (
     PersonalContextService,
     PersonalContextVersion,
@@ -908,43 +907,21 @@ class InMemoryModelRunRepository:
         return tuple(self._runs)
 
 
-class JsonFileModelRunRepository(InMemoryModelRunRepository):
+class JsonFileModelRunRepository:
+    """Compatibility entry point backed by per-root transactional storage."""
+
     def __init__(self, path: Path) -> None:
-        super().__init__()
-        self._path = path
-        data = read_json(path, default={"schema_version": 1, "runs": []})
-        if data.get("schema_version") != 1:
-            raise RuntimeError("Unsupported model-run storage schema.")
-        self._runs = [
-            ModelRunRecord(
-                id=str(item["id"]),
-                requested_at=datetime.fromisoformat(str(item["requested_at"])),
-                status=item["status"],
-                provider=str(item["provider"]),
-                model=str(item["model"]),
-                model_calls=int(item["model_calls"]),
-                latency_ms=int(item["latency_ms"]),
-                retries=int(item["retries"]),
-                input_tokens=int(item["input_tokens"]),
-                output_tokens=int(item["output_tokens"]),
-                billable_units=int(item["billable_units"]),
-                failure=str(item["failure"]) if item.get("failure") else None,
-            )
-            for item in data["runs"]
-        ]
+        from reckoning.model_run_store import SQLiteModelRunRepository
+
+        self._repository = SQLiteModelRunRepository(path)
 
     def save_run(self, run: ModelRunRecord) -> None:
-        super().save_run(run)
-        atomic_write_json(
-            self._path,
-            {
-                "schema_version": 1,
-                "runs": [
-                    {**asdict(item), "requested_at": item.requested_at.isoformat()}
-                    for item in self._runs
-                ],
-            },
-        )
+        self._repository.save_run(run)
+
+    def list_runs(self) -> tuple[ModelRunRecord, ...]:
+        return self._repository.list_runs()
+
+
 def create_local_application(
     data_path: Path | None = None,
     *,
