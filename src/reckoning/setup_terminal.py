@@ -242,8 +242,22 @@ class InteractiveUI(PlainTextUI):
         selectable = [index for index, entry in enumerate(entries) if entry[2]]
         position = selectable[0]
 
-        def render() -> None:
-            self._output(prompt)
+        # Frame height: prompt + one line per entry + the hint line.
+        frame_height = len(entries) + 2
+        # Extra lines printed below the frame (help text); the next redraw
+        # must travel up over them too.
+        extra_lines = 0
+
+        def render(*, redraw: bool) -> None:
+            nonlocal extra_lines
+            if redraw:
+                # Cursor up to the top of the previous frame and clear
+                # everything below, so re-renders replace instead of stack.
+                up = frame_height + extra_lines
+                extra_lines = 0
+                self._output(f"\x1b[{up}A\x1b[J{prompt}")
+            else:
+                self._output(prompt)
             for index, (option_id, label, enabled) in enumerate(entries):
                 if not enabled:
                     self._output(self._color(f"    {label}", "2"))
@@ -257,10 +271,16 @@ class InteractiveUI(PlainTextUI):
             )
 
         stream: Any = self._stream
-        render()
+        render(redraw=False)
         old_settings = termios.tcgetattr(stream)
         try:
-            tty.setraw(stream.fileno())
+            # Read keys immediately without disabling the terminal's output
+            # newline handling. tty.setraw() changes both input and output,
+            # which makes each redrawn line continue at the previous column.
+            input_settings = termios.tcgetattr(stream)
+            tty.cfmakeraw(input_settings)
+            input_settings[1] = old_settings[1]
+            termios.tcsetattr(stream, termios.TCSAFLUSH, input_settings)
             while True:
                 char = os.read(stream.fileno(), 1)
                 if char == b"\x1b":
@@ -271,14 +291,14 @@ class InteractiveUI(PlainTextUI):
                     elif rest == b"[B":  # down
                         current = selectable.index(position)
                         position = selectable[(current + 1) % len(selectable)]
-                    self._output("")
-                    render()
+                    render(redraw=True)
                 elif char in (b"\r", b"\n"):
                     break
                 elif char == b"?":
+                    text = help_text or HELP_HINT
                     self._output("")
-                    self._output(help_text or HELP_HINT)
-                    render()
+                    self._output(text)
+                    extra_lines += text.count("\n") + 2
                 elif char == b"\x03":  # Ctrl+C
                     raise SetupExit
         finally:
