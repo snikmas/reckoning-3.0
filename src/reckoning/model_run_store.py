@@ -11,13 +11,21 @@ from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, cast
 
 from reckoning.json_store import atomic_write_json, read_json
+from reckoning.root_database import (
+    ROOT_DATABASE_FILENAME,
+    ROOT_DATABASE_SCHEMA_VERSION,
+    connect_database,
+    ensure_root_schema,
+    logical_root_for,
+    metadata,
+    set_metadata,
+    table_exists,
+)
 
 if TYPE_CHECKING:
     from reckoning.application import ModelRunRecord, ModelRunUsageStatus
 
 
-ROOT_DATABASE_FILENAME = "reckoning.sqlite3"
-ROOT_DATABASE_SCHEMA_VERSION = "1"
 MODEL_RUN_SCHEMA_VERSION = "1"
 
 
@@ -26,7 +34,7 @@ class SQLiteModelRunRepository:
 
     def __init__(self, legacy_path: Path) -> None:
         self._legacy_path = legacy_path
-        self._root = _logical_root_for(legacy_path)
+        self._root = logical_root_for(legacy_path)
         self._path = self._root / ROOT_DATABASE_FILENAME
         self._initialize_or_migrate()
 
@@ -35,7 +43,7 @@ class SQLiteModelRunRepository:
         return self._path
 
     def save_run(self, run: ModelRunRecord) -> None:
-        with closing(_connect(self._path)) as connection, connection:
+        with closing(connect_database(self._path)) as connection, connection:
             connection.execute(
                 """
                 INSERT INTO model_runs (
@@ -74,7 +82,7 @@ class SQLiteModelRunRepository:
     def list_runs(self) -> tuple[ModelRunRecord, ...]:
         from reckoning.application import ModelRunRecord
 
-        with closing(_connect(self._path)) as connection:
+        with closing(connect_database(self._path)) as connection:
             rows = connection.execute(
                 """
                 SELECT
@@ -135,18 +143,18 @@ class SQLiteModelRunRepository:
             _write_legacy_authority(self._legacy_path, state="migration-pending")
 
         self._root.mkdir(parents=True, exist_ok=True)
-        with closing(_connect(self._path)) as connection:
+        with closing(connect_database(self._path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                current_version = _metadata(connection, "model_runs_schema_version")
-                if current_version is not None and not _table_exists(
+                current_version = metadata(connection, "model_runs_schema_version")
+                if current_version is not None and not table_exists(
                     connection, "model_runs"
                 ):
                     raise RuntimeError(
                         "Model-run schema authority has no record table."
                     )
                 _create_schema(connection)
-                current_version = _metadata(connection, "model_runs_schema_version")
+                current_version = metadata(connection, "model_runs_schema_version")
                 if current_version not in (None, MODEL_RUN_SCHEMA_VERSION):
                     raise RuntimeError("Unsupported model-run storage schema.")
                 if current_version is None:
@@ -161,12 +169,12 @@ class SQLiteModelRunRepository:
                         )
                     for run in legacy_runs:
                         _insert_run(connection, run)
-                    _set_metadata(
+                    set_metadata(
                         connection,
                         "model_runs_schema_version",
                         MODEL_RUN_SCHEMA_VERSION,
                     )
-                    _set_metadata(
+                    set_metadata(
                         connection,
                         "model_runs_legacy_sha256",
                         legacy_digest or "not-required",
@@ -205,6 +213,8 @@ def snapshot_database(path: Path) -> bytes:
 
 
 def validate_database(path: Path) -> None:
+    from reckoning.personal_context import validate_personal_context_schema
+
     try:
         connection = sqlite3.connect(
             f"{path.resolve().as_uri()}?mode=ro",
@@ -214,15 +224,16 @@ def validate_database(path: Path) -> None:
             integrity = connection.execute("PRAGMA integrity_check").fetchone()
             if integrity is None or integrity[0] != "ok":
                 raise RuntimeError("SQLite integrity check failed.")
-            root_version = _metadata(connection, "root_schema_version")
-            model_run_version = _metadata(connection, "model_runs_schema_version")
+            root_version = metadata(connection, "root_schema_version")
+            model_run_version = metadata(connection, "model_runs_schema_version")
             if root_version != ROOT_DATABASE_SCHEMA_VERSION:
                 raise RuntimeError("Unsupported placement-root database schema.")
             if model_run_version not in (None, MODEL_RUN_SCHEMA_VERSION):
                 raise RuntimeError("Unsupported model-run storage schema.")
-            has_model_runs = _table_exists(connection, "model_runs")
+            has_model_runs = table_exists(connection, "model_runs")
             if (model_run_version is None) != (not has_model_runs):
                 raise RuntimeError("Incomplete model-run storage schema.")
+            validate_personal_context_schema(connection)
         finally:
             connection.close()
     except sqlite3.Error as error:
@@ -236,35 +247,8 @@ def validate_database_bytes(content: bytes) -> None:
         validate_database(path)
 
 
-def _logical_root_for(legacy_path: Path) -> Path:
-    state_root = legacy_path.expanduser().resolve().parent
-    if state_root.name == "confirmed-state":
-        return state_root.parent
-    return state_root
-
-
-def _connect(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path, timeout=30.0)
-    path.chmod(0o600)
-    connection.execute("PRAGMA busy_timeout = 30000")
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
-
-
 def _create_schema(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS root_metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """
-    )
-    root_version = _metadata(connection, "root_schema_version")
-    if root_version not in (None, ROOT_DATABASE_SCHEMA_VERSION):
-        raise RuntimeError("Unsupported placement-root database schema.")
-    if root_version is None:
-        _set_metadata(connection, "root_schema_version", ROOT_DATABASE_SCHEMA_VERSION)
+    ensure_root_schema(connection)
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS model_runs (
@@ -296,40 +280,16 @@ def _model_run_store_ready(path: Path) -> bool:
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         try:
             return (
-                _metadata(connection, "root_schema_version")
+                metadata(connection, "root_schema_version")
                 == ROOT_DATABASE_SCHEMA_VERSION
-                and _metadata(connection, "model_runs_schema_version")
+                and metadata(connection, "model_runs_schema_version")
                 == MODEL_RUN_SCHEMA_VERSION
-                and _table_exists(connection, "model_runs")
+                and table_exists(connection, "model_runs")
             )
         finally:
             connection.close()
     except sqlite3.Error:
         return False
-
-
-def _metadata(connection: sqlite3.Connection, key: str) -> str | None:
-    try:
-        row = connection.execute(
-            "SELECT value FROM root_metadata WHERE key = ?", (key,)
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return None
-    return str(row[0]) if row is not None else None
-
-
-def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
-    row = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
-    ).fetchone()
-    return row is not None
-
-
-def _set_metadata(connection: sqlite3.Connection, key: str, value: str) -> None:
-    connection.execute(
-        "INSERT OR REPLACE INTO root_metadata (key, value) VALUES (?, ?)",
-        (key, value),
-    )
 
 
 def _load_legacy_runs(
@@ -451,8 +411,8 @@ def _finalize_legacy_authority(database: Path, legacy_path: Path) -> None:
             _write_legacy_authority(legacy_path, state="sqlite-authoritative")
         return
     legacy_data, _, digest = _load_legacy_runs(legacy_path)
-    with closing(_connect(database)) as connection:
-        migrated_digest = _metadata(connection, "model_runs_legacy_sha256")
+    with closing(connect_database(database)) as connection:
+        migrated_digest = metadata(connection, "model_runs_legacy_sha256")
     if digest != migrated_digest:
         raise RuntimeError(
             "Legacy model-run data changed after SQLite became authoritative."

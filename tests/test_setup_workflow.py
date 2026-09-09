@@ -15,6 +15,7 @@ import pytest
 
 from reckoning.config import ProviderCredentialStore
 from reckoning.operations import setup_instance
+from reckoning.personal_context import JsonFilePersonalContextRepository
 from reckoning.provider_adapters import urlopen_transport
 from reckoning.setup_workflow import (
     MenuOption,
@@ -655,17 +656,15 @@ def test_guided_profile_answers_become_unconfirmed_proposals(
     outcome, _ = run_workflow(tmp_path, answers)
 
     assert outcome.status == "activated"
-    context = json.loads(
-        (tmp_path / "data" / "personal-context" / "personal-context.json")
-        .read_text(encoding="utf-8")
-    )
-    versions = context["versions"]
-    meanings = [item["canonical_meaning"] for item in versions]
+    versions = JsonFilePersonalContextRepository(
+        tmp_path / "data" / "personal-context" / "personal-context.json"
+    ).all_versions()
+    meanings = [item.canonical_meaning for item in versions]
     assert any("address: Mary" in meaning for meaning in meanings)
     assert any(
         "goals: Finish the semester strong" in meaning for meaning in meanings
     )
-    assert {item["status"] for item in versions} == {"proposed"}
+    assert {item.status for item in versions} == {"proposed"}
 
 
 def test_profile_import_previews_and_removes_statements(tmp_path: Path) -> None:
@@ -693,11 +692,12 @@ def test_profile_import_previews_and_removes_statements(tmp_path: Path) -> None:
     assert outcome.status == "activated"
     displayed = "\n".join(ui.lines)
     assert "Parsed statements" in displayed
-    context = json.loads(
-        (tmp_path / "data" / "personal-context" / "personal-context.json")
-        .read_text(encoding="utf-8")
+    versions = JsonFilePersonalContextRepository(
+        tmp_path / "data" / "personal-context" / "personal-context.json"
+    ).all_versions()
+    all_text = "\n".join(
+        f"{item.original_text}\n{item.canonical_meaning}" for item in versions
     )
-    all_text = json.dumps(context)
     assert "Graduate in 2028" not in all_text
     assert "computer science" in all_text
 
