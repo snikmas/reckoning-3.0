@@ -429,7 +429,12 @@ class ReckoningApplication:
         return context.list_proposed()
 
     def correct_profile_proposal(
-        self, record_id: str, text: str, *, language: str
+        self,
+        record_id: str,
+        text: str,
+        *,
+        language: str,
+        expected_revision: int | None = None,
     ) -> PersonalContextVersion:
         context = self._require_personal_context()
         return context.correct(
@@ -438,6 +443,7 @@ class ReckoningApplication:
             language=language,
             canonical_meaning=text,
             corrected_at=self._dependencies.clock.now(),
+            expected_revision=expected_revision,
         )
 
     def confirm_profile_proposal(self, record_id: str) -> PersonalContextVersion:
