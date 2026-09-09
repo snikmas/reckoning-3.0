@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import os
+import select
+import subprocess
+import sys
+import time
+from pathlib import Path
+
 import pytest
 
 from reckoning.setup_terminal import NonInteractiveUI, PlainTextUI
@@ -109,3 +116,85 @@ def test_non_interactive_ui_uses_confirm_defaults() -> None:
     assert ui.confirm("unknown", "Continue?", default=False) is False
     ui = NonInteractiveUI({"go": "yes"}, output=lambda line: None)
     assert ui.confirm("go", "Continue?", default=False) is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="arrow menus need a posix pty")
+def test_arrow_menu_is_visible_redraws_in_place_and_restores_terminal(
+    tmp_path: Path,
+) -> None:
+    import pty
+    import termios
+
+    child = """
+import sys
+from reckoning.command import main
+
+raise SystemExit(main(sys.argv[1:]))
+"""
+
+    def read_until(fd: int, marker: bytes) -> bytes:
+        output = bytearray()
+        deadline = time.monotonic() + 2
+        while marker not in output:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, f"terminal output stopped at {bytes(output)!r}"
+            readable, _, _ = select.select([fd], [], [], remaining)
+            assert readable, f"terminal output stopped at {bytes(output)!r}"
+            output.extend(os.read(fd, 4096))
+        return bytes(output)
+
+    master, slave = pty.openpty()
+    original_settings = termios.tcgetattr(slave)
+    environment = os.environ.copy()
+    environment.pop("NO_COLOR", None)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            child,
+            "setup",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--credentials",
+            str(tmp_path / "provider.json"),
+            "--telegram-config",
+            str(tmp_path / "telegram.json"),
+            "--draft-path",
+            str(tmp_path / "setup-draft.json"),
+        ],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=environment,
+        close_fds=True,
+    )
+    try:
+        # No input is sent until the complete first menu is visible.
+        initial = read_until(master, b"Enter to select\r\n")
+        assert b"Choose how to set up Reckoning" in initial
+        assert b"  > Quick Setup" in initial
+        assert process.poll() is None
+
+        deadline = time.monotonic() + 2
+        while termios.tcgetattr(slave)[3] & termios.ICANON:
+            assert time.monotonic() < deadline, "terminal never entered raw mode"
+            time.sleep(0.01)
+
+        os.write(master, b"\x1b[B")
+        redraw = read_until(master, b"Enter to select\r\n")
+        assert b"\x1b[J" in redraw
+        assert b"Choose how to set up Reckoning\r\n" in redraw
+        assert b"  > Custom Setup" in redraw
+
+        os.write(master, b"\x03")
+        read_until(master, b"reckoning setup to resume.\r\n")
+        assert process.wait(timeout=2) == 1
+        assert termios.tcgetattr(slave) == original_settings
+        assert (tmp_path / "setup-draft.json").exists()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
