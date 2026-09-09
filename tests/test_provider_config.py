@@ -8,8 +8,10 @@ from reckoning.config import (
     DeepSeekSettings,
     OrcaRouterSettings,
     ProviderCredentialStore,
+    RuntimeProviderSettings,
     default_provider_name,
 )
+from reckoning.operations import setup_instance
 
 
 def test_orcarouter_settings_load_only_allowed_values_from_env_file(
@@ -268,6 +270,62 @@ def test_an_empty_credential_store_saves_with_a_null_default(
         "default_provider": None,
         "providers": {},
     }
+
+
+def test_an_explicit_null_default_does_not_reactivate_a_saved_credential(
+    tmp_path: Path,
+) -> None:
+    credentials_path = tmp_path / "provider.json"
+    store = ProviderCredentialStore()
+    store.set_key("deepseek", "sk-saved")
+    store.default_provider = None
+    store.save(credentials_path)
+
+    loaded = ProviderCredentialStore.load(credentials_path)
+
+    assert loaded.default_provider is None
+    assert loaded.api_key_for("deepseek") == "sk-saved"
+
+
+def test_provider_override_does_not_inherit_custom_endpoint_advanced_settings(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    credentials_path = tmp_path / "provider.json"
+    setup_instance(data_dir, "local")
+    instance_path = data_dir / "instance.json"
+    instance = json.loads(instance_path.read_text(encoding="utf-8"))
+    instance["activation"] = {
+        "status": "activated",
+        "provider": "custom",
+        "model": "custom-model",
+        "base_url": "https://llm.example.test/v1",
+        "protocol": "openai-chat-completions",
+        "context_window": 32_000,
+        "header_env": {"X-Tenant": "CUSTOM_TENANT"},
+    }
+    instance_path.write_text(json.dumps(instance), encoding="utf-8")
+    store = ProviderCredentialStore()
+    store.set_key(
+        "custom",
+        "custom-key",
+        model="custom-model",
+        base_url="https://llm.example.test/v1",
+    )
+    store.set_key("deepseek", "deepseek-key", model="deepseek-chat")
+    store.save(credentials_path)
+
+    settings = RuntimeProviderSettings.load(
+        data_dir,
+        credentials_path=credentials_path,
+        environ={"CUSTOM_TENANT": "tenant-secret"},
+        provider_name="deepseek",
+    )
+
+    assert settings.provider_name == "deepseek"
+    assert settings.protocol == "openai-chat-completions"
+    assert settings.context_window is None
+    assert settings.headers == ()
 
 
 def test_default_provider_name_returns_the_saved_default(tmp_path: Path) -> None:

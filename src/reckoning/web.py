@@ -12,10 +12,9 @@ from wsgiref.types import StartResponse, WSGIEnvironment
 
 from reckoning.application import Message, ReckoningApplication, create_local_application
 from reckoning.config import (
+    CREDENTIAL_PROVIDER_NAMES,
     DEFAULT_PROVIDER_CREDENTIALS,
-    DeepSeekSettings,
-    OrcaRouterSettings,
-    default_provider_name,
+    RuntimeProviderSettings,
 )
 from reckoning.interfaces import (
     ControlView,
@@ -23,6 +22,7 @@ from reckoning.interfaces import (
     create_local_interface_application,
 )
 from reckoning.operations import OperationError, load_installation_runtime
+from reckoning.provider_adapters import AdapterConfig
 
 
 def validate_bind_host(host: str) -> str:
@@ -518,7 +518,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Reckoning's local web interface.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
-    parser.add_argument("--provider", choices=("fake", "deepseek", "orcarouter"))
+    parser.add_argument("--provider", choices=CREDENTIAL_PROVIDER_NAMES)
     parser.add_argument("--model")
     parser.add_argument("--base-url")
     parser.add_argument(
@@ -544,45 +544,30 @@ def main(argv: Sequence[str] | None = None) -> None:
             arguments.data_dir,
             server_data_dir=arguments.server_data_dir,
         )
+        provider = RuntimeProviderSettings.load(
+            arguments.data_dir,
+            credentials_path=DEFAULT_PROVIDER_CREDENTIALS,
+            provider_name=arguments.provider,
+            model=arguments.model,
+            base_url=arguments.base_url,
+        )
     except (OperationError, ValueError) as error:
         parser.error(str(error))
-
-    orcarouter_settings = OrcaRouterSettings.load(
-        credential_file=DEFAULT_PROVIDER_CREDENTIALS
-    )
-    deepseek_settings = DeepSeekSettings.load(
-        credential_file=DEFAULT_PROVIDER_CREDENTIALS
-    )
-    settings_by_provider: dict[str, OrcaRouterSettings | DeepSeekSettings] = {
-        "orcarouter": orcarouter_settings,
-        "deepseek": deepseek_settings,
-    }
-    default_name = default_provider_name()
-    provider_candidates = (
-        ((default_name,) if default_name else ()) + ("orcarouter", "deepseek")
-    )
-    provider_name = arguments.provider or next(
-        (
-            name
-            for name in provider_candidates
-            if settings_by_provider[name].api_key
-        ),
-        "fake",
-    )
-    settings = (
-        deepseek_settings if provider_name == "deepseek" else orcarouter_settings
-    )
 
     application = create_local_application(
         runtime.state_path("confirmed-state", "continuity.json"),
         personal_context_path=runtime.state_path(
             "personal-context", "personal-context.json"
         ),
-        provider_name=provider_name,
-        orcarouter_api_key=orcarouter_settings.api_key,
-        deepseek_api_key=deepseek_settings.api_key,
-        model_name=arguments.model or settings.model,
-        base_url=arguments.base_url or settings.base_url,
+        provider_name=provider.provider_name,
+        provider_config=AdapterConfig(
+            api_key=provider.api_key,
+            model=provider.model,
+            base_url=provider.base_url,
+            protocol=provider.protocol,
+            context_window=provider.context_window,
+            headers=provider.headers,
+        ),
         persona=runtime.persona,
         placement=runtime.application_placement,
     )

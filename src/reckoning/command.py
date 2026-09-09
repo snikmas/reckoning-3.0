@@ -30,6 +30,7 @@ from reckoning.provider_adapters import (
     probe_local_endpoint,
 )
 from reckoning.provider_registry import available_providers, find_provider
+from reckoning.provider_validation import is_valid_env_name
 from reckoning.setup_copy import LOCALE
 from reckoning.setup_terminal import (
     InteractiveUI,
@@ -192,9 +193,32 @@ def _setup_parser(prog: str) -> argparse.ArgumentParser:
         choices=_PROVIDER_IDS,
         help="Primary provider; secrets arrive via environment variables only.",
     )
+    parser.add_argument(
+        "--credential-env",
+        metavar="NAME",
+        help="Environment variable name that holds the provider credential.",
+    )
+    parser.add_argument("--api-key", help=argparse.SUPPRESS)
     parser.add_argument("--model", help="Model ID for the primary provider.")
     parser.add_argument(
         "--base-url", help="Endpoint URL for custom providers."
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=("openai-chat-completions",),
+        help="Custom endpoint protocol under Advanced.",
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        help="Custom endpoint context size in tokens under Advanced.",
+    )
+    parser.add_argument(
+        "--header-env",
+        action="append",
+        default=[],
+        metavar="HEADER=ENV_VAR",
+        help="Custom request header whose value comes from an environment variable.",
     )
     parser.add_argument(
         "--profile",
@@ -278,7 +302,26 @@ def _non_interactive_answers(
                     "non-interactive mode"
                 )
             answers["provider-base-url"] = arguments.base_url
-            answers["provider-custom-key"] = ""
+            if not arguments.credential_env:
+                answers["provider-custom-key"] = ""
+            advanced = bool(
+                arguments.protocol
+                or arguments.context_window is not None
+                or arguments.header_env
+            )
+            answers["provider-custom-advanced"] = "y" if advanced else "n"
+            if advanced:
+                answers["provider-custom-protocol"] = (
+                    arguments.protocol or "openai-chat-completions"
+                )
+                answers["provider-custom-context"] = (
+                    str(arguments.context_window)
+                    if arguments.context_window is not None
+                    else ""
+                )
+                answers["provider-custom-header-env"] = ",".join(
+                    arguments.header_env
+                )
         else:
             definition = find_provider(provider)
             env_name = next(
@@ -292,7 +335,13 @@ def _non_interactive_answers(
             saved = ProviderCredentialStore.load(
                 paths.credentials_path
             ).credential_for(provider)
-            if env_name is not None:
+            if arguments.credential_env:
+                if not os.environ.get(arguments.credential_env, "").strip():
+                    raise OperationError(
+                        f"{arguments.credential_env} is not set for --provider "
+                        f"{provider}"
+                    )
+            elif env_name is not None:
                 answers["provider-key-source"] = "env-ref"
             elif saved is not None:
                 answers["provider-key-source"] = "saved"
@@ -326,6 +375,23 @@ def _non_interactive_answers(
 def _run_setup(rest: Sequence[str]) -> int:
     parser = _setup_parser("reckoning setup")
     arguments = parser.parse_args(rest)
+    if arguments.api_key is not None:
+        parser.error(
+            "--api-key is not supported because command-line values can leak; "
+            "use --credential-env NAME"
+        )
+    if arguments.credential_env and arguments.provider is None:
+        parser.error("--credential-env requires --provider")
+    if (
+        arguments.protocol
+        or arguments.context_window is not None
+        or arguments.header_env
+        or arguments.base_url
+    ) and arguments.provider != "custom":
+        parser.error(
+            "--base-url, --protocol, --context-window, and --header-env are "
+            "only valid with --provider custom"
+        )
     paths = _setup_paths(arguments)
     services = SetupServices(environ=dict(os.environ), probe=probe_local_endpoint)
     preselected = {
@@ -344,6 +410,14 @@ def _run_setup(rest: Sequence[str]) -> int:
         preselected.setdefault("provider", "fake")
     if arguments.server_data_dir is not None:
         preselected["server-data-dir"] = str(arguments.server_data_dir)
+    if arguments.credential_env:
+        if not is_valid_env_name(arguments.credential_env):
+            parser.error("--credential-env must be an environment variable name")
+        if arguments.provider in ("fake", "ollama", "lmstudio", "vllm", "llamacpp"):
+            parser.error(
+                f"--provider {arguments.provider} does not accept a credential"
+            )
+        preselected["credential-env"] = arguments.credential_env
     lines: list[str] = []
     # Interactive output must reach the terminal before setup waits for
     # input; buffer only when a stable JSON result must print afterwards.
@@ -391,6 +465,23 @@ def _report_failure(
     *,
     unexpected: Exception | None = None,
 ) -> None:
+    if arguments.json:
+        print(
+            json.dumps(
+                {
+                    "activated": False,
+                    "error": message,
+                    "locale": LOCALE,
+                    "next": "fix the cause and rerun; nothing was activated",
+                    "result": "invalid",
+                    "status": "invalid",
+                },
+                sort_keys=True,
+            )
+        )
+        if arguments.debug and unexpected is not None:
+            traceback.print_exception(unexpected)
+        return
     print(f"setup failed: {message}", file=sys.stderr)
     print("next: fix the cause and rerun; nothing was activated.", file=sys.stderr)
     if arguments.debug and unexpected is not None:
@@ -398,10 +489,13 @@ def _report_failure(
 
 
 def _outcome_json(outcome: SetupOutcome) -> str:
+    result = "incomplete" if outcome.status == "draft" else "complete"
     return json.dumps(
         {
             "locale": LOCALE,
             "status": outcome.status,
+            "result": result,
+            "activated": outcome.status == "activated",
             "provider": outcome.provider_id,
             "model": outcome.model,
             "demo": outcome.demo,

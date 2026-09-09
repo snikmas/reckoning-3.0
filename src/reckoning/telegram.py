@@ -20,9 +20,7 @@ from reckoning.application import create_local_application
 from reckoning.config import (
     CREDENTIAL_PROVIDER_NAMES,
     DEFAULT_PROVIDER_CREDENTIALS,
-    DeepSeekSettings,
-    OrcaRouterSettings,
-    default_provider_name,
+    RuntimeProviderSettings,
 )
 from reckoning.interfaces import (
     ReckoningInterfaceApplication,
@@ -30,6 +28,7 @@ from reckoning.interfaces import (
 )
 from reckoning.json_store import atomic_write_json, read_json
 from reckoning.operations import OperationError, load_installation_runtime
+from reckoning.provider_adapters import AdapterConfig
 from reckoning.web import validate_bind_host
 
 DEFAULT_TELEGRAM_CONFIG = Path.home() / ".config" / "reckoning" / "telegram.json"
@@ -83,7 +82,7 @@ class TelegramPollingSettings:
             )
         if gateway_name != "telegram":
             raise ValueError("The configured messaging gateway is not supported.")
-        if provider_name not in CREDENTIAL_PROVIDER_NAMES + ("fake",):
+        if provider_name not in CREDENTIAL_PROVIDER_NAMES:
             raise ValueError("The configured model provider is not supported.")
         if next_update_offset is not None and type(next_update_offset) is not int:
             raise ValueError("Telegram polling offset is invalid.")
@@ -831,76 +830,33 @@ class TelegramWebhookApplication:
         return [body]
 
 
-def _create_interface(
-    arguments: argparse.Namespace,
-    *,
-    configured_provider: str | None = None,
-) -> ReckoningInterfaceApplication:
+def _create_interface(arguments: argparse.Namespace) -> ReckoningInterfaceApplication:
     runtime = load_installation_runtime(
         arguments.data_dir,
         server_data_dir=arguments.server_data_dir,
     )
-
-    orcarouter_api_key: str | None = None
-    deepseek_api_key: str | None = None
-    model_name = arguments.model
-    base_url = arguments.base_url
-    provider_name = arguments.provider or configured_provider
-    if provider_name == "orcarouter":
-        orcarouter_settings = OrcaRouterSettings.load(
-            credential_file=DEFAULT_PROVIDER_CREDENTIALS
-        )
-        orcarouter_api_key = orcarouter_settings.api_key
-        model_name = model_name or orcarouter_settings.model
-        base_url = base_url or orcarouter_settings.base_url
-    elif provider_name == "deepseek":
-        deepseek_settings = DeepSeekSettings.load(
-            credential_file=DEFAULT_PROVIDER_CREDENTIALS
-        )
-        deepseek_api_key = deepseek_settings.api_key
-        model_name = model_name or deepseek_settings.model
-        base_url = base_url or deepseek_settings.base_url
-    elif provider_name is None:
-        orcarouter_settings = OrcaRouterSettings.load(
-            credential_file=DEFAULT_PROVIDER_CREDENTIALS
-        )
-        deepseek_settings = DeepSeekSettings.load(
-            credential_file=DEFAULT_PROVIDER_CREDENTIALS
-        )
-        settings_by_provider: dict[str, OrcaRouterSettings | DeepSeekSettings] = {
-            "orcarouter": orcarouter_settings,
-            "deepseek": deepseek_settings,
-        }
-        default_name = default_provider_name()
-        candidates = (
-            ((default_name,) if default_name else ())
-            + ("orcarouter", "deepseek")
-        )
-        for candidate in candidates:
-            candidate_settings = settings_by_provider[candidate]
-            if not candidate_settings.api_key:
-                continue
-            provider_name = candidate
-            if candidate == "orcarouter":
-                orcarouter_api_key = candidate_settings.api_key
-            else:
-                deepseek_api_key = candidate_settings.api_key
-            model_name = model_name or candidate_settings.model
-            base_url = base_url or candidate_settings.base_url
-            break
-        else:
-            provider_name = "fake"
+    provider = RuntimeProviderSettings.load(
+        arguments.data_dir,
+        credentials_path=DEFAULT_PROVIDER_CREDENTIALS,
+        provider_name=arguments.provider,
+        model=arguments.model,
+        base_url=arguments.base_url,
+    )
 
     application = create_local_application(
         runtime.state_path("confirmed-state", "continuity.json"),
         personal_context_path=runtime.state_path(
             "personal-context", "personal-context.json"
         ),
-        provider_name=provider_name or "fake",
-        orcarouter_api_key=orcarouter_api_key,
-        deepseek_api_key=deepseek_api_key,
-        model_name=model_name,
-        base_url=base_url,
+        provider_name=provider.provider_name,
+        provider_config=AdapterConfig(
+            api_key=provider.api_key,
+            model=provider.model,
+            base_url=provider.base_url,
+            protocol=provider.protocol,
+            context_window=provider.context_window,
+            headers=provider.headers,
+        ),
         persona=runtime.persona,
         placement=runtime.application_placement,
     )
@@ -928,7 +884,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "reckoning gateway") 
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8081, type=int)
-    parser.add_argument("--provider", choices=("fake", "deepseek", "orcarouter"))
+    parser.add_argument("--provider", choices=CREDENTIAL_PROVIDER_NAMES)
     parser.add_argument("--model")
     parser.add_argument("--base-url")
     parser.add_argument(
@@ -956,10 +912,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "reckoning gateway") 
             interface = _create_interface(arguments)
         else:
             polling_settings = TelegramPollingSettings.load(arguments.telegram_config)
-            interface = _create_interface(
-                arguments,
-                configured_provider=polling_settings.provider_name,
-            )
+            interface = _create_interface(arguments)
     except (OperationError, RuntimeError, ValueError) as error:
         parser.error(str(error))
 

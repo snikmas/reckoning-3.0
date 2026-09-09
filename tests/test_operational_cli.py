@@ -895,5 +895,6 @@ def test_setup_never_accepts_secrets_as_command_line_flags(tmp_path: Path) -> No
     )
 
     assert result.returncode == 2
-    assert "unrecognized arguments: --api-key" in result.stderr
+    assert "--api-key is not supported" in result.stderr
+    assert "sk-flag-secret" not in result.stderr
     assert not (tmp_path / "flag-secret-instance").exists()

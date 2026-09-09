@@ -20,6 +20,7 @@ from reckoning.provider_adapters import (
     ProviderVerificationError,
     SetupProviderAdapter,
     available_adapters,
+    candidate_adapter_for,
     setup_adapter_for,
 )
 from reckoning.provider_registry import available_providers
@@ -287,12 +288,141 @@ class TestCustomEndpointContract:
                 transport=RecordingTransport([]),
             )
 
+    @pytest.mark.parametrize(
+        "base_url",
+        (
+            "https://user:base-url-secret@llm.example.test/v1",
+            "https://llm.example.test/v1?token=base-url-secret",
+        ),
+    )
+    def test_custom_endpoint_rejects_secret_bearing_base_urls_without_echo(
+        self, base_url: str
+    ) -> None:
+        adapter = setup_adapter_for("custom")
+        transport = RecordingTransport([])
+
+        with pytest.raises(ProviderVerificationError, match="invalid") as failure:
+            adapter.verify(
+                AdapterConfig(base_url=base_url, model="m"),
+                transport=transport,
+            )
+
+        assert "base-url-secret" not in str(failure.value)
+        assert transport.requests == []
+
     def test_custom_endpoint_requires_a_base_url(self) -> None:
         adapter = setup_adapter_for("custom")
         with pytest.raises(ProviderVerificationError, match="base URL"):
             adapter.verify(
                 AdapterConfig(model="m"), transport=RecordingTransport([])
             )
+
+    def test_custom_endpoint_adds_non_secret_advanced_headers(self) -> None:
+        adapter = setup_adapter_for("custom")
+        transport = RecordingTransport([completion_payload()])
+
+        adapter.verify(
+            AdapterConfig(
+                base_url="https://llm.example.test/v1",
+                model="my-model",
+                protocol="openai-chat-completions",
+                context_window=32_000,
+                headers=(("X-Tenant", "tenant-a"),),
+            ),
+            transport=transport,
+        )
+
+        (request,) = transport.requests
+        assert request.headers["X-tenant"] == "tenant-a"
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        (
+            ("Bad Header", "safe"),
+            ("X-Test", "secret\r\nInjected: yes"),
+        ),
+    )
+    def test_custom_endpoint_rejects_unsafe_headers_without_echoing_values(
+        self, name: str, value: str
+    ) -> None:
+        adapter = setup_adapter_for("custom")
+
+        with pytest.raises(ProviderVerificationError) as failure:
+            adapter.verify(
+                AdapterConfig(
+                    base_url="https://llm.example.test/v1",
+                    model="my-model",
+                    headers=((name, value),),
+                ),
+                transport=RecordingTransport([]),
+            )
+
+        assert value not in str(failure.value)
+
+    def test_custom_endpoint_redacts_environment_backed_header_values(self) -> None:
+        adapter = setup_adapter_for("custom")
+        secret = "tenant-header-secret"
+        transport = RecordingTransport(
+            [http_error(401, f"unknown tenant {secret}")]
+        )
+
+        with pytest.raises(ProviderVerificationError) as failure:
+            adapter.verify(
+                AdapterConfig(
+                    base_url="https://llm.example.test/v1",
+                    model="my-model",
+                    headers=(("X-Tenant", secret),),
+                ),
+                transport=transport,
+            )
+
+        assert secret not in str(failure.value)
+        assert "[redacted]" in str(failure.value)
+
+
+class TestOpenAICandidateContract:
+    def test_openai_candidate_uses_the_documented_api_contract(self) -> None:
+        adapter = candidate_adapter_for("openai")
+        transport = RecordingTransport([completion_payload("served-openai-model")])
+
+        result = adapter.verify(
+            AdapterConfig(api_key=SECRET),
+            transport=transport,
+        )
+
+        (request,) = transport.requests
+        body = json.loads(request.data.decode("utf-8"))
+        assert request.full_url == "https://api.openai.com/v1/chat/completions"
+        assert request.headers["Authorization"] == f"Bearer {SECRET}"
+        assert body["model"] == adapter.definition.recommended_model
+        assert body["max_completion_tokens"] == 8
+        assert "max_tokens" not in body
+        assert result.provider == "openai"
+
+    def test_openai_candidate_discovers_models_and_accepts_manual_model(self) -> None:
+        adapter = candidate_adapter_for("openai")
+        discovery = RecordingTransport([models_payload("gpt-z", "gpt-a")])
+
+        models = adapter.discover_models(
+            AdapterConfig(api_key=SECRET), transport=discovery
+        )
+
+        assert models == ("gpt-a", "gpt-z")
+        assert discovery.requests[0].headers["Authorization"] == f"Bearer {SECRET}"
+
+        completion = RecordingTransport([completion_payload("manual-model")])
+        result = adapter.verify(
+            AdapterConfig(api_key=SECRET, model="manual-model"),
+            transport=completion,
+        )
+        body = json.loads(completion.requests[0].data.decode("utf-8"))
+        assert body["model"] == "manual-model"
+        assert result.model == "manual-model"
+
+    def test_openai_stays_coming_soon_before_the_opt_in_smoke(self) -> None:
+        assert candidate_adapter_for("openai").definition.available is False
+        with pytest.raises(KeyError, match="not available"):
+            setup_adapter_for("openai")
 
 
 class TestCloudHostPinning:

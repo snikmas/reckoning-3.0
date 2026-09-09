@@ -9,9 +9,9 @@ from reckoning.continuity import (
     CheckIn,
     DecisionResume,
     DeterministicFakeReckoningProvider,
+    Evidence,
     IdentifierFactory,
     InMemoryReckoningRepository,
-    Evidence,
     PersonalRecordVersion,
     Reckoning,
     ReckoningProvider,
@@ -20,13 +20,21 @@ from reckoning.continuity import (
     UuidIdentifierFactory,
     WhyView,
 )
-from reckoning.providers import ProviderFailure, ProviderResponse, ProviderUsage
 from reckoning.external_content import ExternalContentResult
 from reckoning.personal_context import (
     PersonalContextService,
     PersonalContextVersion,
     RetrievalQuery,
 )
+from reckoning.provider_adapters import (
+    AdapterConfig,
+    RuntimeAdapterModelProvider,
+)
+from reckoning.provider_adapters import Transport as SetupProviderTransport
+from reckoning.provider_adapters import (
+    urlopen_transport as setup_urlopen_transport,
+)
+from reckoning.providers import ProviderFailure, ProviderResponse, ProviderUsage
 
 MessageRole = Literal["user", "assistant"]
 ConversationHistory = tuple[tuple[MessageRole, str], ...]
@@ -952,17 +960,14 @@ def create_local_application(
     deepseek_api_key: str | None = None,
     model_name: str | None = None,
     base_url: str | None = None,
+    provider_config: AdapterConfig | None = None,
+    provider_transport: SetupProviderTransport = setup_urlopen_transport,
     persona: PersonaSettings | None = None,
     placement: PlacementState | None = None,
 ) -> ReckoningApplication:
     from reckoning.persistence import JsonFileReckoningRepository
     from reckoning.personal_context import JsonFilePersonalContextRepository
-    from reckoning.providers import (
-        DeepSeekModelProvider,
-        DeepSeekReckoningProvider,
-        OrcaRouterModelProvider,
-        OrcaRouterReckoningProvider,
-    )
+    from reckoning.providers import OrcaRouterReckoningProvider
 
     continuity_path = data_path or (
         Path.home() / ".local" / "state" / "reckoning" / "continuity.json"
@@ -970,24 +975,27 @@ def create_local_application(
     if provider_name == "fake":
         model: ModelProvider = DeterministicFakeModel()
         reckoning_provider: ReckoningProvider = DeterministicFakeReckoningProvider()
-    elif provider_name == "orcarouter":
-        cloud_model = OrcaRouterModelProvider(
-            orcarouter_api_key or "",
-            model=model_name or "orcarouter/auto",
-            base_url=base_url or "https://api.orcarouter.ai/v1",
-        )
-        model = cloud_model
-        reckoning_provider = OrcaRouterReckoningProvider(cloud_model)
-    elif provider_name == "deepseek":
-        deepseek_model = DeepSeekModelProvider(
-            deepseek_api_key or "",
-            model=model_name or "deepseek-v4-flash",
-            base_url=base_url or "https://api.deepseek.com",
-        )
-        model = deepseek_model
-        reckoning_provider = DeepSeekReckoningProvider(deepseek_model)
     else:
-        raise ValueError(f"Unsupported model provider: {provider_name}")
+        if provider_config is None:
+            api_key = (
+                deepseek_api_key
+                if provider_name == "deepseek"
+                else orcarouter_api_key
+                if provider_name == "orcarouter"
+                else None
+            )
+            provider_config = AdapterConfig(
+                api_key=api_key,
+                model=model_name,
+                base_url=base_url,
+            )
+        runtime_model = RuntimeAdapterModelProvider(
+            provider_name,
+            provider_config,
+            transport=provider_transport,
+        )
+        model = runtime_model
+        reckoning_provider = OrcaRouterReckoningProvider(runtime_model)
     return ReckoningApplication(
         ApplicationDependencies(
             clock=SystemClock(),
