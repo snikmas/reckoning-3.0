@@ -265,6 +265,7 @@ class OpenAICompatibleAdapter:
             max_retries=max_retries,
             timer=timer,
             max_tokens=VERIFICATION_MAX_TOKENS,
+            verification_request_fields=self._verification_request_fields(),
         )
 
     def complete(
@@ -311,9 +312,14 @@ class OpenAICompatibleAdapter:
         max_retries: int,
         timer: Callable[[], float],
         max_tokens: int | None = None,
+        verification_request_fields: Mapping[str, object] | None = None,
     ) -> ProviderVerification:
         base_url = _validated_base_url(self._definition, config.base_url)
+        extra_fields = dict(verification_request_fields or {})
+        for reserved in ("model", "messages", "stream", "max_tokens"):
+            extra_fields.pop(reserved, None)
         body: dict[str, object] = {
+            **extra_fields,
             "model": model,
             "messages": [
                 {"role": role, "content": content} for role, content in messages
@@ -368,9 +374,24 @@ class OpenAICompatibleAdapter:
         timer: Callable[[], float],
     ) -> ProviderVerification:
         parsed = json.loads(raw.decode("utf-8"))
-        content = str(parsed["choices"][0]["message"]["content"]).strip()
-        if not content:
+        choice = parsed["choices"][0]
+        message = choice["message"]
+        if not isinstance(message, dict):
+            raise ValueError("message is not an object")
+        content = message.get("content")
+        if content is None or (
+            isinstance(content, str) and not content.strip()
+        ):
+            if choice.get("finish_reason") == "length":
+                raise ProviderVerificationError(
+                    f"{self._definition.display_name} provider test ended "
+                    "before a final answer. "
+                    "Retry the test or edit provider settings."
+                )
             raise ValueError("empty content")
+        if not isinstance(content, str):
+            raise ValueError("content is not a string")
+        content = content.strip()
         usage_data = parsed.get("usage") or {}
         return ProviderVerification(
             provider=self._definition.id,
@@ -405,6 +426,16 @@ class OpenAICompatibleAdapter:
         if api_key and api_key.strip():
             return {"Authorization": f"Bearer {api_key.strip()}"}
         return {}
+
+    def _verification_request_fields(self) -> Mapping[str, object]:
+        return {}
+
+
+class DeepSeekProviderAdapter(OpenAICompatibleAdapter):
+    """DeepSeek setup verification with thinking disabled."""
+
+    def _verification_request_fields(self) -> Mapping[str, object]:
+        return {"thinking": {"type": "disabled"}}
 
 
 class FakeProviderAdapter:
@@ -483,6 +514,8 @@ def setup_adapter_for(provider_id: str) -> SetupProviderAdapter:
         raise KeyError(f"Provider is not available yet: {provider_id}")
     if definition.id == "fake":
         return FakeProviderAdapter()
+    if definition.id == "deepseek":
+        return DeepSeekProviderAdapter(definition)
     return OpenAICompatibleAdapter(definition)
 
 
