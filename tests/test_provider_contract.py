@@ -15,6 +15,7 @@ import pytest
 
 from reckoning.provider_adapters import (
     AdapterConfig,
+    DeepSeekProviderAdapter,
     FakeProviderAdapter,
     ModelDiscoveryError,
     ProviderVerificationError,
@@ -35,6 +36,30 @@ def completion_payload(model: str = "test-model") -> bytes:
         {
             "model": model,
             "choices": [{"message": {"role": "assistant", "content": "ready"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+        }
+    ).encode("utf-8")
+
+
+def response_payload(
+    *,
+    content: object = "ready",
+    include_content: bool = True,
+    finish_reason: str | None = None,
+    reasoning_content: str | None = None,
+) -> bytes:
+    message: dict[str, object] = {"role": "assistant"}
+    if include_content:
+        message["content"] = content
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
+    choice: dict[str, object] = {"message": message}
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
+    return json.dumps(
+        {
+            "model": "test-model",
+            "choices": [choice],
             "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
         }
     ).encode("utf-8")
@@ -217,6 +242,110 @@ class TestSharedProviderContract:
         assert any(hit.kind == "credential" for hit in hits)
         if adapter.definition.local_probe_urls:
             assert any(hit.kind == "local-endpoint" for hit in hits)
+
+
+class TestDeepSeekVerificationContract:
+    def test_deepseek_verification_disables_thinking(self) -> None:
+        adapter = setup_adapter_for("deepseek")
+        assert isinstance(adapter, DeepSeekProviderAdapter)
+        transport = RecordingTransport([completion_payload()])
+
+        adapter.verify(
+            AdapterConfig(api_key=SECRET, model="deepseek-v4-flash"),
+            transport=transport,
+        )
+
+        (request,) = transport.requests
+        body = json.loads(request.data.decode("utf-8"))
+        assert body["model"] == "deepseek-v4-flash"
+        assert body["messages"] == [
+            {"role": "user", "content": "Reply with the single word: ready"}
+        ]
+        assert body["stream"] is False
+        assert body["max_tokens"] == 8
+        assert body["thinking"] == {"type": "disabled"}
+
+    @pytest.mark.parametrize(
+        "provider_id",
+        [item.id for item in available_providers() if item.id not in {"deepseek", "fake"}],
+    )
+    def test_other_adapters_omit_thinking(self, provider_id: str) -> None:
+        adapter = setup_adapter_for(provider_id)
+        transport = RecordingTransport([completion_payload()])
+
+        adapter.verify(config_for(adapter), transport=transport)
+
+        (request,) = transport.requests
+        body = json.loads(request.data.decode("utf-8"))
+        assert "thinking" not in body
+
+    def test_normal_deepseek_completion_omits_verification_override(self) -> None:
+        adapter = setup_adapter_for("deepseek")
+        transport = RecordingTransport([completion_payload()])
+
+        adapter.complete(
+            AdapterConfig(api_key=SECRET, model="deepseek-v4-flash"),
+            (("user", "Hello"),),
+            transport=transport,
+        )
+
+        (request,) = transport.requests
+        body = json.loads(request.data.decode("utf-8"))
+        assert "thinking" not in body
+
+    def test_reasoning_only_length_response_has_a_safe_specific_error(self) -> None:
+        adapter = setup_adapter_for("deepseek")
+        transport = RecordingTransport(
+            [
+                response_payload(
+                    content=None,
+                    finish_reason="length",
+                    reasoning_content="private reasoning text",
+                )
+            ]
+        )
+
+        with pytest.raises(ProviderVerificationError) as failure:
+            adapter.verify(
+                AdapterConfig(api_key=SECRET, model="deepseek-v4-flash"),
+                transport=transport,
+            )
+
+        message = str(failure.value)
+        assert message == (
+            "DeepSeek provider test ended before a final answer. Retry the test "
+            "or edit provider settings."
+        )
+        assert SECRET not in message
+        assert "reasoning_content" not in message
+        assert "private reasoning text" not in message
+
+    @pytest.mark.parametrize(
+        ("content", "include_content"),
+        [
+            (None, True),
+            ("", True),
+            (None, False),
+            ([], True),
+            ({"answer": "ready"}, True),
+            (0, True),
+            (3.14, True),
+        ],
+        ids=["null", "empty", "missing", "list", "object", "zero", "numeric"],
+    )
+    def test_non_string_or_missing_content_cannot_pass(
+        self, content: object, include_content: bool
+    ) -> None:
+        adapter = setup_adapter_for("deepseek")
+        transport = RecordingTransport(
+            [response_payload(content=content, include_content=include_content)]
+        )
+
+        with pytest.raises(ProviderVerificationError, match="invalid response"):
+            adapter.verify(
+                AdapterConfig(api_key=SECRET, model="deepseek-v4-flash"),
+                transport=transport,
+            )
 
 
 class TestKeylessLocalContract:
