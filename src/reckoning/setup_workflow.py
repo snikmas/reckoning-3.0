@@ -6,15 +6,20 @@ This module owns setup policy and never prints terminal UI directly; a
 
 from __future__ import annotations
 
+import os
+import shutil
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Literal, Protocol, cast
 
 from reckoning.config import (
     DEFAULT_PROVIDER_CREDENTIALS,
     ProviderCredentialStore,
+    RuntimeProviderSettings,
     StoredCredential,
 )
 from reckoning.json_store import atomic_write_json, read_json
@@ -60,6 +65,7 @@ from reckoning.provider_registry import (
     find_provider,
     providers_in_group,
 )
+from reckoning.provider_validation import is_valid_env_name, is_valid_header_name
 from reckoning.setup_copy import (
     AUTONOMY_FLOOR_TITLE,
     CONNECTOR_COMING_SOON,
@@ -253,11 +259,18 @@ class SetupDraft:
     provider_id: str | None = None
     provider_model: str | None = None
     provider_base_url: str | None = None
+    provider_protocol: str = "openai-chat-completions"
+    provider_context_window: int | None = None
+    provider_header_env: dict[str, str] = field(default_factory=dict)
     provider_credential: str | None = None
     provider_demo: bool = False
     profile_choice: str | None = None
     profile_proposal_count: int = 0
+    profile_entries: list[dict[str, str]] = field(default_factory=list)
     telegram_status: str | None = None
+    provider_verified_at: str | None = None
+    status: Literal["incomplete"] = "incomplete"
+    next_step: SetupStep | None = None
     schema_version: int = SETUP_DRAFT_SCHEMA
 
     def mark_completed(self, step: SetupStep) -> None:
@@ -271,9 +284,43 @@ class SetupDraft:
             return None
         if data.get("schema_version") != SETUP_DRAFT_SCHEMA:
             raise OperationError("The setup draft uses an unsupported schema.")
+        if data.get("status", "incomplete") != "incomplete":
+            raise OperationError("The setup draft has an invalid status.")
+        mode = data.get("mode")
+        completed = data.get("completed", [])
+        next_step = data.get("next_step")
+        header_env = data.get("provider_header_env", {})
+        all_steps = frozenset(("mode", *QUICK_STEPS, *CUSTOM_STEPS))
+        if mode not in (None, "quick", "custom"):
+            raise OperationError("The setup draft has an invalid mode.")
+        if not isinstance(completed, list) or any(
+            not isinstance(step, str) or step not in all_steps for step in completed
+        ):
+            raise OperationError("The setup draft has invalid completed steps.")
+        if next_step is not None and next_step not in all_steps:
+            raise OperationError("The setup draft has an invalid next step.")
+        if not isinstance(header_env, dict) or any(
+            not is_valid_header_name(name) or not is_valid_env_name(env_name)
+            for name, env_name in header_env.items()
+        ):
+            raise OperationError("The setup draft has invalid header references.")
+        raw_context_window = data.get("provider_context_window")
+        try:
+            context_window = (
+                int(raw_context_window) if raw_context_window is not None else None
+            )
+        except (TypeError, ValueError) as error:
+            raise OperationError(
+                "The setup draft has an invalid context size."
+            ) from error
+        if context_window is not None and context_window <= 0:
+            raise OperationError("The setup draft has an invalid context size.")
+        protocol = str(data.get("provider_protocol", "openai-chat-completions"))
+        if protocol != "openai-chat-completions":
+            raise OperationError("The setup draft has an invalid provider protocol.")
         return cls(
-            mode=data.get("mode"),
-            completed=list(data.get("completed", [])),
+            mode=cast(SetupMode | None, mode),
+            completed=completed,
             placement=data.get("placement"),
             server_data_dir=data.get("server_data_dir"),
             persona_id=data.get("persona_id"),
@@ -281,14 +328,29 @@ class SetupDraft:
             provider_id=data.get("provider_id"),
             provider_model=data.get("provider_model"),
             provider_base_url=data.get("provider_base_url"),
+            provider_protocol=protocol,
+            provider_context_window=context_window,
+            provider_header_env=header_env,
             provider_credential=data.get("provider_credential"),
             provider_demo=bool(data.get("provider_demo", False)),
             profile_choice=data.get("profile_choice"),
             profile_proposal_count=int(data.get("profile_proposal_count", 0)),
+            profile_entries=list(data.get("profile_entries", [])),
             telegram_status=data.get("telegram_status"),
+            provider_verified_at=data.get("provider_verified_at"),
+            status="incomplete",
+            next_step=cast(SetupStep | None, next_step),
         )
 
     def save(self, path: Path) -> None:
+        if self.mode is None:
+            self.next_step = "mode"
+        else:
+            steps = QUICK_STEPS if self.mode == "quick" else CUSTOM_STEPS
+            self.next_step = next(
+                (step for step in steps if step not in self.completed),
+                None,
+            )
         atomic_write_json(path, {"schema_version": self.schema_version, **{
             key: value
             for key, value in asdict(self).items()
@@ -444,6 +506,75 @@ class SectionStatus:
     detail: str
 
 
+@dataclass(frozen=True)
+class _FileSnapshot:
+    path: Path
+    content: bytes | None
+    mode: int | None
+
+    @classmethod
+    def capture(cls, path: Path) -> _FileSnapshot:
+        if not path.exists():
+            return cls(path, None, None)
+        return cls(path, path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+
+    def restore(self) -> None:
+        if self.content is None:
+            self.path.unlink(missing_ok=True)
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                "wb",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.rollback-",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(self.content)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            os.replace(temporary_path, self.path)
+            if self.mode is not None:
+                self.path.chmod(self.mode)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class _EmptyRootSnapshot:
+    path: Path
+    existed: bool
+    mode: int | None
+
+    @classmethod
+    def capture(cls, path: Path) -> _EmptyRootSnapshot:
+        if path.exists() and (
+            not path.is_dir() or path.is_symlink() or any(path.iterdir())
+        ):
+            raise OperationError(
+                f"Activation requires an empty installation root: {path}"
+            )
+        return cls(
+            path,
+            path.exists(),
+            stat.S_IMODE(path.stat().st_mode) if path.exists() else None,
+        )
+
+    def restore(self) -> None:
+        if self.path.exists():
+            if self.path.is_dir() and not self.path.is_symlink():
+                shutil.rmtree(self.path)
+            else:
+                self.path.unlink()
+        if self.existed:
+            self.path.mkdir(parents=True)
+            if self.mode is not None:
+                self.path.chmod(self.mode)
+
+
 class SetupWorkflow:
     """One authoritative setup workflow for interactive and scripted runs."""
 
@@ -496,6 +627,20 @@ class SetupWorkflow:
                 self._start_over(existing)
             else:
                 self._draft = existing
+                try:
+                    self._profile_entries = [
+                        UserProfileEntry(
+                            record_id=item["record_id"],
+                            section=item["section"],
+                            text=item["text"],
+                            source=item["source"],
+                        )
+                        for item in existing.profile_entries
+                    ]
+                except (KeyError, TypeError) as error:
+                    raise OperationError(
+                        "The setup draft contains invalid profile proposals."
+                    ) from error
                 for line in existing.summary_lines():
                     self._ui.info(line)
         return self._run_guided()
@@ -971,6 +1116,9 @@ class SetupWorkflow:
         api_key: str | None = None
         credential_kind = "none"
         base_url: str | None = None
+        protocol = "openai-chat-completions"
+        context_window: int | None = None
+        header_env: dict[str, str] = {}
         self._pending_key = None
         self._pending_env_name = None
         if definition.auth == "api-key":
@@ -997,20 +1145,115 @@ class SetupWorkflow:
                 default=self._draft.provider_base_url or "",
                 allow_empty=False,
             )
-            raw_key = self._ui.ask(
-                "provider-custom-key",
-                "API key (input hidden; leave empty for keyless): ",
-                secret=True,
+            env_name = self._preselected.get("credential-env")
+            if env_name:
+                api_key = environ.get(env_name, "").strip() or None
+                if api_key is None:
+                    raise SetupInputError(
+                        f"the credential environment variable {env_name} is not set"
+                    )
+                self._pending_env_name = env_name
+                credential_kind = "env-ref"
+            else:
+                raw_key = self._ui.ask(
+                    "provider-custom-key",
+                    "API key (input hidden; leave empty for keyless): ",
+                    secret=True,
+                )
+                api_key = raw_key or None
+                credential_kind = "store" if api_key else "none"
+            advanced = self._ui.confirm(
+                "provider-custom-advanced",
+                "Configure protocol, context size, or environment-backed headers?",
+                default=False,
             )
-            api_key = raw_key or None
-            credential_kind = "store" if api_key else "none"
+            if advanced:
+                protocol = self._ui.choose(
+                    "provider-custom-protocol",
+                    "Protocol",
+                    (
+                        MenuOption(
+                            "openai-chat-completions",
+                            "OpenAI Chat Completions",
+                        ),
+                    ),
+                )
+                raw_context = self._ui.ask(
+                    "provider-custom-context",
+                    "Context size in tokens (leave empty if unknown): ",
+                )
+                if raw_context:
+                    try:
+                        context_window = int(raw_context)
+                    except ValueError as error:
+                        raise SetupInputError(
+                            "custom endpoint context size must be an integer"
+                        ) from error
+                    if context_window <= 0:
+                        raise SetupInputError(
+                            "custom endpoint context size must be positive"
+                        )
+                raw_headers = self._ui.ask(
+                    "provider-custom-header-env",
+                    "Headers as Name=ENV_VAR, separated by commas (optional): ",
+                )
+                header_env = self._parse_header_env(raw_headers, environ)
         if definition.id == "fake":
             model = "deterministic-fake"
         else:
-            model = self._choose_model(definition, api_key, base_url)
+            model = self._choose_model(
+                definition,
+                AdapterConfig(
+                    api_key=api_key,
+                    base_url=base_url,
+                    protocol=protocol,
+                    context_window=context_window,
+                    headers=tuple(
+                        (name, environ[env_name].strip())
+                        for name, env_name in header_env.items()
+                    ),
+                ),
+            )
         self._draft.provider_credential = credential_kind
+        self._draft.provider_protocol = protocol
+        self._draft.provider_context_window = context_window
+        self._draft.provider_header_env = header_env
         self._pending_key = api_key
-        return AdapterConfig(api_key=api_key, base_url=base_url, model=model)
+        return AdapterConfig(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            protocol=protocol,
+            context_window=context_window,
+            headers=tuple(
+                (name, environ[env_name].strip())
+                for name, env_name in header_env.items()
+            ),
+        )
+
+    @staticmethod
+    def _parse_header_env(
+        raw: str, environ: Mapping[str, str]
+    ) -> dict[str, str]:
+        references: dict[str, str] = {}
+        for item in (part.strip() for part in raw.split(",")):
+            if not item:
+                continue
+            if "=" not in item:
+                raise SetupInputError(
+                    "custom headers must use the form Header=ENV_VAR"
+                )
+            name, env_name = (part.strip() for part in item.split("=", 1))
+            if not is_valid_header_name(name) or not is_valid_env_name(env_name):
+                raise SetupInputError(
+                    "custom headers must use the form Header=ENV_VAR"
+                )
+            if not environ.get(env_name, "").strip():
+                raise SetupInputError(
+                    f"the custom header environment variable {env_name} is not set"
+                )
+            references[name] = env_name
+        return references
 
     def _collect_api_key(
         self,
@@ -1025,6 +1268,16 @@ class SetupWorkflow:
             ),
             None,
         )
+        requested_env_name = self._preselected.get("credential-env")
+        if requested_env_name:
+            requested_value = environ.get(requested_env_name, "").strip()
+            if not requested_value:
+                raise SetupInputError(
+                    f"the credential environment variable {requested_env_name} "
+                    "is not set"
+                )
+            self._pending_env_name = requested_env_name
+            return requested_value, "env-ref"
         sources: list[MenuOption] = []
         if env_name is not None:
             sources.append(
@@ -1068,8 +1321,7 @@ class SetupWorkflow:
     def _choose_model(
         self,
         definition: ProviderDefinition,
-        api_key: str | None,
-        base_url: str | None,
+        config: AdapterConfig,
     ) -> str:
         recommended = definition.recommended_model
         options: list[MenuOption] = []
@@ -1097,7 +1349,7 @@ class SetupWorkflow:
             )
         if choice == "discover":
             discovered = self._services.adapter_for(definition.id).discover_models(
-                AdapterConfig(api_key=api_key, base_url=base_url),
+                config,
                 transport=self._services.transport,
             )
             filter_text = self._ui.ask(
@@ -1160,8 +1412,12 @@ class SetupWorkflow:
         self._draft.provider_model = config.model
         self._draft.provider_base_url = config.base_url
         self._draft.provider_demo = demo
+        self._draft.provider_verified_at = (
+            datetime.now(UTC).isoformat() if verified else None
+        )
         if definition.id == "fake" or definition.auth == "keyless-local":
             return
+        previous_default = self._store.default_provider
         if self._draft.provider_credential == "env-ref" and self._pending_env_name:
             self._store.set_env_reference(
                 definition.id,
@@ -1187,6 +1443,7 @@ class SetupWorkflow:
             )
         else:
             return
+        self._store.default_provider = previous_default
         self._store.save(self._paths.credentials_path)
 
     def _recover_provider_failure(self, definition: ProviderDefinition) -> str:
@@ -1283,6 +1540,15 @@ class SetupWorkflow:
         self._profile_entries = entries
         self._draft.profile_choice = choice
         self._draft.profile_proposal_count = len(entries)
+        self._draft.profile_entries = [
+            {
+                "record_id": entry.record_id,
+                "section": entry.section,
+                "text": entry.text,
+                "source": entry.source,
+            }
+            for entry in entries
+        ]
         if entries:
             self._ui.info(PROFILE_SAVED_AS_PROPOSALS)
 
@@ -1425,7 +1691,7 @@ class SetupWorkflow:
                 definition = find_provider(self._draft.provider_id or "fake")
                 config = self._current_adapter_config()
                 self._draft.provider_model = self._choose_model(
-                    definition, config.api_key, config.base_url
+                    definition, config
                 )
                 continue
             if action == "change-provider":
@@ -1448,7 +1714,18 @@ class SetupWorkflow:
         )
         if provider_id == "custom" and api_key == "endpoint-only":
             api_key = None
-        return AdapterConfig(api_key=api_key, base_url=base_url, model=model)
+        environ = os.environ if self._services.environ is None else self._services.environ
+        return AdapterConfig(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            protocol=self._draft.provider_protocol,
+            context_window=self._draft.provider_context_window,
+            headers=tuple(
+                (name, environ.get(env_name, ""))
+                for name, env_name in self._draft.provider_header_env.items()
+            ),
+        )
 
     # ------------------------------------------------------------------ review
 
@@ -1487,13 +1764,31 @@ class SetupWorkflow:
             "mode": self._draft.mode or "quick",
             "provider": provider_id,
             "model": model_name,
+            "base_url": self._draft.provider_base_url,
+            "protocol": self._draft.provider_protocol,
+            "context_window": self._draft.provider_context_window,
+            "header_env": self._draft.provider_header_env,
             "demo": demo,
+            "verified_at": self._draft.provider_verified_at,
             "activated_at": datetime.now(UTC).isoformat(),
         }
         if self._accepted is None:
             raise OperationError(
                 "Activation requires an accepted first conversation."
             )
+        root_snapshots = [
+            _EmptyRootSnapshot.capture(self._paths.data_dir.expanduser().resolve())
+        ]
+        if self._draft.server_data_dir:
+            root_snapshots.append(
+                _EmptyRootSnapshot.capture(
+                    Path(self._draft.server_data_dir).expanduser().resolve()
+                )
+            )
+        file_snapshots = (
+            _FileSnapshot.capture(self._paths.credentials_path),
+            _FileSnapshot.capture(self._paths.telegram_config_path),
+        )
         try:
             setup_instance(
                 self._paths.data_dir,
@@ -1508,16 +1803,45 @@ class SetupWorkflow:
                 first_conversation=self._accepted,
                 activation=activation,
             )
-        except (OperationError, OSError, ValueError) as error:
+            credential = self._store.credential_for(provider_id)
+            if credential is not None:
+                self._store.providers[provider_id] = StoredCredential(
+                    secret=credential.secret,
+                    model=model_name,
+                    base_url=self._draft.provider_base_url or credential.base_url,
+                    verified=credential.verified,
+                    verified_at=credential.verified_at,
+                )
+            self._store.default_provider = (
+                provider_id
+                if definition.auth in ("api-key", "custom-endpoint")
+                else None
+            )
+            if self._store.providers or self._paths.credentials_path.exists():
+                self._store.save(self._paths.credentials_path)
+            self._update_telegram_provider(provider_id)
+            self._prove_reopen()
+        except (OperationError, OSError, RuntimeError, ValueError) as error:
+            rollback_errors: list[str] = []
+            for snapshot in reversed(root_snapshots):
+                try:
+                    snapshot.restore()
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            for snapshot in file_snapshots:
+                try:
+                    snapshot.restore()
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            rollback_note = (
+                f" Rollback also failed: {'; '.join(rollback_errors)}."
+                if rollback_errors
+                else " The partial activation was rolled back."
+            )
             raise OperationError(
-                f"Activation failed at the installation step: {error}. "
-                "Nothing was activated; run reckoning setup to resume."
+                f"Activation failed: {error}.{rollback_note} "
+                "Run reckoning setup to resume."
             ) from error
-        if provider_id != "fake":
-            self._store.default_provider = provider_id
-            self._store.save(self._paths.credentials_path)
-        self._update_telegram_provider(provider_id)
-        self._prove_reopen()
         self._paths.draft_path.unlink(missing_ok=True)
         if demo:
             self._ui.success(
@@ -1568,12 +1892,22 @@ class SetupWorkflow:
                     else None
                 ),
             )
+            provider = RuntimeProviderSettings.load(
+                self._paths.data_dir,
+                credentials_path=self._paths.credentials_path,
+                environ=self._services.environ,
+            )
             session_path = runtime.state_path("confirmed-state", "interfaces.json")
             state = JsonFileInterfaceRepository(session_path).load()
         except (OperationError, RuntimeError, ValueError) as error:
             raise OperationError(
                 f"Activation failed at the reopen check: {error}."
             ) from error
+        if provider.provider_name != (self._draft.provider_id or "fake"):
+            raise OperationError(
+                "Activation failed at the reopen check: the installed provider "
+                "does not match the verified provider."
+            )
         assert self._accepted is not None
         user_text, assistant_text = self._accepted
         web_sessions = [
@@ -1672,6 +2006,26 @@ class SetupWorkflow:
         sections.append(
             SectionStatus("placement", True, f"{placement}")
         )
+        sections.append(
+            SectionStatus(
+                "migration",
+                isinstance(activation, dict),
+                "current" if isinstance(activation, dict) else "required",
+            )
+        )
+        if self._paths.draft_path.exists():
+            try:
+                draft = SetupDraft.load(self._paths.draft_path)
+                draft_detail = (
+                    f"incomplete; next step {draft.next_step or 'review'}"
+                    if draft is not None
+                    else "none"
+                )
+                sections.append(SectionStatus("draft", True, draft_detail))
+            except (OperationError, RuntimeError, ValueError) as error:
+                sections.append(SectionStatus("draft", False, str(error)))
+        else:
+            sections.append(SectionStatus("draft", True, "none"))
         try:
             persona = PersonaService(
                 JsonFilePersonaRepository(self._paths.data_dir / "personas.json")
@@ -1681,27 +2035,26 @@ class SetupWorkflow:
             )
         except (KeyError, LookupError, RuntimeError, ValueError) as error:
             sections.append(SectionStatus("persona", False, str(error)))
-        default = self._store.default_provider
-        credential = (
-            self._store.credential_for(default) if default else None
-        )
-        if isinstance(activation, dict) and activation.get("provider") == "fake":
-            sections.append(SectionStatus("provider", True, "fake (demo mode)"))
-        elif default and credential is not None:
-            state = "verified" if credential.verified else "INACTIVE (unverified)"
-            model = credential.model or "default model"
-            when = credential.verified_at or "never"
-            sections.append(
-                SectionStatus(
-                    "provider",
-                    credential.verified,
-                    f"{default}, model {model}, {state}, last verified {when}",
-                )
+        try:
+            provider = RuntimeProviderSettings.load(
+                self._paths.data_dir,
+                credentials_path=self._paths.credentials_path,
+                environ=self._services.environ,
             )
-        else:
-            sections.append(
-                SectionStatus("provider", False, "no active provider credential")
+            verified_at = (
+                str(activation.get("verified_at") or "never")
+                if isinstance(activation, dict)
+                else "never"
             )
+            detail = (
+                f"{provider.provider_name}, model {provider.model}, verified, "
+                f"last verified {verified_at}"
+            )
+            if provider.provider_name == "fake":
+                detail = f"fake (demo mode), model {provider.model}"
+            sections.append(SectionStatus("provider", True, detail))
+        except (KeyError, RuntimeError, ValueError) as error:
+            sections.append(SectionStatus("provider", False, str(error)))
         try:
             runtime = load_installation_runtime(
                 self._paths.data_dir,
@@ -1721,32 +2074,44 @@ class SetupWorkflow:
         telegram = telegram_connector_status(self._paths.telegram_config_path)
         sections.append(
             SectionStatus(
+                "gateway",
+                True,
+                "not running; start with reckoning gateway",
+            )
+        )
+        sections.append(
+            SectionStatus(
                 "connectors",
                 telegram not in ("error",),
-                f"telegram {telegram}; gateway is not started by setup "
-                "(reckoning gateway runs it)",
+                f"telegram {telegram}",
             )
         )
         return tuple(sections)
 
     def _verify_all(self) -> None:
-        default = self._store.default_provider
-        credential = (
-            self._store.credential_for(default) if default else None
-        )
-        if default and credential is not None:
-            definition = find_provider(default)
-            if definition.group in ("direct", "gateway"):
+        try:
+            provider = RuntimeProviderSettings.load(
+                self._paths.data_dir,
+                credentials_path=self._paths.credentials_path,
+                environ=self._services.environ,
+            )
+            definition = find_provider(provider.provider_name)
+        except (KeyError, RuntimeError, ValueError) as error:
+            self._ui.failure(f"Provider check failed: {error}")
+        else:
+            if provider.provider_name == "fake":
+                self._ui.info("Fake is deterministic demo mode; no live check ran.")
+            elif definition.group in ("direct", "gateway") or (
+                definition.group == "custom" and provider.api_key
+            ):
                 if not self._ui.confirm(
                     "verify-paid-refresh", STATUS_PAID_REFRESH, default=False
                 ):
                     self._ui.info("Skipped the paid provider check.")
                 else:
-                    self._verify_saved_provider(default, credential)
+                    self._verify_active_provider(provider)
             else:
-                self._verify_saved_provider(default, credential)
-        else:
-            self._ui.info("No stored provider credential to verify.")
+                self._verify_active_provider(provider)
         if self._paths.telegram_config_path.exists():
             try:
                 config = TelegramConnectorConfig.load(
@@ -1759,27 +2124,40 @@ class SetupWorkflow:
             except (ValueError, RuntimeError) as error:
                 self._ui.failure(f"Telegram check failed: {error}")
 
-    def _verify_saved_provider(
-        self, provider_id: str, credential: StoredCredential
-    ) -> None:
-        definition = find_provider(provider_id)
-        api_key = credential.resolve_secret(self._services.environ)
-        if api_key == "endpoint-only":
-            api_key = None
+    def _verify_active_provider(self, provider: RuntimeProviderSettings) -> None:
+        definition = find_provider(provider.provider_name)
         config = AdapterConfig(
-            api_key=api_key,
-            base_url=credential.base_url,
-            model=credential.model,
+            api_key=provider.api_key,
+            base_url=provider.base_url,
+            model=provider.model,
+            protocol=provider.protocol,
+            context_window=provider.context_window,
+            headers=provider.headers,
         )
         try:
-            result = self._services.adapter_for(provider_id).verify(
+            result = self._services.adapter_for(provider.provider_name).verify(
                 config, transport=self._services.transport
             )
         except (ProviderVerificationError, KeyError) as error:
             self._ui.failure(f"{definition.display_name}: {error}")
             return
-        self._store.mark_verified(provider_id)
-        self._store.save(self._paths.credentials_path)
+        credential = self._store.credential_for(provider.provider_name)
+        if credential is not None:
+            self._store.mark_verified(provider.provider_name)
+            self._store.save(self._paths.credentials_path)
+        instance = read_json(self._paths.data_dir / "instance.json", default={})
+        activation = instance.get("activation")
+        if isinstance(activation, dict):
+            atomic_write_json(
+                self._paths.data_dir / "instance.json",
+                {
+                    **instance,
+                    "activation": {
+                        **activation,
+                        "verified_at": datetime.now(UTC).isoformat(),
+                    },
+                },
+            )
         self._ui.success(
             f"{definition.display_name} verified in {result.latency_ms} ms."
         )
@@ -1789,19 +2167,97 @@ class SetupWorkflow:
             self._edit_installed_persona()
         elif section == "provider":
             self._step_provider()
-            provider_id = self._draft.provider_id
-            if provider_id and provider_id != "fake":
-                self._store.default_provider = provider_id
-                self._store.save(self._paths.credentials_path)
-                self._update_telegram_provider(provider_id)
+            self._commit_installed_provider()
             self._paths.draft_path.unlink(missing_ok=True)
         elif section == "profile":
             self._step_profile()
             self._append_installed_profile_entries()
         elif section == "connectors":
             self._setup_telegram()
+        elif section == "migration":
+            self._maybe_offer_migration()
+        elif section == "draft":
+            if self._ui.confirm(
+                "repair-draft-remove",
+                "Remove the invalid setup draft?",
+                default=False,
+            ):
+                self._paths.draft_path.unlink(missing_ok=True)
+                self._ui.success("The invalid setup draft was removed.")
+            else:
+                self._ui.info("The invalid setup draft was left unchanged.")
         else:
             raise SetupInputError(f"Unknown section: {section}")
+
+    def _commit_installed_provider(self) -> None:
+        provider_id = self._draft.provider_id
+        if provider_id is None:
+            raise OperationError("No provider was selected.")
+        definition = find_provider(provider_id)
+        instance_path = self._paths.data_dir / "instance.json"
+        instance = read_json(instance_path, default={})
+        activation = instance.get("activation")
+        if not isinstance(activation, dict):
+            raise OperationError("The installation has no activation record.")
+        snapshots = (
+            _FileSnapshot.capture(instance_path),
+            _FileSnapshot.capture(self._paths.credentials_path),
+            _FileSnapshot.capture(self._paths.telegram_config_path),
+        )
+        try:
+            self._store.default_provider = (
+                provider_id
+                if definition.auth in ("api-key", "custom-endpoint")
+                else None
+            )
+            if self._store.providers or self._paths.credentials_path.exists():
+                self._store.save(self._paths.credentials_path)
+            self._update_telegram_provider(provider_id)
+            atomic_write_json(
+                instance_path,
+                {
+                    **instance,
+                    "activation": {
+                        **activation,
+                        "provider": provider_id,
+                        "model": self._draft.provider_model,
+                        "base_url": self._draft.provider_base_url,
+                        "protocol": self._draft.provider_protocol,
+                        "context_window": self._draft.provider_context_window,
+                        "header_env": self._draft.provider_header_env,
+                        "demo": self._draft.provider_demo,
+                        "verified_at": self._draft.provider_verified_at,
+                    },
+                },
+            )
+            reopened = RuntimeProviderSettings.load(
+                self._paths.data_dir,
+                credentials_path=self._paths.credentials_path,
+                environ=self._services.environ,
+            )
+            if reopened.provider_name != provider_id:
+                raise OperationError(
+                    "The installed provider does not match the verified provider."
+                )
+        except (OSError, RuntimeError, ValueError) as error:
+            rollback_errors: list[str] = []
+            for snapshot in snapshots:
+                try:
+                    snapshot.restore()
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            self._store = ProviderCredentialStore.load(
+                self._paths.credentials_path
+            )
+            rollback_note = (
+                f" Rollback also failed: {'; '.join(rollback_errors)}."
+                if rollback_errors
+                else ""
+            )
+            raise OperationError(
+                f"Provider update failed and was rolled back: {error}."
+                f"{rollback_note}"
+            ) from error
 
     def _edit_installed_persona(self) -> None:
         service = PersonaService(

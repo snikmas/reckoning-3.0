@@ -189,8 +189,106 @@ def test_non_interactive_setup_reports_stable_json(tmp_path: Path) -> None:
     assert returncode == 0
     payload = jsonlib.loads(stdout.strip().splitlines()[-1])
     assert payload["status"] == "activated"
+    assert payload["result"] == "complete"
     assert payload["provider"] == "fake"
     assert payload["demo"] is True
+
+
+def test_non_interactive_json_reports_invalid_setup_as_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json as jsonlib
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    returncode, stdout, stderr = run_dispatcher(
+        "setup",
+        "--non-interactive",
+        "--json",
+        "--provider",
+        "deepseek",
+        "--data-dir",
+        str(tmp_path / "invalid-json-instance"),
+        *setup_paths(tmp_path),
+    )
+
+    assert returncode == 2
+    assert stderr == ""
+    payload = jsonlib.loads(stdout)
+    assert payload["status"] == "invalid"
+    assert payload["result"] == "invalid"
+    assert "DEEPSEEK_API_KEY is required" in payload["error"]
+    assert payload["activated"] is False
+
+
+def test_json_reports_an_interrupted_setup_as_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json as jsonlib
+
+    answers = iter(("quick", "simon", "y", "n", "exit"))
+    monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
+    returncode, stdout, stderr = run_dispatcher(
+        "setup",
+        "--json",
+        "--data-dir",
+        str(tmp_path / "incomplete-json-instance"),
+        *setup_paths(tmp_path),
+    )
+
+    assert returncode == 1
+    assert stderr == ""
+    payload = jsonlib.loads(stdout.strip().splitlines()[-1])
+    assert payload["status"] == "draft"
+    assert payload["result"] == "incomplete"
+    assert payload["demo"] is False
+
+
+def test_command_line_secret_values_are_rejected_without_echoing_them(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-must-not-appear"
+
+    returncode, stdout, stderr = run_dispatcher(
+        "setup",
+        "--non-interactive",
+        "--api-key",
+        secret,
+        "--data-dir",
+        str(tmp_path / "secret-instance"),
+        *setup_paths(tmp_path),
+    )
+
+    assert returncode == 2
+    assert secret not in stdout
+    assert secret not in stderr
+    assert "--credential-env" in stderr
+
+
+@pytest.mark.parametrize(
+    ("provider_args", "expected"),
+    (
+        (("--credential-env", "CUSTOM_TOKEN"), "requires --provider"),
+        (
+            ("--provider", "deepseek", "--header-env", "X-Tenant=CUSTOM_TENANT"),
+            "only valid with --provider custom",
+        ),
+    ),
+)
+def test_provider_specific_script_flags_reject_ambiguous_combinations(
+    tmp_path: Path, provider_args: tuple[str, ...], expected: str
+) -> None:
+    returncode, _stdout, stderr = run_dispatcher(
+        "setup",
+        "--non-interactive",
+        *provider_args,
+        "--data-dir",
+        str(tmp_path / "invalid-flags-instance"),
+        *setup_paths(tmp_path),
+    )
+
+    assert returncode == 2
+    assert expected in stderr
+    assert not (tmp_path / "invalid-flags-instance").exists()
 
 
 def test_non_interactive_setup_requires_env_references_for_secrets(
