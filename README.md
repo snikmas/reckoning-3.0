@@ -121,13 +121,18 @@ repository root; those values take precedence over the saved credential. See
 
 ## Storage and access limits
 
-The default instance stores live state as plain JSON under
-`~/.local/state/reckoning`. Use `reckoning backup` to create an encrypted
-archive.
+The default instance stores live state under `~/.local/state/reckoning`.
+Transactional records use the placement-root SQLite database. Small JSON files
+hold configuration and compatibility pointers. Use `reckoning backup` to create
+one encrypted archive of both formats.
 
 The built-in web server accepts loopback addresses only and has no public
 login. Do not expose it directly to the internet. For remote access to a
-personal server, use an SSH tunnel.
+personal server, use an SSH tunnel. Every browser mutation requires the
+configured Host, an allowed Origin when the browser sends one, and a
+session-bound form token. See
+[web access](docs/operations.md#use-the-web-interface-safely) for the supported
+origin and private-access contract.
 
 Reckoning supports `local`, `personal-server`, and `hybrid` placement profiles.
 The local profile is the default. See [operations](docs/operations.md) for

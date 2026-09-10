@@ -1079,6 +1079,43 @@ def test_hybrid_remote_run_withholds_all_local_context_categories(
     assert responder.requests[0].recent_history == ()
 
 
+def test_unavailable_confirmed_state_is_not_disclosed_through_personal_context(
+    tmp_path: Path,
+) -> None:
+    policy = PlacementPolicy(
+        profile="hybrid",
+        categories=(
+            SourcePlacement(
+                category="personal-context",
+                sensitivity="private",
+                storage_node="local",
+                processing_node="local",
+            ),
+            SourcePlacement(
+                category="confirmed-state",
+                sensitivity="private",
+                storage_node="server",
+                processing_node="server",
+                remote_approved=True,
+            ),
+        ),
+        local_node_available=True,
+        server_node_available=False,
+    )
+    state = InterfaceState(
+        confirmed_records=("private decision d-1",),
+        permissions=("calendar.read",),
+    )
+    interface, responder = build_interface(tmp_path, state=state, policy=policy)
+
+    reply = interface.send_channel_message("web", "Use available context only.")
+
+    assert reply.placement.status == "limited"
+    assert responder.requests[0].available_categories == ("personal-context",)
+    assert responder.requests[0].confirmed_records == ()
+    assert responder.requests[0].permissions == ()
+
+
 def test_installed_hybrid_outage_gives_web_and_telegram_identical_truth(
     tmp_path: Path,
 ) -> None:

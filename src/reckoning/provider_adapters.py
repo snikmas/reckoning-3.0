@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Literal, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from reckoning.provider_registry import (
@@ -536,6 +536,364 @@ class DeepSeekProviderAdapter(OpenAICompatibleAdapter):
         return {"thinking": {"type": "disabled"}}
 
 
+class AnthropicProviderAdapter(OpenAICompatibleAdapter):
+    """Anthropic's Messages API behind the shared provider contract."""
+
+    def discover_models(
+        self,
+        config: AdapterConfig,
+        *,
+        transport: Transport = urlopen_transport,
+        timeout_seconds: float = 15.0,
+    ) -> tuple[str, ...]:
+        request = Request(
+            f"{_validated_base_url(self._definition, config.base_url)}/models",
+            headers=self._request_headers(config),
+            method="GET",
+        )
+        try:
+            parsed = json.loads(transport(request, timeout_seconds).decode("utf-8"))
+            data = parsed["data"]
+            if not isinstance(data, list):
+                raise TypeError("model data is not a list")
+            models = tuple(
+                sorted(
+                    item["id"].strip()
+                    for item in data
+                    if isinstance(item, dict)
+                    and isinstance(item.get("id"), str)
+                    and item["id"].strip()
+                )
+            )
+        except HTTPError as error:
+            raise ModelDiscoveryError(
+                _redact(
+                    f"Anthropic returned HTTP {error.code} while listing models.",
+                    config.api_key,
+                )
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
+            reason = getattr(error, "reason", error)
+            raise ModelDiscoveryError(
+                f"Anthropic could not be reached: {reason}"
+            ) from error
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ModelDiscoveryError(
+                "Anthropic returned an invalid model list."
+            ) from error
+        if not models:
+            raise ModelDiscoveryError(
+                "Anthropic listed no models; enter a model ID manually under Advanced."
+            )
+        return models
+
+    def _chat(
+        self,
+        config: AdapterConfig,
+        model: str,
+        messages: tuple[tuple[str, str], ...],
+        *,
+        transport: Transport,
+        timeout_seconds: float,
+        max_retries: int,
+        timer: Callable[[], float],
+        max_tokens: int | None = None,
+        verification_request_fields: Mapping[str, object] | None = None,
+    ) -> ProviderVerification:
+        del verification_request_fields
+        system = "\n\n".join(content for role, content in messages if role == "system")
+        conversation = []
+        for role, content in messages:
+            if role == "system":
+                continue
+            if role not in ("user", "assistant"):
+                raise ProviderVerificationError(f"Unsupported message role: {role}")
+            conversation.append({"role": role, "content": content})
+        body: dict[str, object] = {
+            "model": model,
+            "messages": conversation,
+            "max_tokens": max_tokens if max_tokens is not None else 4096,
+            "stream": False,
+        }
+        if system:
+            body["system"] = system
+        return self._send_anthropic(
+            config,
+            body,
+            model=model,
+            transport=transport,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            timer=timer,
+        )
+
+    def _send_anthropic(
+        self,
+        config: AdapterConfig,
+        body: dict[str, object],
+        *,
+        model: str,
+        transport: Transport,
+        timeout_seconds: float,
+        max_retries: int,
+        timer: Callable[[], float],
+    ) -> ProviderVerification:
+        payload = json.dumps(body).encode("utf-8")
+        started = timer()
+        last_error = "Anthropic did not return a response."
+        for attempt in range(max(0, max_retries) + 1):
+            request = Request(
+                f"{_validated_base_url(self._definition, config.base_url)}/messages",
+                data=payload,
+                headers={
+                    **self._request_headers(config),
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                raw = transport(request, timeout_seconds)
+                return self._parse_anthropic_completion(
+                    raw, model=model, started=started, attempt=attempt, timer=timer
+                )
+            except HTTPError as error:
+                last_error = self._http_error_message(error, config)
+                if error.code < 500 and error.code != 429:
+                    break
+            except (URLError, TimeoutError, OSError) as error:
+                reason = getattr(error, "reason", error)
+                last_error = f"Anthropic could not be reached: {reason}"
+            except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+                last_error = "Anthropic returned an invalid response."
+                break
+        raise ProviderVerificationError(
+            _redact(last_error, config.api_key),
+            model_calls=attempt + 1,
+            latency_ms=round((timer() - started) * 1000),
+            retries=attempt,
+        )
+
+    def _parse_anthropic_completion(
+        self,
+        raw: bytes,
+        *,
+        model: str,
+        started: float,
+        attempt: int,
+        timer: Callable[[], float],
+    ) -> ProviderVerification:
+        parsed = json.loads(raw.decode("utf-8"))
+        blocks = parsed["content"]
+        if not isinstance(blocks, list):
+            raise TypeError("content is not a list")
+        text = "".join(
+            block["text"]
+            for block in blocks
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ).strip()
+        if not text:
+            raise ValueError("content has no text")
+        usage = parsed.get("usage") or {}
+        if not isinstance(usage, dict):
+            raise TypeError("usage is not an object")
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        served_model = parsed.get("model")
+        return ProviderVerification(
+            provider=self._definition.id,
+            model=served_model if isinstance(served_model, str) else model,
+            content=text,
+            latency_ms=round((timer() - started) * 1000),
+            retries=attempt,
+            usage=ProviderUsage(
+                input_tokens, output_tokens, input_tokens + output_tokens
+            ),
+        )
+
+    def _request_headers(self, config: AdapterConfig) -> dict[str, str]:
+        if config.headers:
+            raise ProviderVerificationError("Anthropic does not accept custom headers.")
+        return {
+            "x-api-key": (config.api_key or "").strip(),
+            "anthropic-version": "2023-06-01",
+        }
+
+
+class GeminiProviderAdapter(OpenAICompatibleAdapter):
+    """Google Gemini's generateContent API behind the shared contract."""
+
+    def discover_models(
+        self,
+        config: AdapterConfig,
+        *,
+        transport: Transport = urlopen_transport,
+        timeout_seconds: float = 15.0,
+    ) -> tuple[str, ...]:
+        request = Request(
+            f"{_validated_base_url(self._definition, config.base_url)}/models",
+            headers=self._request_headers(config),
+            method="GET",
+        )
+        try:
+            parsed = json.loads(transport(request, timeout_seconds).decode("utf-8"))
+            data = parsed["models"]
+            if not isinstance(data, list):
+                raise TypeError("model data is not a list")
+            models = tuple(
+                sorted(
+                    item["name"].removeprefix("models/").strip()
+                    for item in data
+                    if isinstance(item, dict)
+                    and isinstance(item.get("name"), str)
+                    and "generateContent"
+                    in item.get("supportedGenerationMethods", ())
+                )
+            )
+        except HTTPError as error:
+            raise ModelDiscoveryError(
+                _redact(
+                    f"Google Gemini returned HTTP {error.code} while listing models.",
+                    config.api_key,
+                )
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
+            reason = getattr(error, "reason", error)
+            raise ModelDiscoveryError(
+                f"Google Gemini could not be reached: {reason}"
+            ) from error
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ModelDiscoveryError(
+                "Google Gemini returned an invalid model list."
+            ) from error
+        if not models:
+            raise ModelDiscoveryError(
+                "Google Gemini listed no generation models; "
+                "enter a model ID manually under Advanced."
+            )
+        return models
+
+    def _chat(
+        self,
+        config: AdapterConfig,
+        model: str,
+        messages: tuple[tuple[str, str], ...],
+        *,
+        transport: Transport,
+        timeout_seconds: float,
+        max_retries: int,
+        timer: Callable[[], float],
+        max_tokens: int | None = None,
+        verification_request_fields: Mapping[str, object] | None = None,
+    ) -> ProviderVerification:
+        del verification_request_fields
+        system = "\n\n".join(content for role, content in messages if role == "system")
+        contents = []
+        for role, content in messages:
+            if role == "system":
+                continue
+            if role not in ("user", "assistant"):
+                raise ProviderVerificationError(f"Unsupported message role: {role}")
+            contents.append(
+                {
+                    "role": "model" if role == "assistant" else "user",
+                    "parts": [{"text": content}],
+                }
+            )
+        body: dict[str, object] = {"contents": contents}
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        if max_tokens is not None:
+            body["generationConfig"] = {"maxOutputTokens": max_tokens}
+        model_id = model.removeprefix("models/").strip()
+        endpoint = (
+            f"{_validated_base_url(self._definition, config.base_url)}/models/"
+            f"{quote(model_id, safe='')}:generateContent"
+        )
+        payload = json.dumps(body).encode("utf-8")
+        started = timer()
+        last_error = "Google Gemini did not return a response."
+        for attempt in range(max(0, max_retries) + 1):
+            request = Request(
+                endpoint,
+                data=payload,
+                headers={
+                    **self._request_headers(config),
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                raw = transport(request, timeout_seconds)
+                return self._parse_gemini_completion(
+                    raw, model=model_id, started=started, attempt=attempt, timer=timer
+                )
+            except HTTPError as error:
+                last_error = self._http_error_message(error, config)
+                if error.code < 500 and error.code != 429:
+                    break
+            except (URLError, TimeoutError, OSError) as error:
+                last_error = (
+                    "Google Gemini could not be reached: "
+                    f"{getattr(error, 'reason', error)}"
+                )
+            except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+                last_error = "Google Gemini returned an invalid response."
+                break
+        raise ProviderVerificationError(
+            _redact(last_error, config.api_key),
+            model_calls=attempt + 1,
+            latency_ms=round((timer() - started) * 1000),
+            retries=attempt,
+        )
+
+    def _parse_gemini_completion(
+        self,
+        raw: bytes,
+        *,
+        model: str,
+        started: float,
+        attempt: int,
+        timer: Callable[[], float],
+    ) -> ProviderVerification:
+        parsed = json.loads(raw.decode("utf-8"))
+        parts = parsed["candidates"][0]["content"]["parts"]
+        if not isinstance(parts, list):
+            raise TypeError("parts is not a list")
+        text = "".join(
+            part["text"]
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ).strip()
+        if not text:
+            raise ValueError("content has no text")
+        usage = parsed.get("usageMetadata") or {}
+        if not isinstance(usage, dict):
+            raise TypeError("usage metadata is not an object")
+        input_tokens = int(usage.get("promptTokenCount", 0) or 0)
+        output_tokens = int(usage.get("candidatesTokenCount", 0) or 0)
+        total_tokens = int(
+            usage.get("totalTokenCount", input_tokens + output_tokens) or 0
+        )
+        served_model = parsed.get("modelVersion")
+        return ProviderVerification(
+            provider=self._definition.id,
+            model=served_model if isinstance(served_model, str) else model,
+            content=text,
+            latency_ms=round((timer() - started) * 1000),
+            retries=attempt,
+            usage=ProviderUsage(input_tokens, output_tokens, total_tokens),
+        )
+
+    def _request_headers(self, config: AdapterConfig) -> dict[str, str]:
+        if config.headers:
+            raise ProviderVerificationError(
+                "Google Gemini does not accept custom headers."
+            )
+        return {"x-goog-api-key": (config.api_key or "").strip()}
+
+
 class FakeProviderAdapter:
     """The deterministic offline provider; verification makes no requests."""
 
@@ -622,6 +980,10 @@ def candidate_adapter_for(provider_id: str) -> SetupProviderAdapter:
         return OpenAIProviderAdapter(definition)
     if definition.id == "deepseek":
         return DeepSeekProviderAdapter(definition)
+    if definition.id == "anthropic":
+        return AnthropicProviderAdapter(definition)
+    if definition.id == "google-gemini":
+        return GeminiProviderAdapter(definition)
     return OpenAICompatibleAdapter(definition)
 
 

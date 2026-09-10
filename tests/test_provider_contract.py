@@ -27,6 +27,7 @@ from reckoning.provider_adapters import (
     setup_adapter_for,
 )
 from reckoning.provider_registry import available_providers
+from reckoning.providers import ProviderUsage
 
 ADAPTERS = available_adapters()
 ADAPTER_IDS = [adapter.definition.id for adapter in ADAPTERS]

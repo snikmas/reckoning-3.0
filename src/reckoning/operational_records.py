@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from contextlib import closing
+from dataclasses import asdict
 from datetime import datetime
+import json
 from pathlib import Path
+import sqlite3
 from collections.abc import Iterable
 from typing import Any
 
@@ -11,6 +15,7 @@ from reckoning.interfaces import (
     RunReceipt,
 )
 from reckoning.json_store import read_json
+from reckoning.root_database import ROOT_DATABASE_FILENAME, logical_root_for
 
 
 class LocalOperationalRecordSource:
@@ -37,11 +42,32 @@ class LocalOperationalRecordSource:
         )
 
     def _continuity_snapshot(self) -> OperationalSnapshot:
+        continuity_path = self._data_dir / "continuity.json"
         data = read_json(
-            self._data_dir / "continuity.json",
+            continuity_path,
             default={"schema_version": 1, "reckonings": [], "check_ins": []},
         )
-        if data.get("schema_version") != 1:
+        if data.get("schema_version") == 2 and data.get("authority") == "sqlite":
+            database = logical_root_for(continuity_path) / ROOT_DATABASE_FILENAME
+            try:
+                with closing(
+                    sqlite3.connect(
+                        f"{database.resolve().as_uri()}?mode=ro", uri=True
+                    )
+                ) as connection:
+                    reckonings = [
+                        json.loads(str(row[0]))
+                        for row in connection.execute(
+                            "SELECT payload FROM continuity_reckonings "
+                            "ORDER BY sequence"
+                        ).fetchall()
+                    ]
+                data = {"schema_version": 1, "reckonings": reckonings}
+            except (sqlite3.Error, json.JSONDecodeError) as error:
+                raise RuntimeError(
+                    "Continuity operational storage is invalid."
+                ) from error
+        elif data.get("schema_version") != 1:
             raise RuntimeError("Unsupported continuity storage schema.")
         memory: list[str] = []
         evidence: list[str] = []
@@ -62,11 +88,23 @@ class LocalOperationalRecordSource:
         return OperationalSnapshot(evidence=tuple(evidence), memory=tuple(memory))
 
     def _model_run_snapshot(self) -> OperationalSnapshot:
+        model_run_path = self._data_dir / "model-runs.json"
         data = read_json(
-            self._data_dir / "model-runs.json",
+            model_run_path,
             default={"schema_version": 1, "runs": []},
         )
-        if data.get("schema_version") != 1:
+        if data.get("schema_version") == 2 and data.get("authority") == "sqlite":
+            from reckoning.model_run_store import SQLiteModelRunRepository
+
+            runs = SQLiteModelRunRepository(model_run_path).list_runs()
+            data = {
+                "schema_version": 1,
+                "runs": [
+                    {**asdict(run), "requested_at": run.requested_at.isoformat()}
+                    for run in runs
+                ],
+            }
+        elif data.get("schema_version") != 1:
             raise RuntimeError("Unsupported model-run storage schema.")
         receipts: list[RunReceipt] = []
         failures: list[OperationalFailure] = []

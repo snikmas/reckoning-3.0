@@ -19,6 +19,11 @@ from reckoning.delegation import (
     DelegationRequest,
     InMemoryDelegationReceiptRepository,
 )
+from reckoning.processing import (
+    JsonFileProcessingGrantRepository,
+    ProcessingDestination,
+    ProcessingScope,
+)
 
 
 class ExactContextSource:
@@ -121,6 +126,7 @@ def run(
     model: ModelGateway | None = None,
     tools: ToolGateway | None = None,
     receipts: InMemoryDelegationReceiptRepository | None = None,
+    processing_authorizer: ProcessingScope | None = None,
 ):
     context = context or ExactContextSource()
     model = model or ModelGateway()
@@ -133,6 +139,7 @@ def run(
         receipts,
         model_gateway=model,
         tool_gateway=tools,
+        processing_authorizer=processing_authorizer,
     ).delegate(
         bounded_request(),
         bounded_policy(),
@@ -140,6 +147,46 @@ def run(
         started_at=datetime(2026, 8, 31, 8, 0, tzinfo=timezone.utc),
     )
     return outcome, context, model, tools
+
+
+def test_delegated_context_is_not_read_or_sent_without_destination_grant(
+    tmp_path,
+) -> None:
+    class Worker:
+        def execute(self, task: Any, runtime: BoundedWorkerRuntime):
+            runtime.call_model("must not run")
+            raise AssertionError("blocked delegated work must not execute")
+
+    scope = ProcessingScope(
+        JsonFileProcessingGrantRepository(tmp_path / "processing-grants.json"),
+        ProcessingDestination("fake-worker", "https://worker.example.test", "cloud"),
+    )
+    context = ExactContextSource()
+    model = ModelGateway()
+    reviewer = SimonReviewer(
+        AgentDisposition("blocked", "No delegated result.", "Grant missing.")
+    )
+
+    outcome, _, _, _ = run(
+        Worker(),
+        reviewer,
+        context=context,
+        model=model,
+        processing_authorizer=scope,
+    )
+
+    assert outcome.receipt.result == "blocked"
+    assert "processing grants" in outcome.receipt.policy_violations[0]
+    assert context.requested == []
+    assert model.calls == []
+
+    scope.change(
+        ("delegated-context",),
+        changed_at=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        expected_version=0,
+    )
+    decision = scope.authorize_delegation("fake-worker", ("active_goal",))
+    assert decision.blocked_categories == ()
 
 
 def test_exact_context_and_host_measured_receipt() -> None:

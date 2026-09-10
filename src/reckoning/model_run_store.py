@@ -213,7 +213,9 @@ def snapshot_database(path: Path) -> bytes:
 
 
 def validate_database(path: Path) -> None:
+    from reckoning.persistence import validate_continuity_schema
     from reckoning.personal_context import validate_personal_context_schema
+    from reckoning.trials import validate_trial_schema
 
     try:
         connection = sqlite3.connect(
@@ -233,7 +235,9 @@ def validate_database(path: Path) -> None:
             has_model_runs = table_exists(connection, "model_runs")
             if (model_run_version is None) != (not has_model_runs):
                 raise RuntimeError("Incomplete model-run storage schema.")
+            validate_continuity_schema(connection)
             validate_personal_context_schema(connection)
+            validate_trial_schema(connection)
         finally:
             connection.close()
     except sqlite3.Error as error:

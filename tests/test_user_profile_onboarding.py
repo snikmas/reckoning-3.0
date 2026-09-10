@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from io import BytesIO
@@ -80,6 +81,8 @@ def request(
     method: str,
     path: str,
     form: dict[str, str] | None = None,
+    *,
+    cookie: str = "",
 ) -> tuple[str, dict[str, str], bytes]:
     body = urlencode(form or {}).encode("utf-8")
     captured_status = ""
@@ -95,17 +98,19 @@ def request(
         captured_status = status
         captured_headers = dict(headers)
 
-    response = application(
-        {
+    environ = {
             "REQUEST_METHOD": method,
             "PATH_INFO": path,
             "CONTENT_LENGTH": str(len(body)),
             "CONTENT_TYPE": "application/x-www-form-urlencoded",
             "wsgi.input": BytesIO(body),
             "REMOTE_ADDR": "127.0.0.1",
-        },
-        start_response,
-    )
+            "SERVER_NAME": "127.0.0.1",
+            "SERVER_PORT": "8000",
+        }
+    if cookie:
+        environ["HTTP_COOKIE"] = cookie
+    response = application(environ, start_response)
     return captured_status, captured_headers, b"".join(response)
 
 
@@ -272,17 +277,27 @@ I am learning backend programming.
     web = ReckoningWebApplication(application, interface_application=interface)
     proposal_id = application.profile_proposals()[0].record_id
 
-    _, _, initial_page = request(web, "GET", "/simon")
+    _, initial_headers, initial_page = request(web, "GET", "/simon")
     assert b"Review your profile" not in initial_page
+    cookie = initial_headers["Set-Cookie"].split(";", 1)[0]
+    token_match = re.search(
+        rb'name="_csrf_token"\s+value="([^"]+)"', initial_page
+    )
+    assert token_match is not None
+    csrf_token = token_match.group(1).decode()
 
     status, headers, _ = request(
         web,
         "POST",
         "/messages",
-        {"message": "How should I practice backend programming?"},
+        {
+            "message": "How should I practice backend programming?",
+            "_csrf_token": csrf_token,
+        },
+        cookie=cookie,
     )
     assert status == "303 See Other"
-    assert headers["Location"] == "/"
+    assert headers["Location"] == "/simon"
 
     _, _, review_page = request(web, "GET", "/simon")
     assert b"Review your profile" in review_page
@@ -294,14 +309,22 @@ I am learning backend programming.
         web,
         "POST",
         f"/profile/{proposal_id}/correct",
-        {"meaning": "I currently focus on backend engineering."},
+        {
+            "meaning": "I currently focus on backend engineering.",
+            "_csrf_token": csrf_token,
+        },
+        cookie=cookie,
     )
     assert status == "303 See Other"
     _, _, corrected_page = request(web, "GET", "/simon")
     assert b"I currently focus on backend engineering." in corrected_page
 
     status, _, _ = request(
-        web, "POST", f"/profile/{proposal_id}/confirm"
+        web,
+        "POST",
+        f"/profile/{proposal_id}/confirm",
+        {"_csrf_token": csrf_token},
+        cookie=cookie,
     )
     assert status == "303 See Other"
     assert application.profile_proposals() == ()

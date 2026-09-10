@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from hmac import compare_digest
 from html import escape
+from http.cookies import SimpleCookie
 from ipaddress import ip_address
 from pathlib import Path
+from secrets import token_urlsafe
 from typing import Iterable
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 from wsgiref.simple_server import make_server
 from wsgiref.types import StartResponse, WSGIEnvironment
 
@@ -22,6 +25,7 @@ from reckoning.interfaces import (
     create_local_interface_application,
 )
 from reckoning.operations import OperationError, load_installation_runtime
+from reckoning.processing import PROCESSING_CATEGORIES
 from reckoning.provider_adapters import AdapterConfig
 
 
@@ -40,6 +44,43 @@ def validate_bind_host(host: str) -> str:
         )
     return host
 
+
+def validate_allowed_origin(origin: str) -> str:
+    """Return one canonical browser origin with no path or credentials."""
+    candidate = origin.strip().rstrip("/")
+    parsed = urlsplit(candidate)
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError(f"invalid allowed browser origin: {origin}") from error
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"invalid allowed browser origin: {origin}")
+    scheme = parsed.scheme.casefold()
+    hostname = parsed.hostname.casefold()
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    port = parsed.port
+    if port in ({"http": 80, "https": 443}[scheme], None):
+        return f"{scheme}://{rendered_host}"
+    return f"{scheme}://{rendered_host}:{port}"
+
+
+def local_browser_origins(port: int) -> tuple[str, ...]:
+    """Supported loopback browser origins for the built-in server."""
+    return (
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+        f"http://[::1]:{port}",
+    )
+
+
 class ReckoningWebApplication:
     """A thin WSGI adapter for the Reckoning application boundary."""
 
@@ -48,19 +89,53 @@ class ReckoningWebApplication:
         application: ReckoningApplication,
         *,
         interface_application: ReckoningInterfaceApplication | None = None,
+        allowed_origins: tuple[str, ...] | None = None,
     ) -> None:
         self._application = application
         self._interfaces = interface_application
+        configured = allowed_origins or local_browser_origins(8000)
+        self._allowed_origins = frozenset(
+            validate_allowed_origin(origin) for origin in configured
+        )
+        if not self._allowed_origins:
+            raise ValueError("at least one allowed browser origin is required")
+        self._allowed_hosts = frozenset(
+            urlsplit(origin).netloc.casefold() for origin in self._allowed_origins
+        )
+        self._browser_sessions: dict[str, str] = {}
 
     def __call__(
         self, environ: WSGIEnvironment, start_response: StartResponse
     ) -> Iterable[bytes]:
         method = str(environ.get("REQUEST_METHOD", "GET")).upper()
         path = str(environ.get("PATH_INFO", "/"))
+        csrf_token = ""
+        response_headers: tuple[tuple[str, str], ...] = ()
+        if method == "GET":
+            csrf_token, cookie = self._browser_session(environ, create=True)
+            if cookie is not None:
+                response_headers = (("Set-Cookie", cookie),)
+        elif method not in {"HEAD", "OPTIONS"}:
+            if self._mutation_rejection(environ) is not None:
+                body = b"This request was rejected by the browser mutation policy."
+                start_response(
+                    "403 Forbidden",
+                    [
+                        ("Content-Type", "text/plain; charset=utf-8"),
+                        ("Content-Length", str(len(body))),
+                    ],
+                )
+                return [body]
+            csrf_token, _ = self._browser_session(environ, create=False)
 
         if self._interfaces is not None:
             interface_response = self._handle_interface_request(
-                method, path, environ, start_response
+                method,
+                path,
+                environ,
+                start_response,
+                csrf_token=csrf_token,
+                response_headers=response_headers,
             )
             if interface_response is not None:
                 return interface_response
@@ -69,7 +144,10 @@ class ReckoningWebApplication:
             return self._html_response(
                 start_response,
                 "200 OK",
-                self._render_session(self._application.open_session()),
+                self._render_session(
+                    self._application.open_session(), csrf_token=csrf_token
+                ),
+                extra_headers=response_headers,
             )
 
         if method == "POST" and path == "/messages":
@@ -80,7 +158,9 @@ class ReckoningWebApplication:
                     start_response,
                     "400 Bad Request",
                     self._render_session(
-                        self._application.open_session(), error=str(error)
+                        self._application.open_session(),
+                        error=str(error),
+                        csrf_token=csrf_token,
                     ),
                 )
             start_response("303 See Other", [("Location", "/"), ("Content-Length", "0")])
@@ -102,11 +182,19 @@ class ReckoningWebApplication:
         path: str,
         environ: WSGIEnvironment,
         start_response: StartResponse,
+        *,
+        csrf_token: str,
+        response_headers: tuple[tuple[str, str], ...],
     ) -> list[bytes] | None:
         assert self._interfaces is not None
         if (
-            method == "GET"
-            and (path == "/control" or path.startswith("/control/"))
+            (
+                (
+                    method == "GET"
+                    and (path == "/control" or path.startswith("/control/"))
+                )
+                or (method == "POST" and path == "/processing-scope")
+            )
             and not self._interfaces.administration_allowed(
                 str(environ.get("REMOTE_ADDR", "")),
                 private_network_authenticated=environ.get(
@@ -130,7 +218,8 @@ class ReckoningWebApplication:
             return self._html_response(
                 start_response,
                 "200 OK",
-                self._render_interface_area(area),
+                self._render_interface_area(area, csrf_token=csrf_token),
+                extra_headers=response_headers,
             )
         if method == "GET" and path in {
             "/home",
@@ -142,7 +231,10 @@ class ReckoningWebApplication:
             return self._html_response(
                 start_response,
                 "200 OK",
-                self._render_interface_area(path.removeprefix("/")),
+                self._render_interface_area(
+                    path.removeprefix("/"), csrf_token=csrf_token
+                ),
+                extra_headers=response_headers,
             )
         if method == "POST" and path == "/messages":
             try:
@@ -153,9 +245,37 @@ class ReckoningWebApplication:
                 return self._html_response(
                     start_response,
                     "400 Bad Request",
-                    self._render_interface_area("simon", error=str(error)),
+                    self._render_interface_area(
+                        "simon", error=str(error), csrf_token=csrf_token
+                    ),
                 )
-            start_response("303 See Other", [("Location", "/"), ("Content-Length", "0")])
+            start_response(
+                "303 See Other",
+                [("Location", "/simon"), ("Content-Length", "0")],
+            )
+            return [b""]
+        if method == "POST" and path == "/processing-scope":
+            try:
+                fields = self._read_form(environ)
+                expected_revision = int(
+                    fields.get("expected_revision", [""])[0]
+                )
+                categories = tuple(fields.get("category", []))
+                self._application.change_processing_scope(
+                    categories, expected_revision=expected_revision
+                )
+            except (RuntimeError, TypeError, ValueError) as error:
+                return self._html_response(
+                    start_response,
+                    "400 Bad Request",
+                    self._render_interface_area(
+                        "control", error=str(error), csrf_token=csrf_token
+                    ),
+                )
+            start_response(
+                "303 See Other",
+                [("Location", "/control"), ("Content-Length", "0")],
+            )
             return [b""]
         profile_action = self._profile_action(method, path)
         if profile_action is not None:
@@ -175,13 +295,73 @@ class ReckoningWebApplication:
                 return self._html_response(
                     start_response,
                     "400 Bad Request",
-                    self._render_interface_area("simon", error=str(error)),
+                    self._render_interface_area(
+                        "simon", error=str(error), csrf_token=csrf_token
+                    ),
                 )
             start_response(
                 "303 See Other",
                 [("Location", "/simon"), ("Content-Length", "0")],
             )
             return [b""]
+        return None
+
+    def _browser_session(
+        self, environ: WSGIEnvironment, *, create: bool
+    ) -> tuple[str, str | None]:
+        session_id = ""
+        raw_cookie = str(environ.get("HTTP_COOKIE", ""))
+        if raw_cookie:
+            cookies = SimpleCookie()
+            try:
+                cookies.load(raw_cookie)
+            except Exception:  # An invalid cookie is an absent browser session.
+                cookies = SimpleCookie()
+            morsel = cookies.get("reckoning_session")
+            session_id = morsel.value if morsel is not None else ""
+        csrf_token = self._browser_sessions.get(session_id, "")
+        if csrf_token or not create:
+            return csrf_token, None
+        session_id = token_urlsafe(24)
+        csrf_token = token_urlsafe(32)
+        self._browser_sessions[session_id] = csrf_token
+        cookie = (
+            f"reckoning_session={session_id}; Path=/; HttpOnly; "
+            "SameSite=Strict"
+        )
+        return csrf_token, cookie
+
+    def _mutation_rejection(self, environ: WSGIEnvironment) -> str | None:
+        host = str(environ.get("HTTP_HOST", "")).strip().casefold()
+        if not host:
+            server_name = str(environ.get("SERVER_NAME", "")).strip()
+            server_port = str(environ.get("SERVER_PORT", "")).strip()
+            host = f"{server_name}:{server_port}".casefold()
+        if host not in self._allowed_hosts:
+            return "untrusted host"
+
+        origin = str(environ.get("HTTP_ORIGIN", "")).strip()
+        if origin:
+            try:
+                normalized_origin = validate_allowed_origin(origin)
+            except ValueError:
+                return "invalid origin"
+            if normalized_origin not in self._allowed_origins:
+                return "untrusted origin"
+
+        fetch_site = str(environ.get("HTTP_SEC_FETCH_SITE", "")).strip().casefold()
+        if fetch_site == "cross-site":
+            return "cross-site request"
+
+        session_token, _ = self._browser_session(environ, create=False)
+        if not session_token:
+            return "missing or expired browser session"
+        try:
+            submitted_token = self._read_form_field(environ, "_csrf_token")
+        except (UnicodeDecodeError, ValueError):
+            return "invalid form"
+        if not submitted_token or not compare_digest(session_token, submitted_token):
+            return "invalid session token"
         return None
 
     @staticmethod
@@ -198,20 +378,19 @@ class ReckoningWebApplication:
 
     @staticmethod
     def _read_message(environ: WSGIEnvironment) -> str:
-        content_length = int(str(environ.get("CONTENT_LENGTH") or "0"))
-        if content_length > 65_536:
-            raise ValueError("The message is too long.")
-
-        input_stream = environ.get("wsgi.input")
-        if input_stream is None or not hasattr(input_stream, "read"):
-            raise ValueError("The request body is missing.")
-
-        body = input_stream.read(content_length).decode("utf-8")
-        fields = parse_qs(body, keep_blank_values=True)
+        fields = ReckoningWebApplication._read_form(environ)
         return fields.get("message", [""])[0]
 
     @staticmethod
     def _read_form_field(environ: WSGIEnvironment, name: str) -> str:
+        fields = ReckoningWebApplication._read_form(environ)
+        return fields.get(name, [""])[0]
+
+    @staticmethod
+    def _read_form(environ: WSGIEnvironment) -> dict[str, list[str]]:
+        cached = environ.get("reckoning.form_fields")
+        if isinstance(cached, dict):
+            return cached
         content_length = int(str(environ.get("CONTENT_LENGTH") or "0"))
         if content_length > 65_536:
             raise ValueError("The form is too long.")
@@ -220,11 +399,16 @@ class ReckoningWebApplication:
             raise ValueError("The request body is missing.")
         body = input_stream.read(content_length).decode("utf-8")
         fields = parse_qs(body, keep_blank_values=True)
-        return fields.get(name, [""])[0]
+        environ["reckoning.form_fields"] = fields
+        return fields
 
     @staticmethod
     def _html_response(
-        start_response: StartResponse, status: str, page: str
+        start_response: StartResponse,
+        status: str,
+        page: str,
+        *,
+        extra_headers: tuple[tuple[str, str], ...] = (),
     ) -> list[bytes]:
         body = page.encode("utf-8")
         start_response(
@@ -232,12 +416,18 @@ class ReckoningWebApplication:
             [
                 ("Content-Type", "text/html; charset=utf-8"),
                 ("Content-Length", str(len(body))),
+                *extra_headers,
             ],
         )
         return [body]
 
     @staticmethod
-    def _render_session(messages: tuple[Message, ...], error: str | None = None) -> str:
+    def _render_session(
+        messages: tuple[Message, ...],
+        error: str | None = None,
+        *,
+        csrf_token: str = "",
+    ) -> str:
         conversation = "".join(
             (
                 '<article class="message">'
@@ -281,6 +471,8 @@ class ReckoningWebApplication:
       <div aria-live="polite">{conversation}</div>
       {error_markup}
       <form action="/messages" method="post">
+        <input type="hidden" name="_csrf_token"
+          value="{escape(csrf_token, quote=True)}">
         <label for="message">Your message</label>
         <textarea id="message" name="message" required autofocus></textarea>
         <button type="submit">Send</button>
@@ -290,7 +482,9 @@ class ReckoningWebApplication:
 </body>
 </html>"""
 
-    def _render_interface_area(self, area: str, error: str | None = None) -> str:
+    def _render_interface_area(
+        self, area: str, error: str | None = None, *, csrf_token: str = ""
+    ) -> str:
         assert self._interfaces is not None
         visual_state = self._interfaces.visual_state()
         if area == "home":
@@ -309,7 +503,12 @@ class ReckoningWebApplication:
               </div>
             """
         elif area == "control":
-            content = self._render_control(self._interfaces.control())
+            error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
+            content = (
+                self._render_control(self._interfaces.control())
+                + error_markup
+                + self._render_processing_scope(csrf_token)
+            )
         elif area == "simon":
             messages = self._interfaces.channel_session("web")
             conversation = "".join(
@@ -320,7 +519,7 @@ class ReckoningWebApplication:
             ) or '<p class="empty">Send Simon the first message.</p>'
             error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
             profile_review = (
-                self._render_profile_review()
+                self._render_profile_review(csrf_token)
                 if any(message.role == "assistant" for message in messages)
                 else ""
             )
@@ -328,6 +527,8 @@ class ReckoningWebApplication:
               <header><p class="eyebrow">Conversation</p><h1>Simon</h1></header>
               <div aria-live="polite">{conversation}</div>{error_markup}
               <form action="/messages" method="post">
+                <input type="hidden" name="_csrf_token"
+                  value="{escape(csrf_token, quote=True)}">
                 <label for="message">Your message</label>
                 <textarea id="message" name="message" required></textarea>
                 <button type="submit">Send</button>
@@ -438,7 +639,7 @@ class ReckoningWebApplication:
 </body>
 </html>"""
 
-    def _render_profile_review(self) -> str:
+    def _render_profile_review(self, csrf_token: str) -> str:
         profile_proposals = getattr(self._application, "profile_proposals", None)
         if not callable(profile_proposals):
             return ""
@@ -452,15 +653,21 @@ class ReckoningWebApplication:
               <p><strong>Unconfirmed profile statement</strong></p>
               <p>Source: {escape(item.source)}</p>
               <form action="/profile/{escape(item.record_id)}/correct" method="post">
+                <input type="hidden" name="_csrf_token"
+                  value="{escape(csrf_token, quote=True)}">
                 <label for="meaning-{escape(item.record_id)}">Meaning</label>
                 <textarea id="meaning-{escape(item.record_id)}" name="meaning"
                   required>{escape(item.original_text)}</textarea>
                 <button type="submit">Save correction</button>
               </form>
               <form action="/profile/{escape(item.record_id)}/confirm" method="post">
+                <input type="hidden" name="_csrf_token"
+                  value="{escape(csrf_token, quote=True)}">
                 <button type="submit">Confirm</button>
               </form>
               <form action="/profile/{escape(item.record_id)}/reject" method="post">
+                <input type="hidden" name="_csrf_token"
+                  value="{escape(csrf_token, quote=True)}">
                 <button type="submit">Reject</button>
               </form>
               <a href="/">Skip for now</a>
@@ -507,6 +714,37 @@ class ReckoningWebApplication:
           <section id="failure-log" class="control-section"><h2>Failure log</h2>{failures}</section>
         """
 
+    def _render_processing_scope(self, csrf_token: str) -> str:
+        inspect_scope = getattr(self._application, "processing_scope_status", None)
+        if not callable(inspect_scope):
+            return ""
+        status = inspect_scope()
+        choices = "".join(
+            f'<label><input type="checkbox" name="category" value="{escape(category)}"'
+            f'{" checked" if category in status.allowed_categories else ""}>'
+            f" {escape(category)}</label>"
+            for category in PROCESSING_CATEGORIES
+        )
+        explicit = "explicit grant" if status.explicit else "default local policy"
+        return f"""
+          <section id="processing-scope" class="control-section">
+            <h2>Model processing scope</h2>
+            <p>Storage: {escape(status.storage_location)}. Executing node:
+              {escape(status.executing_node)}. Provider destination:
+              {escape(status.destination.id)} ({escape(status.destination.kind)}).</p>
+            <p>Grant revision {status.grant_version}; {explicit}.</p>
+            <form action="/processing-scope" method="post">
+              <input type="hidden" name="_csrf_token"
+                value="{escape(csrf_token, quote=True)}">
+              <input type="hidden" name="expected_revision"
+                value="{status.grant_version}">
+              <fieldset><legend>Context allowed at this exact destination</legend>
+                {choices}</fieldset>
+              <button type="submit">Save processing scope</button>
+            </form>
+          </section>
+        """
+
     @staticmethod
     def _list(items: tuple[str, ...]) -> str:
         if not items:
@@ -521,6 +759,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", choices=CREDENTIAL_PROVIDER_NAMES)
     parser.add_argument("--model")
     parser.add_argument("--base-url")
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[],
+        help=(
+            "Browser origin allowed to submit mutations. Repeat for explicit "
+            "private access; forwarded headers are not trusted automatically."
+        ),
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -551,6 +798,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             model=arguments.model,
             base_url=arguments.base_url,
         )
+        configured_origins = tuple(arguments.allowed_origin) or local_browser_origins(
+            arguments.port
+        )
+        allowed_origins = tuple(
+            validate_allowed_origin(origin) for origin in configured_origins
+        )
     except (OperationError, ValueError) as error:
         parser.error(str(error))
 
@@ -579,6 +832,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             placement=runtime.interface_placement,
             connector_data_dir=runtime.root_for("approved-remote-sources"),
         ),
+        allowed_origins=allowed_origins,
     )
     with make_server(host, arguments.port, web) as server:
         print(f"Simon is available at http://{host}:{arguments.port}")

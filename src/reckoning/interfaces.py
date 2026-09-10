@@ -238,6 +238,8 @@ class ChannelRequest:
     permissions: tuple[str, ...]
     available_categories: tuple[str, ...]
     limited: bool
+    required_processing_categories: tuple[str, ...] = ()
+    safe_when_incomplete: bool = True
 
 
 class ChannelResponder(Protocol):
@@ -251,6 +253,10 @@ class MessageApplication(Protocol):
         history: tuple[tuple[Literal["user", "assistant"], str], ...],
         confirmed_records: tuple[str, ...],
         permissions: tuple[str, ...],
+        *,
+        required_processing_categories: tuple[str, ...] = (),
+        available_processing_categories: tuple[str, ...] | None = None,
+        safe_when_incomplete: bool = True,
     ) -> object: ...
 
 
@@ -269,6 +275,11 @@ class ApplicationChannelResponder:
             history,
             request.confirmed_records,
             request.permissions,
+            required_processing_categories=request.required_processing_categories,
+            available_processing_categories=_processing_categories_for(
+                request.available_categories
+            ),
+            safe_when_incomplete=request.safe_when_incomplete,
         )
         content = getattr(response, "content", None)
         if not isinstance(content, str):
@@ -463,9 +474,19 @@ class ReckoningInterfaceApplication:
                 raise RuntimeError(placement.notice)
 
             history = self._session(state, channel, session_id).messages
+            placement_categories = self._placement.required_categories
+            confirmed_state_category = (
+                "confirmed-state"
+                if "confirmed-state" in placement_categories
+                else (
+                    "personal-context"
+                    if "personal-context" in placement_categories
+                    else None
+                )
+            )
             confirmed_state_available = (
-                "confirmed-state" in placement.available_categories
-                or "confirmed-state" not in self._placement.required_categories
+                confirmed_state_category is None
+                or confirmed_state_category in placement.available_categories
             )
             self._repository.save(
                 replace(self._repository.load(), activity="reasoning")
@@ -476,15 +497,17 @@ class ReckoningInterfaceApplication:
                     text=message,
                     recent_history=history if confirmed_state_available else (),
                     confirmed_records=(
-                        state.confirmed_records
-                        if "personal-context" in placement.available_categories
-                        else ()
+                        state.confirmed_records if confirmed_state_available else ()
                     ),
                     permissions=(
                         state.permissions if confirmed_state_available else ()
                     ),
                     available_categories=placement.available_categories,
                     limited=placement.status == "limited",
+                    required_processing_categories=_processing_categories_for(
+                        categories
+                    ),
+                    safe_when_incomplete=safe_when_incomplete,
                 )
             ).strip()
             if not response:
@@ -761,6 +784,23 @@ def create_local_interface_application(
 
 def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def _processing_categories_for(
+    placement_categories: tuple[str, ...],
+) -> tuple[str, ...]:
+    processing_by_placement = {
+        "personal-context": "personal-context",
+        "confirmed-state": "confirmed-state",
+        "approved-remote-sources": "supplied-context",
+    }
+    return _unique(
+        tuple(
+            processing_by_placement[category]
+            for category in placement_categories
+            if category in processing_by_placement
+        )
+    )
 
 
 def _merge_by_id[T](

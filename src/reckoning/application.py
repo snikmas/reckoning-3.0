@@ -16,6 +16,7 @@ from reckoning.continuity import (
     Reckoning,
     ReckoningProvider,
     ReckoningProviderResult,
+    ReckoningRevisionConflict,
     ReckoningRepository,
     UuidIdentifierFactory,
     WhyView,
@@ -25,6 +26,13 @@ from reckoning.personal_context import (
     PersonalContextService,
     PersonalContextVersion,
     RetrievalQuery,
+)
+from reckoning.processing import (
+    JsonFileProcessingGrantRepository,
+    ProcessingScope,
+    ProcessingScopeStatus,
+    UnrestrictedProcessingScope,
+    provider_destination,
 )
 from reckoning.provider_adapters import (
     AdapterConfig,
@@ -104,6 +112,7 @@ class ModelRequest:
     placement: PlacementState
     available_connectors: tuple[str, ...]
     prompt_stack: PromptStack
+    processing_destination: str = "in-process"
 
 
 class Clock(Protocol):
@@ -176,6 +185,9 @@ class ApplicationDependencies:
         default_factory=lambda: InMemoryModelRunRepository()
     )
     personal_context: PersonalContextService | None = None
+    processing_scope: ProcessingScope | UnrestrictedProcessingScope = field(
+        default_factory=UnrestrictedProcessingScope
+    )
 
 
 class ProtectedResponsePolicy:
@@ -262,6 +274,10 @@ class ReckoningApplication:
         history: ConversationHistory,
         confirmed_records: tuple[str, ...],
         permissions: tuple[str, ...],
+        *,
+        required_processing_categories: tuple[str, ...] = (),
+        available_processing_categories: tuple[str, ...] | None = None,
+        safe_when_incomplete: bool = True,
     ) -> Message:
         """Respond with the channel's filtered shared state below protected rules."""
         return self._respond_to_message(
@@ -272,6 +288,9 @@ class ReckoningApplication:
             available_connectors=None,
             confirmed_records=confirmed_records,
             permissions=permissions,
+            required_processing_categories=required_processing_categories,
+            available_processing_categories=available_processing_categories,
+            safe_when_incomplete=safe_when_incomplete,
         )
 
     def respond_with_external_content(
@@ -316,6 +335,9 @@ class ReckoningApplication:
         available_connectors: tuple[str, ...] | None,
         confirmed_records: tuple[str, ...] = (),
         permissions: tuple[str, ...] = (),
+        required_processing_categories: tuple[str, ...] = (),
+        available_processing_categories: tuple[str, ...] | None = None,
+        safe_when_incomplete: bool = True,
     ) -> Message:
         user_message = text.strip()
         if not user_message:
@@ -342,14 +364,71 @@ class ReckoningApplication:
         if immediate_danger_response is not None:
             response = immediate_danger_response
         else:
-            profile_context, profile_missing = self._personal_context_for_message(
-                user_message, requested_at
-            )
             supplied_context = (
                 self._dependencies.retrieved_context
                 if retrieved_context is None
                 else retrieved_context
             )
+            supplied_context_category = (
+                "derived-summaries"
+                if retrieved_context is None
+                else "supplied-context"
+            )
+            placement_allows_personal_context = (
+                available_processing_categories is None
+                or "personal-context" in available_processing_categories
+            )
+            present_processing_categories = (
+                "current-request",
+                *(("recent-channel-history",) if recent_history else ()),
+                *(
+                    ("personal-context",)
+                    if self._dependencies.personal_context
+                    and placement_allows_personal_context
+                    else ()
+                ),
+                *(("confirmed-state",) if confirmed_records else ()),
+                *(("permissions",) if permissions else ()),
+                *((supplied_context_category,) if supplied_context else ()),
+            )
+            processing_categories = tuple(
+                dict.fromkeys(
+                    (*present_processing_categories, *required_processing_categories)
+                )
+            )
+            required_categories = (
+                ("current-request",)
+                if safe_when_incomplete
+                else tuple(
+                    dict.fromkeys(
+                        ("current-request", *required_processing_categories)
+                    )
+                )
+            )
+            processing = self._dependencies.processing_scope.evaluate(
+                processing_categories,
+                required_categories=required_categories,
+            )
+            if processing.blocked_categories:
+                raise RuntimeError(
+                    "Model processing is blocked because the destination lacks "
+                    "a grant for: " + ", ".join(processing.blocked_categories) + "."
+                )
+            allowed = set(processing.allowed_categories)
+            if "personal-context" in allowed:
+                profile_context, profile_missing = self._personal_context_for_message(
+                    user_message, requested_at
+                )
+            else:
+                profile_context = ()
+            if "recent-channel-history" not in allowed:
+                recent_history = ()
+            if supplied_context_category not in allowed:
+                supplied_context = ()
+            if "confirmed-state" not in allowed:
+                confirmed_records = ()
+            if "permissions" not in allowed:
+                permissions = ()
             connectors = (
                 self._dependencies.connectors.available_names()
                 if available_connectors is None
@@ -361,6 +440,9 @@ class ReckoningApplication:
                 requested_at=requested_at,
                 placement=self._dependencies.placement,
                 available_connectors=connectors,
+                processing_destination=(
+                    self._dependencies.processing_scope.destination.id
+                ),
                 prompt_stack=self._build_prompt_stack(
                     user_message,
                     connectors,
@@ -404,9 +486,20 @@ class ReckoningApplication:
                 response = (
                     "Limited context: no user profile is available. " + response
                 )
+            if processing.unavailable_categories:
+                response = (
+                    "Limited context: unavailable processing categories: "
+                    + ", ".join(processing.unavailable_categories)
+                    + ". "
+                    + response
+                )
             run_status: ModelRunStatus = (
                 "limited"
-                if response != proposed_response or profile_missing
+                if (
+                    response != proposed_response
+                    or profile_missing
+                    or processing.unavailable_categories
+                )
                 else "succeeded"
             )
             self._dependencies.model_runs.save_run(
@@ -472,10 +565,40 @@ class ReckoningApplication:
     def inspect_model_runs(self) -> tuple[ModelRunRecord, ...]:
         return self._dependencies.model_runs.list_runs()
 
+    def processing_scope_status(self) -> ProcessingScopeStatus:
+        return replace(
+            self._dependencies.processing_scope.review(),
+            storage_location=self._dependencies.placement.storage_location,
+            executing_node=self._dependencies.placement.processing_location,
+        )
+
+    def change_processing_scope(
+        self, allowed_categories: tuple[str, ...], *, expected_revision: int
+    ) -> ProcessingScopeStatus:
+        change = getattr(self._dependencies.processing_scope, "change", None)
+        if not callable(change):
+            raise RuntimeError("This application has no persistent processing scope.")
+        change(
+            allowed_categories,
+            changed_at=self._dependencies.clock.now(),
+            expected_version=expected_revision,
+        )
+        return self.processing_scope_status()
+
     def start_reckoning(self, text: str) -> Reckoning:
         source_input = text.strip()
         if not source_input:
             raise ValueError("A situation cannot be empty.")
+
+        processing = self._dependencies.processing_scope.evaluate(
+            ("raw-reckoning-input",),
+            required_categories=("raw-reckoning-input",),
+        )
+        if processing.blocked_categories:
+            raise RuntimeError(
+                "Model processing is blocked because the destination lacks "
+                "a grant for: raw-reckoning-input."
+            )
 
         requested_at = self._dependencies.clock.now()
         try:
@@ -552,17 +675,26 @@ class ReckoningApplication:
             draft=draft,
             record_versions=record_versions,
         )
-        self._dependencies.reckoning_repository.save(reckoning)
+        self._dependencies.reckoning_repository.save(reckoning, expected_version=0)
         return reckoning
 
     def correct_personal_record(
-        self, reckoning_id: str, record_id: str, corrected_meaning: str
+        self,
+        reckoning_id: str,
+        record_id: str,
+        corrected_meaning: str,
+        *,
+        expected_revision: int | None = None,
     ) -> Reckoning:
         meaning = corrected_meaning.strip()
         if not meaning:
             raise ValueError("A correction cannot be empty.")
 
         reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
+        if expected_revision is not None and reckoning.version != expected_revision:
+            raise ReckoningRevisionConflict(
+                reckoning_id, expected_revision, reckoning.version
+            )
         if reckoning.status == "confirmed":
             raise ValueError("A confirmed reckoning cannot be corrected in place.")
         current = next(
@@ -600,11 +732,19 @@ class ReckoningApplication:
             ),
             record_versions=reckoning.record_versions + (corrected_record,),
         )
-        self._dependencies.reckoning_repository.save(corrected)
+        self._dependencies.reckoning_repository.save(
+            corrected, expected_version=reckoning.version
+        )
         return corrected
 
-    def confirm_reckoning(self, reckoning_id: str) -> Reckoning:
+    def confirm_reckoning(
+        self, reckoning_id: str, *, expected_revision: int | None = None
+    ) -> Reckoning:
         reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
+        if expected_revision is not None and reckoning.version != expected_revision:
+            raise ReckoningRevisionConflict(
+                reckoning_id, expected_revision, reckoning.version
+            )
         if reckoning.status == "confirmed":
             return reckoning
 
@@ -625,7 +765,9 @@ class ReckoningApplication:
             status="confirmed",
             record_versions=reckoning.record_versions + confirmed_records,
         )
-        self._dependencies.reckoning_repository.save(confirmed)
+        self._dependencies.reckoning_repository.save(
+            confirmed, expected_version=reckoning.version
+        )
         return confirmed
 
     def explain_reckoning(self, reckoning_id: str) -> WhyView:
@@ -655,6 +797,10 @@ class ReckoningApplication:
             ),
             record_versions=current_records,
         )
+
+    def inspect_reckoning(self, reckoning_id: str) -> Reckoning:
+        """Return the current persisted reckoning through the public boundary."""
+        return self._dependencies.reckoning_repository.get(reckoning_id)
 
     def resume_decision(self, reckoning_id: str) -> DecisionResume:
         reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
@@ -964,6 +1110,7 @@ def create_local_application(
     provider_transport: SetupProviderTransport = setup_urlopen_transport,
     persona: PersonaSettings | None = None,
     placement: PlacementState | None = None,
+    processing_grants_path: Path | None = None,
 ) -> ReckoningApplication:
     from reckoning.persistence import JsonFileReckoningRepository
     from reckoning.personal_context import JsonFilePersonalContextRepository
@@ -996,6 +1143,25 @@ def create_local_application(
         )
         model = runtime_model
         reckoning_provider = OrcaRouterReckoningProvider(runtime_model)
+    model_runs = JsonFileModelRunRepository(
+        continuity_path.with_name("model-runs.json")
+    )
+    reckoning_repository = JsonFileReckoningRepository(continuity_path)
+    personal_context = (
+        PersonalContextService(
+            JsonFilePersonalContextRepository(personal_context_path)
+        )
+        if personal_context_path is not None
+        else None
+    )
+    destination = provider_destination(provider_name, provider_config)
+    processing_scope = ProcessingScope(
+        JsonFileProcessingGrantRepository(
+            processing_grants_path
+            or continuity_path.with_name("processing-grants.json")
+        ),
+        destination,
+    )
     return ReckoningApplication(
         ApplicationDependencies(
             clock=SystemClock(),
@@ -1010,16 +1176,9 @@ def create_local_application(
             storage=InMemoryConversationStorage(),
             persona=persona or PersonaSettings(),
             reckoning_provider=reckoning_provider,
-            reckoning_repository=JsonFileReckoningRepository(continuity_path),
-            model_runs=JsonFileModelRunRepository(
-                continuity_path.with_name("model-runs.json")
-            ),
-            personal_context=(
-                PersonalContextService(
-                    JsonFilePersonalContextRepository(personal_context_path)
-                )
-                if personal_context_path is not None
-                else None
-            ),
+            reckoning_repository=reckoning_repository,
+            model_runs=model_runs,
+            personal_context=personal_context,
+            processing_scope=processing_scope,
         )
     )
