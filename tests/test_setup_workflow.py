@@ -429,6 +429,37 @@ def chat_transport(payload_content: str = "Here is my answer."):
     return transport, calls
 
 
+def truncated_deepseek_transport():
+    from urllib.request import Request
+
+    calls: list[Request] = []
+
+    def transport(request: Request, timeout: float) -> bytes:
+        calls.append(request)
+        return json.dumps(
+            {
+                "model": "deepseek-v4-flash",
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "private reasoning text",
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 8,
+                    "total_tokens": 12,
+                },
+            }
+        ).encode("utf-8")
+
+    return transport, calls
+
+
 DEEPSEEK_ANSWERS: list[tuple[str, str]] = [
     ("mode", "quick"),
     ("persona", "simon"),
@@ -468,6 +499,10 @@ def test_quick_setup_verifies_a_real_provider_and_never_displays_the_key(
     # One verification request plus one first-conversation request.
     assert len(calls) == 2
     assert calls[0].full_url == "https://api.deepseek.com/chat/completions"
+    verification_body = json.loads(calls[0].data.decode("utf-8"))
+    conversation_body = json.loads(calls[1].data.decode("utf-8"))
+    assert verification_body["thinking"] == {"type": "disabled"}
+    assert "thinking" not in conversation_body
 
     raw = json.loads((tmp_path / "provider.json").read_text(encoding="utf-8"))
     assert raw["schema_version"] == 2
@@ -481,6 +516,54 @@ def test_quick_setup_verifies_a_real_provider_and_never_displays_the_key(
     assert instance["activation"]["provider"] == "deepseek"
     assert instance["activation"]["model"] == "deepseek-v4-flash"
     assert instance["activation"]["demo"] is False
+
+
+def test_reasoning_only_truncated_verification_preserves_recovery_and_inactive_state(
+    tmp_path: Path,
+) -> None:
+    transport, calls = truncated_deepseek_transport()
+    outcome, ui = run_workflow(
+        tmp_path,
+        [
+            ("mode", "quick"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
+            ("provider-preference", "direct"),
+            ("provider-use-recommendation", "y"),
+            ("provider-key-source", "new"),
+            ("provider-key", "sk-truncated"),
+            ("provider-model", "recommended"),
+            ("provider-verify-consent", "y"),
+            ("provider-failure", "save"),
+            ("provider-test-detected", "n"),
+            ("provider", "fake"),
+            ("profile", "skip"),
+            ("connectors", "skip"),
+            ("first-message", "Hello."),
+            ("first-message-action", "accept"),
+            ("review-confirm", "y"),
+        ],
+        services=offline_services(transport=transport),
+    )
+
+    displayed = "\n".join(ui.lines)
+    assert outcome.status == "activated"
+    assert outcome.provider_id == "fake"
+    assert "DeepSeek provider test ended before a final answer." in displayed
+    assert "sk-truncated" not in displayed
+    assert "private reasoning text" not in displayed
+    assert "reasoning_content" not in displayed
+    for label in (
+        "Retry the test",
+        "Edit provider settings",
+        "Back to the provider list",
+        "Save for later",
+        "Exit setup",
+    ):
+        assert label in displayed
+    store = ProviderCredentialStore.load(tmp_path / "provider.json")
+    assert store.is_active("deepseek") is False
+    assert len(calls) == 1
 
 
 def test_an_environment_reference_is_reused_without_copying_its_value(
