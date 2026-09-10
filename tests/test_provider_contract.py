@@ -15,8 +15,10 @@ import pytest
 
 from reckoning.provider_adapters import (
     AdapterConfig,
+    AnthropicProviderAdapter,
     DeepSeekProviderAdapter,
     FakeProviderAdapter,
+    GeminiProviderAdapter,
     ModelDiscoveryError,
     ProviderVerificationError,
     SetupProviderAdapter,
@@ -552,6 +554,223 @@ class TestOpenAICandidateContract:
         assert candidate_adapter_for("openai").definition.available is False
         with pytest.raises(KeyError, match="not available"):
             setup_adapter_for("openai")
+
+
+def anthropic_completion_payload(content: str = "ready") -> bytes:
+    return json.dumps(
+        {
+            "model": "claude-served-model",
+            "content": [{"type": "text", "text": content}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 12, "output_tokens": 4},
+        }
+    ).encode("utf-8")
+
+
+def gemini_completion_payload(content: str = "ready") -> bytes:
+    return json.dumps(
+        {
+            "modelVersion": "gemini-served-model",
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": content}],
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 3,
+                "totalTokenCount": 14,
+            },
+        }
+    ).encode("utf-8")
+
+
+class TestAnthropicCandidateContract:
+    def test_anthropic_maps_system_and_conversation_without_losing_order(self) -> None:
+        adapter = candidate_adapter_for("anthropic")
+        assert isinstance(adapter, AnthropicProviderAdapter)
+        transport = RecordingTransport([anthropic_completion_payload("Use the proof.")])
+
+        result = adapter.complete(
+            AdapterConfig(api_key=SECRET, model="claude-manual"),
+            (
+                ("system", "[protected]\ntruth first"),
+                ("system", "[persona]\nbe direct"),
+                ("user", "Earlier question"),
+                ("assistant", "Earlier answer"),
+                ("user", "Current question"),
+            ),
+            transport=transport,
+        )
+
+        (request,) = transport.requests
+        body = json.loads(request.data.decode("utf-8"))
+        assert request.full_url == "https://api.anthropic.com/v1/messages"
+        assert request.headers["X-api-key"] == SECRET
+        assert request.headers["Anthropic-version"] == "2023-06-01"
+        assert body == {
+            "model": "claude-manual",
+            "system": "[protected]\ntruth first\n\n[persona]\nbe direct",
+            "messages": [
+                {"role": "user", "content": "Earlier question"},
+                {"role": "assistant", "content": "Earlier answer"},
+                {"role": "user", "content": "Current question"},
+            ],
+            "max_tokens": 4096,
+            "stream": False,
+        }
+        assert result.content == "Use the proof."
+        assert result.model == "claude-served-model"
+        assert result.usage == ProviderUsage(12, 4, 16)
+
+    def test_anthropic_discovers_models_and_uses_the_recommended_model(self) -> None:
+        adapter = candidate_adapter_for("anthropic")
+        discovery = RecordingTransport(
+            [json.dumps({"data": [{"id": "claude-z"}, {"id": "claude-a"}]}).encode()]
+        )
+
+        models = adapter.discover_models(
+            AdapterConfig(api_key=SECRET), transport=discovery
+        )
+
+        assert models == ("claude-a", "claude-z")
+        assert discovery.requests[0].full_url == "https://api.anthropic.com/v1/models"
+        verification = RecordingTransport([anthropic_completion_payload()])
+        adapter.verify(AdapterConfig(api_key=SECRET), transport=verification)
+        request_body = json.loads(verification.requests[0].data.decode())
+        assert request_body["model"] == "claude-haiku-4-5"
+        assert request_body["max_tokens"] == 8
+
+
+class TestGeminiCandidateContract:
+    def test_gemini_maps_system_and_conversation_without_losing_order(self) -> None:
+        adapter = candidate_adapter_for("google-gemini")
+        assert isinstance(adapter, GeminiProviderAdapter)
+        transport = RecordingTransport([gemini_completion_payload("Use the proof.")])
+
+        result = adapter.complete(
+            AdapterConfig(api_key=SECRET, model="gemini-manual"),
+            (
+                ("system", "[protected]\ntruth first"),
+                ("system", "[persona]\nbe direct"),
+                ("user", "Earlier question"),
+                ("assistant", "Earlier answer"),
+                ("user", "Current question"),
+            ),
+            transport=transport,
+        )
+
+        (request,) = transport.requests
+        body = json.loads(request.data.decode("utf-8"))
+        assert request.full_url == (
+            "https://generativelanguage.googleapis.com/v1beta/"
+            "models/gemini-manual:generateContent"
+        )
+        assert request.headers["X-goog-api-key"] == SECRET
+        assert body == {
+            "systemInstruction": {
+                "parts": [{"text": "[protected]\ntruth first\n\n[persona]\nbe direct"}]
+            },
+            "contents": [
+                {"role": "user", "parts": [{"text": "Earlier question"}]},
+                {"role": "model", "parts": [{"text": "Earlier answer"}]},
+                {"role": "user", "parts": [{"text": "Current question"}]},
+            ],
+        }
+        assert result.content == "Use the proof."
+        assert result.model == "gemini-served-model"
+        assert result.usage == ProviderUsage(11, 3, 14)
+
+    def test_gemini_discovers_generation_models_and_uses_recommended_model(self) -> None:
+        adapter = candidate_adapter_for("google-gemini")
+        discovery = RecordingTransport(
+            [
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "name": "models/gemini-z",
+                                "supportedGenerationMethods": ["generateContent"],
+                            },
+                            {
+                                "name": "models/embedding-only",
+                                "supportedGenerationMethods": ["embedContent"],
+                            },
+                            {
+                                "name": "models/gemini-a",
+                                "supportedGenerationMethods": ["generateContent"],
+                            },
+                        ]
+                    }
+                ).encode()
+            ]
+        )
+
+        models = adapter.discover_models(
+            AdapterConfig(api_key=SECRET), transport=discovery
+        )
+
+        assert models == ("gemini-a", "gemini-z")
+        assert discovery.requests[0].full_url.endswith("/v1beta/models")
+        verification = RecordingTransport([gemini_completion_payload()])
+        adapter.verify(AdapterConfig(api_key=SECRET), transport=verification)
+        assert verification.requests[0].full_url.endswith(
+            "/models/gemini-2.5-flash:generateContent"
+        )
+        request_body = json.loads(verification.requests[0].data.decode())
+        assert request_body["generationConfig"] == {"maxOutputTokens": 8}
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "env_name"),
+    (
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("google-gemini", "GEMINI_API_KEY"),
+    ),
+)
+def test_protocol_candidates_detect_key_references_and_remain_gated(
+    provider_id: str, env_name: str
+) -> None:
+    adapter = candidate_adapter_for(provider_id)
+
+    hits = adapter.detect(
+        environ={env_name: SECRET}, configured=frozenset({provider_id})
+    )
+
+    assert [hit.kind for hit in hits] == ["environment", "credential"]
+    assert SECRET not in "\n".join(hit.label for hit in hits)
+    with pytest.raises(KeyError, match="not available"):
+        setup_adapter_for(provider_id)
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "payload"),
+    (
+        ("anthropic", anthropic_completion_payload()),
+        ("google-gemini", gemini_completion_payload()),
+    ),
+)
+def test_protocol_candidates_normalize_retries_and_safe_errors(
+    provider_id: str, payload: bytes
+) -> None:
+    adapter = candidate_adapter_for(provider_id)
+    retrying = RecordingTransport([http_error(503), payload])
+
+    result = adapter.verify(
+        AdapterConfig(api_key=SECRET), transport=retrying, max_retries=1
+    )
+
+    assert result.retries == 1
+    assert result.latency_ms >= 0
+    assert len(retrying.requests) == 2
+    denied = RecordingTransport([http_error(401, f"bad key {SECRET}")])
+    with pytest.raises(ProviderVerificationError) as failure:
+        adapter.verify(AdapterConfig(api_key=SECRET), transport=denied)
+    assert SECRET not in str(failure.value)
 
 
 class TestCloudHostPinning:

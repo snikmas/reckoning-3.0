@@ -1010,6 +1010,7 @@ def test_migration_previews_backs_up_and_commits_atomically(tmp_path: Path) -> N
     assert "backup kept" in displayed
     instance = json.loads((tmp_path / "data" / "instance.json").read_text())
     assert instance["activation"]["provider"] == "deepseek"
+    assert instance["activation"]["model"] == "deepseek-v4-flash"
     assert (tmp_path / "provider.json.bak").exists()
     assert (tmp_path / "data" / "instance.json.bak").exists()
     migrated = json.loads((tmp_path / "provider.json").read_text())
@@ -1610,3 +1611,35 @@ def test_provider_edit_can_make_fake_authoritative_over_saved_credentials(
     assert store.default_provider is None
     assert store.api_key_for("deepseek") == "sk-test-deepseek"
     assert any("[ok] provider: fake (demo mode)" in line for line in ui.lines)
+
+
+def test_failed_migration_restores_every_live_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    setup_instance(tmp_path / "data", "local")
+    credential_path = tmp_path / "provider.json"
+    credential_path.write_text(
+        json.dumps(
+            {"default_provider": "deepseek", "providers": {"deepseek": "sk-old"}}
+        ),
+        encoding="utf-8",
+    )
+    original_instance = (tmp_path / "data" / "instance.json").read_bytes()
+    original_credentials = credential_path.read_bytes()
+    workflow = SetupWorkflow(
+        paths=make_paths(tmp_path),
+        ui=ScriptedUI(
+            [("migrate", "migrate"), ("migrate-confirm", "y")]
+        ),
+        services=offline_services(),
+    )
+
+    def fail_save(self, path=credential_path) -> None:
+        raise OSError("simulated credential write failure")
+
+    monkeypatch.setattr(ProviderCredentialStore, "save", fail_save)
+    with pytest.raises(OperationError, match="Migration failed"):
+        workflow.run()
+
+    assert (tmp_path / "data" / "instance.json").read_bytes() == original_instance
+    assert credential_path.read_bytes() == original_credentials
