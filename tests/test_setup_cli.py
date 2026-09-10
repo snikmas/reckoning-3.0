@@ -11,6 +11,7 @@ import pytest
 
 from reckoning.command import main
 from reckoning.config import ProviderCredentialStore
+from reckoning.operations import setup_instance
 from reckoning.setup_copy import BRAND_LINE
 
 
@@ -147,6 +148,34 @@ def test_reset_on_an_empty_machine_is_a_noop(tmp_path: Path) -> None:
     )
     assert returncode == 0
     assert "nothing to remove" in stdout
+
+
+def test_reset_removes_the_configured_personal_server_root(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    server_dir = tmp_path / "server"
+    setup_instance(
+        data_dir,
+        "personal-server",
+        server_data_dir=server_dir,
+    )
+
+    returncode, stdout, stderr = run_cli(
+        "reset",
+        "--yes",
+        "--data-dir",
+        str(data_dir),
+        "--credentials",
+        str(tmp_path / "provider.json"),
+        "--telegram-config",
+        str(tmp_path / "telegram.json"),
+        "--draft-path",
+        str(tmp_path / "setup-draft.json"),
+    )
+
+    assert returncode == 0, stderr
+    assert str(server_dir) in stdout
+    assert not data_dir.exists()
+    assert not server_dir.exists()
 
 
 def test_setup_on_a_configured_installation_opens_the_status_view(

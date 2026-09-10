@@ -53,6 +53,25 @@ def test_openai_live_completion_candidate() -> None:
     assert result.latency_ms > 0
 
 
+@pytest.mark.parametrize(
+    ("provider_id", "env_name"),
+    (
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("google-gemini", "GEMINI_API_KEY"),
+    ),
+)
+def test_protocol_provider_live_completion_candidate(
+    provider_id: str, env_name: str
+) -> None:
+    key = os.environ.get(env_name, "").strip()
+    if not key:
+        pytest.skip(f"{env_name} is not set")
+    adapter = candidate_adapter_for(provider_id)
+    result = adapter.verify(AdapterConfig(api_key=key))
+    assert result.demo is False
+    assert result.latency_ms > 0
+
+
 def test_custom_openai_compatible_live_completion() -> None:
     base_url = os.environ.get("RECKONING_CUSTOM_BASE_URL", "").strip()
     model = os.environ.get("RECKONING_CUSTOM_MODEL", "").strip()

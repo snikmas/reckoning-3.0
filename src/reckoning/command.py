@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from reckoning.config import DEFAULT_PROVIDER_CREDENTIALS, ProviderCredentialStore
+from reckoning.json_store import read_json
 from reckoning.operations import (
     PASSPHRASE_ENV,
     OperationError,
@@ -615,16 +616,28 @@ def _run_reset(rest: Sequence[str]) -> int:
         help="Confirm the previewed removal without an interactive prompt.",
     )
     arguments = parser.parse_args(rest)
-    targets = [
-        path
-        for path in (
-            arguments.data_dir,
-            arguments.credentials,
-            arguments.telegram_config,
-            arguments.draft_path,
-        )
-        if path.exists()
-    ]
+    try:
+        server_root = _configured_server_root(arguments.data_dir)
+    except (OperationError, RuntimeError) as error:
+        parser.error(str(error))
+    candidates = (
+        arguments.data_dir,
+        server_root,
+        arguments.credentials,
+        arguments.telegram_config,
+        arguments.draft_path,
+    )
+    existing = [path for path in candidates if path is not None and path.exists()]
+    targets: list[Path] = []
+    for path in existing:
+        resolved = path.expanduser().resolve()
+        if resolved == Path(resolved.anchor) or resolved == Path.home().resolve():
+            parser.error(f"refusing to reset broad path: {resolved}")
+        if any(resolved == known or resolved.is_relative_to(known) for known in targets):
+            continue
+        if any(known.is_relative_to(resolved) for known in targets):
+            parser.error(f"refusing to reset overlapping broad path: {resolved}")
+        targets.append(resolved)
     if not targets:
         print("reset: nothing to remove")
         return 0
@@ -645,6 +658,36 @@ def _run_reset(rest: Sequence[str]) -> int:
             target.unlink()
     print("reset: removed the previewed targets")
     return 0
+
+
+def _configured_server_root(data_dir: Path) -> Path | None:
+    instance_path = data_dir.expanduser().resolve() / "instance.json"
+    if not instance_path.exists():
+        return None
+    instance = read_json(instance_path, default={})
+    placement = instance.get("placement_profile")
+    roots = instance.get("storage_roots")
+    if placement == "local":
+        return None
+    if placement not in ("personal-server", "hybrid") or not isinstance(roots, dict):
+        raise OperationError(
+            "reset cannot determine the configured personal-server root"
+        )
+    raw_server = roots.get("server")
+    if not isinstance(raw_server, str) or not raw_server:
+        raise OperationError(
+            "reset cannot determine the configured personal-server root"
+        )
+    server_root = Path(raw_server).expanduser()
+    if not server_root.is_absolute():
+        raise OperationError("the configured personal-server root is not absolute")
+    resolved_data = data_dir.expanduser().resolve()
+    resolved_server = server_root.resolve()
+    if resolved_server.is_relative_to(resolved_data) or resolved_data.is_relative_to(
+        resolved_server
+    ):
+        raise OperationError("configured reset roots overlap")
+    return resolved_server
 
 
 def _run_operation(command: str, rest: Sequence[str]) -> int:

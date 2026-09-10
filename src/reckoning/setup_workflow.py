@@ -2394,36 +2394,65 @@ class SetupWorkflow:
         self._ui.success("Migration committed; backups sit next to the files.")
 
     def _migrate_installation(self, instance: dict[str, Any]) -> None:
-        import shutil
-
-        for path in (
+        paths = (
             self._paths.credentials_path,
             self._paths.telegram_config_path,
             self._paths.data_dir / "instance.json",
-        ):
-            if path.exists():
-                shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
-        store = ProviderCredentialStore.load(self._paths.credentials_path)
-        migrated = {
-            **instance,
-            "activation": {
-                "status": "activated",
-                "mode": "migrated",
-                "provider": store.default_provider or "fake",
-                "model": None,
-                "demo": store.default_provider is None,
-                "activated_at": instance.get("created_at"),
-                "migrated_at": datetime.now(UTC).isoformat(),
-            },
-        }
-        atomic_write_json(self._paths.data_dir / "instance.json", migrated)
-        if store.providers:
-            store.save(self._paths.credentials_path)
-        if self._paths.telegram_config_path.exists():
-            try:
-                config = TelegramConnectorConfig.load(
-                    self._paths.telegram_config_path
-                )
-            except ValueError:
-                return
-            config.save(self._paths.telegram_config_path)
+        )
+        snapshots = tuple(_FileSnapshot.capture(path) for path in paths)
+        try:
+            for path in paths:
+                if path.exists():
+                    shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+            store = ProviderCredentialStore.load(self._paths.credentials_path)
+            telegram_config = (
+                TelegramConnectorConfig.load(self._paths.telegram_config_path)
+                if self._paths.telegram_config_path.exists()
+                else None
+            )
+            provider_id = store.default_provider or "fake"
+            credential = store.credential_for(provider_id)
+            definition = find_provider(provider_id)
+            migrated = {
+                **instance,
+                "activation": {
+                    "status": "activated",
+                    "mode": "migrated",
+                    "provider": provider_id,
+                    "model": (
+                        (credential.model if credential is not None else None)
+                        or definition.recommended_model
+                        or "deterministic-fake"
+                    ),
+                    "base_url": (
+                        (credential.base_url if credential is not None else None)
+                        or definition.base_url
+                    ),
+                    "demo": provider_id == "fake",
+                    "verified_at": (
+                        credential.verified_at if credential is not None else None
+                    ),
+                    "activated_at": instance.get("created_at"),
+                    "migrated_at": datetime.now(UTC).isoformat(),
+                },
+            }
+            atomic_write_json(self._paths.data_dir / "instance.json", migrated)
+            if store.providers:
+                store.save(self._paths.credentials_path)
+            if telegram_config is not None:
+                telegram_config.save(self._paths.telegram_config_path)
+        except (KeyError, OSError, RuntimeError, ValueError) as error:
+            rollback_errors: list[str] = []
+            for snapshot in snapshots:
+                try:
+                    snapshot.restore()
+                except OSError as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+            detail = (
+                f" Rollback also failed: {'; '.join(rollback_errors)}."
+                if rollback_errors
+                else ""
+            )
+            raise OperationError(
+                f"Migration failed and live state was restored: {error}.{detail}"
+            ) from error

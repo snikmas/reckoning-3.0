@@ -69,6 +69,36 @@ def test_cloud_providers_pin_their_official_host() -> None:
             assert item.base_url.startswith(f"https://{item.required_host}")
 
 
+@pytest.mark.parametrize(
+    ("provider_id", "env_name", "host", "model"),
+    (
+        (
+            "anthropic",
+            "ANTHROPIC_API_KEY",
+            "api.anthropic.com",
+            "claude-haiku-4-5",
+        ),
+        (
+            "google-gemini",
+            "GEMINI_API_KEY",
+            "generativelanguage.googleapis.com",
+            "gemini-2.5-flash",
+        ),
+    ),
+)
+def test_provider_candidates_publish_their_documented_connection_contract(
+    provider_id: str, env_name: str, host: str, model: str
+) -> None:
+    definition = find_provider(provider_id)
+
+    assert definition.availability == "coming-soon"
+    assert definition.env_names == (env_name,)
+    assert definition.required_host == host
+    assert definition.base_url is not None
+    assert definition.base_url.startswith(f"https://{host}")
+    assert definition.recommended_model == model
+
+
 def test_local_providers_publish_documented_localhost_probes() -> None:
     for item in providers_in_group("local"):
         assert item.local_probe_urls
