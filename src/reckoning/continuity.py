@@ -160,6 +160,17 @@ class DecisionResume:
     check_ins: tuple[CheckIn, ...]
 
 
+class ReckoningRevisionConflict(RuntimeError):
+    def __init__(self, reckoning_id: str, expected: int, actual: int) -> None:
+        super().__init__(
+            f"Reckoning {reckoning_id} changed from revision "
+            f"{expected} to {actual}."
+        )
+        self.reckoning_id = reckoning_id
+        self.expected = expected
+        self.actual = actual
+
+
 class ReckoningProvider(Protocol):
     def reckon(
         self, unstructured_input: str
@@ -167,7 +178,7 @@ class ReckoningProvider(Protocol):
 
 
 class ReckoningRepository(Protocol):
-    def save(self, reckoning: Reckoning) -> None: ...
+    def save(self, reckoning: Reckoning, *, expected_version: int) -> None: ...
 
     def get(self, reckoning_id: str) -> Reckoning: ...
 
@@ -190,7 +201,15 @@ class InMemoryReckoningRepository:
         self._reckonings: dict[str, Reckoning] = {}
         self._check_ins: dict[str, CheckIn] = {}
 
-    def save(self, reckoning: Reckoning) -> None:
+    def save(self, reckoning: Reckoning, *, expected_version: int) -> None:
+        actual = self._reckonings.get(reckoning.id)
+        actual_version = actual.version if actual is not None else 0
+        if actual_version != expected_version:
+            raise ReckoningRevisionConflict(
+                reckoning.id, expected_version, actual_version
+            )
+        if reckoning.version != expected_version + 1:
+            raise ValueError("Reckoning versions must increase by one.")
         self._reckonings[reckoning.id] = reckoning
 
     def get(self, reckoning_id: str) -> Reckoning:

@@ -16,6 +16,47 @@ pipx install .
 `uv tool install .` and `python3 -m pip install .` work as well. The package
 installs exactly one command, `reckoning`.
 
+## Use the web interface safely
+
+Run the web interface on the default loopback address:
+
+```bash
+reckoning
+```
+
+The server accepts `http://127.0.0.1:8000`, `http://localhost:8000`, and
+`http://[::1]:8000` as browser origins. If you change `--port`, the allowed
+loopback origins use the same port.
+
+Every form submission requires a server-issued browser session and form token.
+The server also checks the Host, checks Origin when the browser sends it, and
+rejects cross-site Fetch Metadata. A client that omits Origin or Fetch Metadata
+must still send the valid session cookie and form token. Restarting the server
+expires existing browser sessions. Reload a page to start a new session.
+
+To use an SSH tunnel, keep the same local and server port:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 user@personal-server
+```
+
+Then open `http://127.0.0.1:8000` on the client. The browser origin remains a
+supported loopback origin.
+
+For a private HTTPS origin behind an authenticated reverse proxy, allow the
+exact public origin when you start Reckoning:
+
+```bash
+reckoning --allowed-origin https://reckoning.private.example
+```
+
+Keep the backend bound to loopback, preserve the original Host, and terminate
+TLS at the authenticated proxy. Repeat `--allowed-origin` to allow more than
+one exact origin. Supplying this option replaces the default loopback list, so
+include each loopback origin that you still need. Reckoning does not trust
+`Forwarded` or `X-Forwarded-*` headers to establish browser trust. Do not
+expose the built-in server directly to the internet.
+
 ## Use Reckoning through Telegram on this computer
 
 Create a bot with [BotFather](https://t.me/BotFather). Keep the token private.

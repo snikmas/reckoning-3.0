@@ -6,6 +6,7 @@ import os
 import stat
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Self
 from unittest import mock
@@ -25,6 +26,12 @@ from reckoning.operations import (
     setup_instance,
 )
 from reckoning.personas import PersonaDefinition
+from reckoning.trials import (
+    JsonFileTrialRepository,
+    REQUIRED_REAL_USE_METRICS,
+    TrialEvidence,
+    TrialRecorder,
+)
 from reckoning.web import validate_bind_host
 
 PASSPHRASE = "correct-horse-battery-staple"
@@ -569,6 +576,45 @@ def test_release_readiness_remains_blocked_until_every_required_gate_exists(
     tmp_path: Path,
 ) -> None:
     evidence = tmp_path / "release-evidence.json"
+    trial_path = tmp_path / "trials.json"
+    instant = datetime(2026, 9, 10, 9, 0, tzinfo=timezone.utc)
+    recorder = TrialRecorder(JsonFileTrialRepository(trial_path))
+    trial = recorder.start(
+        "release-trial", "first-slice", instant, assessed_revision="r1"
+    )
+    trial = recorder.record(
+        trial.id,
+        TrialEvidence(
+            "required-check",
+            "automated_check",
+            None,
+            "passed",
+            instant,
+            check_outcome="passed",
+        ),
+        expected_revision=trial.version,
+    )
+    for metric in REQUIRED_REAL_USE_METRICS:
+        trial = recorder.record(
+            trial.id,
+            TrialEvidence(
+                f"observation-{metric}",
+                "real_use",
+                metric,
+                "positive",
+                instant,
+                real_use_outcome="positive",
+            ),
+            expected_revision=trial.version,
+        )
+    recorder.decide(
+        trial.id,
+        "accepted",
+        reason="The first user accepted the assessed revision.",
+        decided_at=instant,
+        assessed_revision="r1",
+        expected_revision=trial.version,
+    )
     write_json(
         evidence,
         {
@@ -580,6 +626,10 @@ def test_release_readiness_remains_blocked_until_every_required_gate_exists(
             "deletion": True,
             "external_action": True,
             "core_continuity_without_developer": True,
+            "trial_acceptance": {
+                "path": trial_path.name,
+                "trial_id": trial.id,
+            },
         },
     )
 

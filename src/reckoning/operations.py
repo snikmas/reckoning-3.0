@@ -603,8 +603,42 @@ def release_readiness(evidence_path: Path) -> ReleaseReadiness:
         raise OperationError(str(error)) from error
     if evidence.get("schema_version") != 1:
         raise OperationError("release evidence must use schema_version 1")
-    missing = tuple(gate for gate in RELEASE_GATES if evidence.get(gate) is not True)
+    missing = tuple(
+        gate
+        for gate in RELEASE_GATES
+        if (
+            not _valid_trial_acceptance(evidence_path, evidence)
+            if gate == "repeated_value"
+            else evidence.get(gate) is not True
+        )
+    )
     return ReleaseReadiness(not missing, missing)
+
+
+def _valid_trial_acceptance(
+    evidence_path: Path, evidence: dict[str, Any]
+) -> bool:
+    reference = evidence.get("trial_acceptance")
+    if not isinstance(reference, dict):
+        return False
+    relative_path = Path(str(reference.get("path", "")))
+    trial_id = str(reference.get("trial_id", "")).strip()
+    if (
+        not trial_id
+        or relative_path.is_absolute()
+        or len(relative_path.parts) != 1
+        or relative_path.name != str(relative_path)
+    ):
+        return False
+    try:
+        from reckoning.trials import inspect_authoritative_trial
+
+        trial = inspect_authoritative_trial(
+            evidence_path.parent / relative_path, trial_id
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return trial.accepted
 
 
 def _check_core_continuity_loop() -> None:

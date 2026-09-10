@@ -261,6 +261,12 @@ class DelegatedToolGateway(Protocol):
     def execute(self, tool: str, payload: str) -> str: ...
 
 
+class DelegatedProcessingAuthorizer(Protocol):
+    def authorize_delegation(
+        self, provider: str, categories: tuple[str, ...]
+    ) -> object: ...
+
+
 class DelegationLimitExceeded(RuntimeError):
     pass
 
@@ -385,6 +391,7 @@ class DelegationCoordinator:
         *,
         model_gateway: DelegatedModelGateway | None = None,
         tool_gateway: DelegatedToolGateway | None = None,
+        processing_authorizer: DelegatedProcessingAuthorizer | None = None,
     ) -> None:
         self._context_source = context_source
         self._worker = worker
@@ -392,6 +399,7 @@ class DelegationCoordinator:
         self._receipts = receipts
         self._model_gateway = model_gateway
         self._tool_gateway = tool_gateway
+        self._processing_authorizer = processing_authorizer
 
     def delegate(
         self,
@@ -403,6 +411,16 @@ class DelegationCoordinator:
     ) -> DelegationOutcome:
         _required(receipt_id, "Delegation receipt id")
         violations = self._request_violations(request, policy)
+        if not violations and self._processing_authorizer is not None:
+            decision = self._processing_authorizer.authorize_delegation(
+                request.provider, request.context_categories
+            )
+            blocked = tuple(getattr(decision, "blocked_categories", ()))
+            if blocked:
+                violations = (
+                    "provider destination lacks processing grants for delegated "
+                    "context: " + ", ".join(blocked),
+                )
         result: DelegatedWorkerResult | None = None
         model_calls = 0
         cost = Decimal(0)

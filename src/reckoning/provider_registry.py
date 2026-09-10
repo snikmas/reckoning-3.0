@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-REGISTRY_VERSION = 1
+REGISTRY_VERSION = 2
 
 ProviderGroup = Literal["direct", "gateway", "local", "custom", "developer"]
 ProviderAvailability = Literal["available", "coming-soon"]
@@ -111,19 +111,31 @@ PROVIDER_REGISTRY: tuple[ProviderDefinition, ...] = (
         recommended_model="gpt-5-mini",
         badges=("API key required", "paid credit may be used"),
     ),
-    _coming_soon(
-        "anthropic",
-        "Anthropic",
-        "direct",
-        "Claude models through the official Anthropic API.",
-        badges=("API key required",),
+    ProviderDefinition(
+        id="anthropic",
+        display_name="Anthropic",
+        group="direct",
+        availability="coming-soon",
+        auth="api-key",
+        summary="Claude models through the official Anthropic API.",
+        env_names=("ANTHROPIC_API_KEY",),
+        base_url="https://api.anthropic.com/v1",
+        required_host="api.anthropic.com",
+        recommended_model="claude-haiku-4-5",
+        badges=("API key required", "paid credit may be used"),
     ),
-    _coming_soon(
-        "google-gemini",
-        "Google Gemini",
-        "direct",
-        "Gemini models through the official Google API.",
-        badges=("API key required",),
+    ProviderDefinition(
+        id="google-gemini",
+        display_name="Google Gemini",
+        group="direct",
+        availability="coming-soon",
+        auth="api-key",
+        summary="Gemini models through the official Google API.",
+        env_names=("GEMINI_API_KEY",),
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        required_host="generativelanguage.googleapis.com",
+        recommended_model="gemini-2.5-flash",
+        badges=("API key required", "free or paid quota may be used"),
     ),
     _coming_soon(
         "xai",

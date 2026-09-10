@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from io import BytesIO
+import re
 from typing import Callable, Iterable
 from urllib.parse import urlencode
 
@@ -64,6 +65,8 @@ def request(
     method: str,
     path: str,
     form: dict[str, str] | None = None,
+    *,
+    cookie: str = "",
 ) -> tuple[str, dict[str, str], bytes]:
     body = urlencode(form or {}).encode("utf-8")
     captured_status = ""
@@ -93,6 +96,8 @@ def request(
         "SERVER_NAME": "127.0.0.1",
         "SERVER_PORT": "8000",
     }
+    if cookie:
+        environ["HTTP_COOKIE"] = cookie
     response: Iterable[bytes] = application(environ, start_response)
     return captured_status, captured_headers, b"".join(response)
 
@@ -117,15 +122,25 @@ def test_first_local_session_sends_message_through_application_boundary() -> Non
     )
     web = ReckoningWebApplication(application)
 
-    status, _, first_session_page = request(web, "GET", "/")
+    status, first_headers, first_session_page = request(web, "GET", "/")
     assert status == "200 OK"
     assert b">Simon</h1>" in first_session_page
+    cookie = first_headers["Set-Cookie"].split(";", 1)[0]
+    token_match = re.search(
+        rb'name="_csrf_token"\s+value="([^"]+)"', first_session_page
+    )
+    assert token_match is not None
+    csrf_token = token_match.group(1).decode()
 
     status, headers, _ = request(
         web,
         "POST",
         "/messages",
-        {"message": "I need to choose between two implementation options."},
+        {
+            "message": "I need to choose between two implementation options.",
+            "_csrf_token": csrf_token,
+        },
+        cookie=cookie,
     )
     assert status == "303 See Other"
     assert headers["Location"] == "/"
