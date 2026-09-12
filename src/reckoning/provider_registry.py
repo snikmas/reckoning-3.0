@@ -296,12 +296,13 @@ PROVIDER_REGISTRY: tuple[ProviderDefinition, ...] = (
             "llama.cpp, then run 'llama-server -m <model.gguf>'."
         ),
     ),
-    # Custom OpenAI-compatible endpoint.
+    # Custom OpenAI-compatible endpoint. Stays coming-soon until an opt-in
+    # real completion is recorded (see tests/test_live_smoke.py).
     ProviderDefinition(
         id="custom",
         display_name="Custom OpenAI-compatible endpoint",
         group="custom",
-        availability="available",
+        availability="coming-soon",
         auth="custom-endpoint",
         summary="Any endpoint that speaks the OpenAI chat-completions protocol.",
         badges=("endpoint URL required", "API key optional"),

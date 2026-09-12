@@ -25,8 +25,10 @@ def test_provider_ids_are_unique() -> None:
 
 def test_available_providers_are_grouped_and_working() -> None:
     available = {item.id for item in available_providers()}
-    assert {"fake", "deepseek", "orcarouter", "custom"} <= available
+    assert {"fake", "deepseek", "orcarouter"} <= available
     assert {"ollama", "lmstudio", "vllm", "llamacpp"} <= available
+    # Custom stays coming-soon until its opt-in real smoke test passes.
+    assert "custom" not in available
     for item in available_providers():
         assert item.availability == "available"
 
@@ -35,6 +37,7 @@ def test_coming_soon_providers_cover_the_product_horizon() -> None:
     coming_soon = {item.id for item in coming_soon_providers()}
     assert {
         "openai",
+        "custom",
         "anthropic",
         "google-gemini",
         "xai",

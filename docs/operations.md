@@ -218,6 +218,51 @@ Setup also creates `release-evidence.json` with every public-release gate set to
 recovery, privacy, deletion, external-action, repeated-value, and
 developer-independent continuity evidence has actually been recorded.
 
+## Migrate an existing installation
+
+An installation created before the current setup state model has an
+`instance.json` without an `activation` record. Re-run setup to inspect it:
+
+```bash
+reckoning setup
+```
+
+Setup inspects the installation before it writes anything. It validates the
+installation record, the single-slot and multi-provider credential stores, the
+Telegram connector, the selected persona, placement policy, User profile
+proposals, and existing durable conversation data. Corrupt, unknown, or
+ambiguous state is refused with a safe explanation and no file changes.
+
+The migration preview names every file it would change. On confirmation, setup
+creates a recoverable `.bak` backup beside every file that changes, stages and
+validates the new files, then writes the activation record last so an
+interruption leaves either a valid legacy installation or a valid migrated one.
+Credential and Telegram files keep owner-only permissions. If a write fails,
+setup restores the exact original bytes and permissions.
+
+Migration preserves provider credentials, the primary provider and model, the
+Desired-self persona, the Placement policy, User profile proposals, Telegram
+owner pairing, and existing conversations. After migration, both `reckoning
+setup` and `reckoning doctor` reopen the installation.
+
+## Reset an installation
+
+```bash
+reckoning reset
+```
+
+Reset prints the exact normalized paths it would remove before it changes
+anything. It removes the local installation root, the configured
+personal-server root, the setup draft, and Telegram connector state. Provider
+credentials are preserved by default and reported as preserved; pass
+`--include-credentials` to remove them too.
+
+Interactive reset requires typing `yes`. A non-interactive reset requires
+`--yes` to accept the previewed removal. Cancelling changes no files. Reset
+refuses a filesystem root, the home directory, overlapping roots, malformed
+server-root configuration, and unsafe path relationships. Reset is deliberately
+separate from setup repair.
+
 ## Check an instance's health
 
 ```bash
