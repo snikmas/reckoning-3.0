@@ -30,10 +30,9 @@ messages sent, no paid requests made.
   F401 introduced by the branch were fixed (typed run-claim record replacing
   `list[object]`, optional-filtering list reads, `Literal` casts,
   repository protocol annotation, `int(str(...))` grant version coercion).
-- Final verified revision: `b59bccd` (the commit adding this report, the
-  scenario, the merge repairs, and the #94 recommendation; the Signal
-  renderer landed in `bc7eae9` just before it). The scenario output records
-  this revision itself.
+- Final verified revision: the `main` tip containing this report (named in
+  the #114 closure comment; the scenario output records the exact hash of
+  the tree it ran against).
 
 ## Assembled synthetic installation scenario
 
