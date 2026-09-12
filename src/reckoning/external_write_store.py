@@ -26,7 +26,6 @@ from reckoning.root_database import (
 )
 from reckoning.store_migration import (
     finalize_legacy_authority,
-    has_sqlite_authority,
     preserve_legacy_rollback,
     write_legacy_authority,
 )
@@ -893,7 +892,7 @@ class SQLiteExternalWriteRepository:
             finalize_legacy_authority(
                 self._path,
                 self._legacy_path,
-                load_legacy=_load_legacy,
+                load_legacy=_load_legacy_authority,
                 digest_key="external_writes_legacy_sha256",
                 label="external-write",
             )
@@ -902,7 +901,7 @@ class SQLiteExternalWriteRepository:
         legacy_data: dict[str, Any] | None = None
         legacy: _LegacyExternalWrites | None = None
         legacy_digest: str | None = None
-        if self._legacy_path.exists() and not has_sqlite_authority(self._legacy_path):
+        if self._legacy_path.exists():
             try:
                 legacy_data, legacy, legacy_digest = _load_legacy(self._legacy_path)
             except (OSError, RuntimeError, TypeError, ValueError, KeyError):
@@ -1510,6 +1509,11 @@ class _LegacyExternalWrites:
     approvals: tuple[ApprovalRecord, ...]
     permissions: tuple[StandingPermission, ...]
     receipts: tuple[WriteReceipt, ...]
+
+
+def _load_legacy_authority(path: Path) -> tuple[dict[str, Any], str]:
+    data, _legacy, digest = _load_legacy(path)
+    return data, digest
 
 
 def _load_legacy(

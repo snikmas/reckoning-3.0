@@ -143,10 +143,51 @@ class LocalOperationalRecordSource:
         return OperationalSnapshot(tuple(receipts), tuple(failures))
 
     def _automation_snapshot(self) -> OperationalSnapshot:
-        data = read_json(
-            self._data_dir / "automation.json",
-            default={"schema_version": 1, "proposals": [], "runs": [], "receipts": []},
-        )
+        from reckoning.store_migration import has_sqlite_authority
+
+        path = self._data_dir / "automation.json"
+        if has_sqlite_authority(path):
+            from reckoning.automation import (
+                _proposal_to_data,
+                _receipt_to_data,
+                _run_to_data,
+            )
+            from reckoning.automation_store import SQLiteAutomationRepository
+
+            repository = SQLiteAutomationRepository(path)
+            data = {
+                "schema_version": 1,
+                "proposals": [
+                    _proposal_to_data(item) for item in repository.list_proposals()
+                ],
+                "runs": [
+                    {
+                        **run_data,
+                        "steps": list(run_data.get("steps", ())),
+                        "results": list(run_data.get("results", ())),
+                    }
+                    for run_data in (
+                        _run_to_data(item) for item in repository.list_runs()
+                    )
+                ],
+                "receipts": [
+                    {
+                        **_receipt_to_data(item),
+                        "results": list(_receipt_to_data(item).get("results", ())),
+                    }
+                    for item in repository.list_receipts()
+                ],
+            }
+        else:
+            data = read_json(
+                path,
+                default={
+                    "schema_version": 1,
+                    "proposals": [],
+                    "runs": [],
+                    "receipts": [],
+                },
+            )
         if data.get("schema_version") != 1:
             raise RuntimeError("Unsupported automation storage schema.")
         proposals = {
