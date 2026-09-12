@@ -639,12 +639,108 @@ class TestAnthropicCandidateContract:
         )
 
         assert models == ("claude-a", "claude-z")
-        assert discovery.requests[0].full_url == "https://api.anthropic.com/v1/models"
+        assert discovery.requests[0].full_url == (
+            "https://api.anthropic.com/v1/models?limit=1000"
+        )
         verification = RecordingTransport([anthropic_completion_payload()])
         adapter.verify(AdapterConfig(api_key=SECRET), transport=verification)
         request_body = json.loads(verification.requests[0].data.decode())
         assert request_body["model"] == "claude-haiku-4-5"
         assert request_body["max_tokens"] == 8
+
+    def test_anthropic_model_discovery_follows_pagination(self) -> None:
+        adapter = candidate_adapter_for("anthropic")
+        discovery = RecordingTransport(
+            [
+                json.dumps(
+                    {
+                        "data": [{"id": "claude-b"}],
+                        "has_more": True,
+                        "last_id": "claude-b",
+                    }
+                ).encode(),
+                json.dumps(
+                    {
+                        "data": [{"id": "claude-a"}],
+                        "has_more": False,
+                        "last_id": "claude-a",
+                    }
+                ).encode(),
+            ]
+        )
+
+        models = adapter.discover_models(
+            AdapterConfig(api_key=SECRET), transport=discovery
+        )
+
+        assert models == ("claude-a", "claude-b")
+        assert len(discovery.requests) == 2
+        assert discovery.requests[0].full_url.endswith("/models?limit=1000")
+        assert discovery.requests[1].full_url.endswith(
+            "/models?limit=1000&after_id=claude-b"
+        )
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            json.dumps({"data": []}).encode(),
+            json.dumps({"models": []}).encode(),
+            json.dumps({"data": [{"id": ""}]}).encode(),
+            json.dumps(
+                {"data": [{"id": "claude-a"}], "has_more": True}
+            ).encode(),
+        ],
+        ids=["empty", "missing-data", "blank-id", "missing-cursor"],
+    )
+    def test_anthropic_model_discovery_rejects_empty_or_malformed_pages(
+        self, payload: bytes
+    ) -> None:
+        adapter = candidate_adapter_for("anthropic")
+        transport = RecordingTransport([payload])
+
+        with pytest.raises(ModelDiscoveryError):
+            adapter.discover_models(AdapterConfig(api_key=SECRET), transport=transport)
+
+    def test_anthropic_verification_accepts_a_manual_model_id(self) -> None:
+        adapter = candidate_adapter_for("anthropic")
+        transport = RecordingTransport([anthropic_completion_payload("ready")])
+
+        result = adapter.verify(
+            AdapterConfig(api_key=SECRET, model="claude-manual-20260101"),
+            transport=transport,
+        )
+
+        body = json.loads(transport.requests[0].data.decode())
+        assert body["model"] == "claude-manual-20260101"
+        assert result.usage == ProviderUsage(12, 4, 16)
+        assert result.latency_ms >= 0
+
+    def test_anthropic_retries_rate_limits_and_server_errors(self) -> None:
+        adapter = candidate_adapter_for("anthropic")
+        transport = RecordingTransport(
+            [http_error(429), http_error(529), anthropic_completion_payload()]
+        )
+
+        result = adapter.verify(
+            AdapterConfig(api_key=SECRET), transport=transport, max_retries=2
+        )
+
+        assert result.retries == 2
+        assert len(transport.requests) == 3
+
+    @pytest.mark.parametrize("code", [400, 401, 403, 404, 422])
+    def test_anthropic_does_not_retry_non_retryable_client_errors(
+        self, code: int
+    ) -> None:
+        adapter = candidate_adapter_for("anthropic")
+        transport = RecordingTransport([http_error(code)] * 3)
+
+        with pytest.raises(ProviderVerificationError):
+            adapter.verify(
+                AdapterConfig(api_key=SECRET), transport=transport, max_retries=3
+            )
+
+        assert len(transport.requests) == 1
 
 
 class TestGeminiCandidateContract:
