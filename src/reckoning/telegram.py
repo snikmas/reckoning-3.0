@@ -164,18 +164,19 @@ class TelegramConnectorConfig:
             paired = chat_ids[0] if chat_ids else None
         return cls(token, username, paired, provider_name)
 
+    def payload(self) -> dict[str, object]:
+        """The exact schema-v2 document written to disk; the token included."""
+        return {
+            "schema_version": 2,
+            "bot_token": self.bot_token,
+            "bot_username": self.bot_username,
+            "paired_chat_id": self.paired_chat_id,
+            "gateway_name": "telegram",
+            "provider_name": self.provider_name,
+        }
+
     def save(self, path: Path = DEFAULT_TELEGRAM_CONFIG) -> None:
-        atomic_write_json(
-            path,
-            {
-                "schema_version": 2,
-                "bot_token": self.bot_token,
-                "bot_username": self.bot_username,
-                "paired_chat_id": self.paired_chat_id,
-                "gateway_name": "telegram",
-                "provider_name": self.provider_name,
-            },
-        )
+        atomic_write_json(path, self.payload())
         path.chmod(0o600)
 
     def polling_settings(self) -> TelegramPollingSettings:

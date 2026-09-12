@@ -620,6 +620,11 @@ def _run_reset(rest: Sequence[str]) -> int:
     if arguments.credentials.exists() and not arguments.include_credentials:
         print(f"provider credentials preserved: {arguments.credentials}")
     if not arguments.yes:
+        if not sys.stdin.isatty():
+            parser.error(
+                "reset in a non-interactive session requires --yes to accept "
+                "the previewed removal"
+            )
         answer = input("Type 'yes' to confirm: ").strip()
         if answer != "yes":
             print("reset: aborted; nothing was removed")
