@@ -54,6 +54,9 @@ class ScriptedUI:
     def info(self, text: str) -> None:
         self.lines.append(text)
 
+    def secondary(self, text: str) -> None:
+        self.lines.append(text)
+
     def success(self, text: str) -> None:
         self.lines.append(f"OK: {text}")
 
@@ -152,24 +155,168 @@ def run_workflow(
     return outcome, ui
 
 
-QUICK_FAKE_ANSWERS: list[tuple[str, str]] = [
-    ("mode", "quick"),
+GUIDED_FAKE_ANSWERS: list[tuple[str, str]] = [
+    ("provider", "fake"),
+    ("connectors", "skip"),
     ("persona", "simon"),
     ("persona-accept", "y"),
-    ("provider-preference", "browse"),
-    ("provider", "fake"),
     ("profile", "skip"),
-    ("connectors", "skip"),
+    ("review-action", "continue"),
     ("first-message", "I need to protect my mornings for study."),
     ("first-message-action", "accept"),
-    ("review-confirm", "y"),
 ]
 
 
-def test_quick_setup_reaches_an_accepted_first_conversation_in_demo_mode(
+def test_guided_setup_uses_five_sections_before_the_first_conversation(
     tmp_path: Path,
 ) -> None:
-    outcome, ui = run_workflow(tmp_path, list(QUICK_FAKE_ANSWERS))
+    outcome, ui = run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
+
+    assert outcome.status == "activated"
+    assert outcome.demo is True
+    steps = [line for line in ui.lines if line.startswith("Step ")]
+    assert steps == [
+        "Step 1/5 — AI provider and model",
+        "Step 2/5 — Ways to use Reckoning",
+        "Step 3/5 — Agent style",
+        "Step 4/5 — About you",
+        "Step 5/5 — Review",
+    ]
+    displayed = "\n".join(ui.lines)
+    assert "Quick Setup" not in displayed
+    assert "Custom Setup" not in displayed
+    assert "Continue to your first conversation" in displayed
+    assert displayed.index("Step 5/5") < displayed.index("Your first conversation")
+    assert "Terminal: Ready. Start with `reckoning`." in displayed
+    assert "Web: Ready. Start with `reckoning web`." in displayed
+    assert "Telegram: Not configured." in displayed
+    assert "Gateway: Stopped. Start with `reckoning gateway`." in displayed
+
+
+def test_provider_screen_lists_only_supported_choices_and_separates_demo(
+    tmp_path: Path,
+) -> None:
+    outcome, ui = run_workflow(tmp_path, [("provider", "__exit__")])
+
+    assert outcome.status == "draft"
+    displayed = "\n".join(ui.lines)
+    assert "More providers coming soon" in displayed
+    for unavailable in ("OpenAI", "Anthropic", "Gemini", "OpenRouter"):
+        assert f"option: {unavailable.casefold()} " not in displayed.casefold()
+    assert displayed.index("OrcaRouter") < displayed.index("Demo")
+
+
+def test_detected_provider_access_is_the_first_choice_without_value_disclosure(
+    tmp_path: Path,
+) -> None:
+    store = ProviderCredentialStore()
+    store.set_key("orcarouter", "sk-never-display", verified=True)
+    store.save(tmp_path / "provider.json")
+
+    outcome, ui = run_workflow(tmp_path, [("provider", "__exit__")])
+
+    assert outcome.status == "draft"
+    displayed = "\n".join(ui.lines)
+    choices = [line for line in ui.lines if line.startswith("  option:")]
+    assert choices[0].startswith("  option: orcarouter ")
+    assert "Detected access" in choices[0]
+    assert "sk-never-display" not in displayed
+    assert "Test a detected provider now?" not in displayed
+
+
+def test_about_you_can_create_a_starter_profile_file(tmp_path: Path) -> None:
+    profile_path = tmp_path / "about-me.md"
+    answers = [
+        ("provider", "fake"),
+        ("connectors", "skip"),
+        ("persona", "simon"),
+        ("persona-accept", "y"),
+        ("profile", "starter"),
+        ("profile-starter-path", str(profile_path)),
+        ("review-action", "continue"),
+        ("first-message", "Help me choose today's priority."),
+        ("first-message-action", "accept"),
+    ]
+
+    outcome, ui = run_workflow(tmp_path, answers)
+
+    assert outcome.status == "activated"
+    profile = profile_path.read_text(encoding="utf-8")
+    assert "# About me" in profile
+    assert "## Current work" in profile
+    assert "## Boundaries" in profile
+    assert "Example:" in "\n".join(ui.lines)
+    instance = json.loads((tmp_path / "data" / "instance.json").read_text())
+    assert instance["profile_bootstrap"]["proposal_count"] == 0
+
+
+def test_legacy_draft_migration_preserves_choices_and_removes_mode(
+    tmp_path: Path,
+) -> None:
+    draft_path = tmp_path / "setup-draft.json"
+    draft_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "incomplete",
+                "mode": "quick",
+                "completed": ["persona", "provider", "profile"],
+                "placement": "local",
+                "persona_id": "simon",
+                "provider_id": "fake",
+                "provider_model": "deterministic-fake",
+                "provider_demo": True,
+                "profile_choice": "skip",
+                "profile_entries": [],
+                "next_step": "connectors",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    outcome, ui = run_workflow(
+        tmp_path,
+        [("resume", "resume"), ("connectors", "__exit__")],
+    )
+
+    assert outcome.status == "draft"
+    migrated = json.loads(draft_path.read_text(encoding="utf-8"))
+    assert migrated["schema_version"] == 2
+    assert "mode" not in migrated
+    assert migrated["persona_id"] == "simon"
+    assert migrated["provider_id"] == "fake"
+    assert "Draft migration preview" in "\n".join(ui.lines)
+
+
+def test_incompatible_draft_requires_an_exact_removal_confirmation(
+    tmp_path: Path,
+) -> None:
+    draft_path = tmp_path / "setup-draft.json"
+    draft_path.write_text(
+        json.dumps({"schema_version": 999, "status": "incomplete"}),
+        encoding="utf-8",
+    )
+
+    outcome, ui = run_workflow(
+        tmp_path,
+        [
+            ("invalid-draft-action", "remove"),
+            ("invalid-draft-remove", "n"),
+        ],
+    )
+
+    assert outcome.status == "draft"
+    assert draft_path.exists()
+    displayed = "\n".join(ui.lines)
+    assert "cannot resume" in displayed
+    assert f"Remove exactly: {draft_path}" in displayed
+    assert not (tmp_path / "data").exists()
+
+
+def test_guided_setup_persists_the_accepted_first_conversation(
+    tmp_path: Path,
+) -> None:
+    outcome, ui = run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
 
     assert outcome.status == "activated"
     assert outcome.demo is True
@@ -177,8 +324,8 @@ def test_quick_setup_reaches_an_accepted_first_conversation_in_demo_mode(
     displayed = "\n".join(ui.lines)
     assert "Demo mode" in displayed
     assert "Real provider ready" not in displayed
-    assert "Quick Setup configures" in displayed
-    assert "Placement: local storage" in displayed
+    assert "Quick Setup" not in displayed
+    assert "Custom Setup" not in displayed
     assert not (tmp_path / "setup-draft.json").exists()
 
     instance = json.loads((tmp_path / "data" / "instance.json").read_text())
@@ -201,7 +348,7 @@ def test_installed_state_survives_a_fresh_application_load(tmp_path: Path) -> No
     from reckoning.interfaces import JsonFileInterfaceRepository
     from reckoning.operations import load_installation_runtime
 
-    run_workflow(tmp_path, list(QUICK_FAKE_ANSWERS))
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
 
     runtime = load_installation_runtime(tmp_path / "data")
     state = JsonFileInterfaceRepository(
@@ -217,53 +364,51 @@ def test_exit_writes_a_non_secret_draft_and_resume_skips_completed_steps(
 ) -> None:
     outcome, _ = run_workflow(
         tmp_path,
-        [
-            ("mode", "quick"),
-            ("persona", "steady"),
-            ("persona-accept", "y"),
-            ("provider-preference", "__exit__"),
-        ],
+        [("provider", "fake"), ("connectors", "__exit__")],
     )
 
     assert outcome.status == "draft"
     draft_raw = (tmp_path / "setup-draft.json").read_text(encoding="utf-8")
     draft = json.loads(draft_raw)
     assert draft["status"] == "incomplete"
-    assert draft["next_step"] == "provider"
-    assert draft["completed"] == ["persona"]
-    assert draft["persona_id"] == "steady"
+    assert draft["next_step"] == "connectors"
+    assert draft["completed"] == ["provider"]
+    assert draft["provider_id"] == "fake"
     assert "secret" not in draft_raw.casefold()
     assert not (tmp_path / "data").exists()
     assert stat.S_IMODE((tmp_path / "setup-draft.json").stat().st_mode) == 0o600
 
-    # Resume: persona is not asked again; setup finishes from the provider step.
+    # Resume: the provider is not asked again; setup finishes from connectors.
     outcome2, ui2 = run_workflow(
         tmp_path,
         [
             ("resume", "resume"),
-            ("provider-preference", "browse"),
-            ("provider", "fake"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("persona", "steady"),
+            ("persona-accept", "y"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Hello again."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
     )
     assert outcome2.status == "activated"
     displayed2 = "\n".join(ui2.lines)
-    assert "Choose your desired-self persona" not in displayed2
-    assert "Completed steps: persona" in displayed2
+    assert "Step 1/5" not in displayed2
+    assert "Completed sections: provider" in displayed2
     assert outcome2.persona_id == "steady"
 
 
-def test_exit_before_mode_records_mode_as_the_next_step(tmp_path: Path) -> None:
-    outcome, _ = run_workflow(tmp_path, [("mode", "__exit__")])
+def test_exit_at_the_provider_step_records_it_as_the_next_step(
+    tmp_path: Path,
+) -> None:
+    outcome, _ = run_workflow(tmp_path, [("provider", "__exit__")])
 
     assert outcome.status == "draft"
     draft = json.loads((tmp_path / "setup-draft.json").read_text())
     assert draft["status"] == "incomplete"
-    assert draft["next_step"] == "mode"
+    assert draft["completed"] == []
+    assert draft["next_step"] == "provider"
 
 
 @pytest.mark.parametrize(
@@ -295,26 +440,23 @@ def test_back_changes_no_committed_state(tmp_path: Path) -> None:
     outcome, _ui = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
+            ("provider", "fake"),
+            ("connectors", "__back__"),
+            ("provider", "fake"),
+            ("connectors", "skip"),
             ("persona", "steady"),
             ("persona-accept", "y"),
-            ("provider-preference", "__back__"),
-            ("persona", "simon"),
-            ("persona-accept", "y"),
-            ("provider-preference", "browse"),
-            ("provider", "fake"),
             ("profile", "skip"),
-            ("connectors", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Testing back navigation."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
     )
 
     assert outcome.status == "activated"
-    assert outcome.persona_id == "simon"
+    assert outcome.persona_id == "steady"
     instance = json.loads((tmp_path / "data" / "instance.json").read_text())
-    assert instance["active_persona_id"] == "simon"
+    assert instance["active_persona_id"] == "steady"
 
 
 def test_a_rejected_first_response_leaves_no_durable_conversation(
@@ -323,13 +465,12 @@ def test_a_rejected_first_response_leaves_no_durable_conversation(
     outcome, _ = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
+            ("provider", "fake"),
+            ("connectors", "skip"),
             ("persona", "simon"),
             ("persona-accept", "y"),
-            ("provider-preference", "browse"),
-            ("provider", "fake"),
             ("profile", "skip"),
-            ("connectors", "skip"),
+            ("review-action", "continue"),
             ("first-message", "First attempt."),
             ("first-message-action", "retry"),
             ("first-message", "Second attempt."),
@@ -351,11 +492,7 @@ def test_start_over_removes_the_draft_but_preserves_credentials(
     store = ProviderCredentialStore()
     store.set_key("deepseek", "sk-verified")
     store.save(tmp_path / "provider.json")
-    run_workflow(
-        tmp_path,
-        [("mode", "quick"), ("persona", "simon"), ("persona-accept", "y"),
-         ("provider-test-detected", "n"), ("provider", "__exit__")],
-    )
+    run_workflow(tmp_path, [("provider", "__exit__")])
 
     outcome, _ui = run_workflow(
         tmp_path,
@@ -363,16 +500,14 @@ def test_start_over_removes_the_draft_but_preserves_credentials(
             ("resume", "start-over"),
             ("start-over-credentials", "n"),
             ("start-over-confirm", "y"),
-            ("mode", "quick"),
+            ("provider", "fake"),
+            ("connectors", "skip"),
             ("persona", "simon"),
             ("persona-accept", "y"),
-            ("provider-test-detected", "n"),
-            ("provider", "fake"),
             ("profile", "skip"),
-            ("connectors", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Fresh start."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         services=offline_services(),
     )
@@ -391,13 +526,7 @@ def test_saved_credentials_alone_do_not_make_a_fresh_installation_configured(
     store.set_key("deepseek", "sk-saved")
     store.save(tmp_path / "provider.json")
 
-    answers = [
-        item
-        for item in QUICK_FAKE_ANSWERS
-        if item[0] != "provider-preference"
-    ]
-    answers.insert(3, ("provider-test-detected", "n"))
-    outcome, ui = run_workflow(tmp_path, answers)
+    outcome, ui = run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
 
     assert outcome.status == "activated"
     assert (tmp_path / "data" / "instance.json").exists()
@@ -461,25 +590,23 @@ def truncated_deepseek_transport():
 
 
 DEEPSEEK_ANSWERS: list[tuple[str, str]] = [
-    ("mode", "quick"),
-    ("persona", "simon"),
-    ("persona-accept", "y"),
-    ("provider-preference", "direct"),
-    ("provider-use-recommendation", "y"),
+    ("provider", "deepseek"),
     ("provider-key-source", "new"),
     ("provider-key", "sk-test-deepseek"),
     ("provider-model", "recommended"),
     ("provider-verify-consent", "y"),
     ("persona-live-sample", "n"),
-    ("profile", "skip"),
     ("connectors", "skip"),
+    ("persona", "simon"),
+    ("persona-accept", "y"),
+    ("profile", "skip"),
+    ("review-action", "continue"),
     ("first-message", "Help me plan the semester."),
     ("first-message-action", "accept"),
-    ("review-confirm", "y"),
 ]
 
 
-def test_quick_setup_verifies_a_real_provider_and_never_displays_the_key(
+def test_guided_setup_verifies_a_real_provider_and_never_displays_the_key(
     tmp_path: Path,
 ) -> None:
     transport, calls = chat_transport()
@@ -503,6 +630,9 @@ def test_quick_setup_verifies_a_real_provider_and_never_displays_the_key(
     conversation_body = json.loads(calls[1].data.decode("utf-8"))
     assert verification_body["thinking"] == {"type": "disabled"}
     assert "thinking" not in conversation_body
+    # The first conversation has no tools, writes, or routines attached.
+    assert "tools" not in conversation_body
+    assert "tool_choice" not in conversation_body
 
     raw = json.loads((tmp_path / "provider.json").read_text(encoding="utf-8"))
     assert raw["schema_version"] == 2
@@ -525,23 +655,20 @@ def test_reasoning_only_truncated_verification_preserves_recovery_and_inactive_s
     outcome, ui = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
-            ("persona", "simon"),
-            ("persona-accept", "y"),
-            ("provider-preference", "direct"),
-            ("provider-use-recommendation", "y"),
+            ("provider", "deepseek"),
             ("provider-key-source", "new"),
             ("provider-key", "sk-truncated"),
             ("provider-model", "recommended"),
             ("provider-verify-consent", "y"),
             ("provider-failure", "save"),
-            ("provider-test-detected", "n"),
             ("provider", "fake"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Hello."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         services=offline_services(transport=transport),
     )
@@ -573,20 +700,18 @@ def test_an_environment_reference_is_reused_without_copying_its_value(
     outcome, ui = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
-            ("persona", "simon"),
-            ("persona-accept", "y"),
-            ("provider-test-detected", "y"),
-            ("provider-detected", "deepseek"),
+            ("provider", "deepseek"),
             ("provider-key-source", "env-ref"),
             ("provider-model", "recommended"),
             ("provider-verify-consent", "y"),
             ("persona-live-sample", "n"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Hello."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         services=offline_services(
             environ={"DEEPSEEK_API_KEY": "sk-env-value"}, transport=transport
@@ -620,23 +745,20 @@ def test_a_failed_verification_can_be_saved_inactive_and_never_completes_setup(
     outcome, ui = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
-            ("persona", "simon"),
-            ("persona-accept", "y"),
-            ("provider-preference", "direct"),
-            ("provider-use-recommendation", "y"),
+            ("provider", "deepseek"),
             ("provider-key-source", "new"),
             ("provider-key", "sk-bad"),
             ("provider-model", "recommended"),
             ("provider-verify-consent", "y"),
             ("provider-failure", "save"),
-            ("provider-test-detected", "n"),
             ("provider", "fake"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Hello."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         services=offline_services(transport=failing_transport),
     )
@@ -690,18 +812,16 @@ def test_telegram_pairing_reports_ready_and_sends_a_confirmation(
 ) -> None:
     client = StubTelegramClient(PAIRING_UPDATES)
     answers = [
-        ("mode", "quick"),
-        ("persona", "simon"),
-        ("persona-accept", "y"),
-        ("provider-preference", "browse"),
         ("provider", "fake"),
-        ("profile", "skip"),
         ("connectors", "telegram"),
         ("telegram-token", "bot-token"),
         ("telegram-pair", "y"),
+        ("persona", "simon"),
+        ("persona-accept", "y"),
+        ("profile", "skip"),
+        ("review-action", "continue"),
         ("first-message", "Hello."),
         ("first-message-action", "accept"),
-        ("review-confirm", "y"),
     ]
     outcome, ui = run_workflow(
         tmp_path,
@@ -727,18 +847,16 @@ def test_telegram_pairing_reports_ready_and_sends_a_confirmation(
 def test_telegram_can_be_saved_verified_without_pairing(tmp_path: Path) -> None:
     client = StubTelegramClient()
     answers = [
-        ("mode", "quick"),
-        ("persona", "simon"),
-        ("persona-accept", "y"),
-        ("provider-preference", "browse"),
         ("provider", "fake"),
-        ("profile", "skip"),
         ("connectors", "telegram"),
         ("telegram-token", "bot-token"),
         ("telegram-pair", "n"),
+        ("persona", "simon"),
+        ("persona-accept", "y"),
+        ("profile", "skip"),
+        ("review-action", "continue"),
         ("first-message", "Hello."),
         ("first-message-action", "accept"),
-        ("review-confirm", "y"),
     ]
     outcome, ui = run_workflow(
         tmp_path,
@@ -756,23 +874,19 @@ def test_guided_profile_answers_become_unconfirmed_proposals(
     tmp_path: Path,
 ) -> None:
     answers = [
-        ("mode", "quick"),
+        ("provider", "fake"),
+        ("connectors", "skip"),
         ("persona", "simon"),
         ("persona-accept", "y"),
-        ("provider-preference", "browse"),
-        ("provider", "fake"),
         ("profile", "guided"),
         ("profile-address", "Mary"),
-        ("profile-situation", ""),
-        ("profile-goals", "Finish the semester strong"),
-        ("profile-constraints", ""),
+        ("profile-work", "Finish the semester strong"),
+        ("profile-priorities", ""),
         ("profile-preferences", ""),
-        ("profile-commitments", ""),
         ("profile-boundaries", ""),
-        ("connectors", "skip"),
+        ("review-action", "continue"),
         ("first-message", "Hello."),
         ("first-message-action", "accept"),
-        ("review-confirm", "y"),
     ]
     outcome, _ = run_workflow(tmp_path, answers)
 
@@ -783,7 +897,7 @@ def test_guided_profile_answers_become_unconfirmed_proposals(
     meanings = [item.canonical_meaning for item in versions]
     assert any("address: Mary" in meaning for meaning in meanings)
     assert any(
-        "goals: Finish the semester strong" in meaning for meaning in meanings
+        "work: Finish the semester strong" in meaning for meaning in meanings
     )
     assert {item.status for item in versions} == {"proposed"}
 
@@ -795,18 +909,16 @@ def test_profile_import_previews_and_removes_statements(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     answers = [
-        ("mode", "quick"),
+        ("provider", "fake"),
+        ("connectors", "skip"),
         ("persona", "simon"),
         ("persona-accept", "y"),
-        ("provider-preference", "browse"),
-        ("provider", "fake"),
         ("profile", "import"),
         ("profile-import-path", str(profile)),
         ("profile-import-remove", "2"),
-        ("connectors", "skip"),
+        ("review-action", "continue"),
         ("first-message", "Hello."),
         ("first-message-action", "accept"),
-        ("review-confirm", "y"),
     ]
     outcome, ui = run_workflow(tmp_path, answers)
 
@@ -823,21 +935,22 @@ def test_profile_import_previews_and_removes_statements(tmp_path: Path) -> None:
     assert "computer science" in all_text
 
 
-def test_custom_setup_records_personal_server_placement(tmp_path: Path) -> None:
+def test_review_can_change_storage_to_a_personal_server(
+    tmp_path: Path,
+) -> None:
     server_dir = tmp_path / "server"
     answers = [
-        ("mode", "custom"),
-        ("placement", "personal-server"),
-        ("server-data-dir", str(server_dir)),
+        ("provider", "fake"),
+        ("connectors", "skip"),
         ("persona", "steady"),
         ("persona-accept", "y"),
-        ("provider-preference", "browse"),
-        ("provider", "fake"),
         ("profile", "skip"),
-        ("connectors", "skip"),
+        ("review-action", "placement"),
+        ("placement", "personal-server"),
+        ("server-data-dir", str(server_dir)),
+        ("review-action", "continue"),
         ("first-message", "Hello."),
         ("first-message-action", "accept"),
-        ("review-confirm", "y"),
     ]
     outcome, _ = run_workflow(tmp_path, answers)
 
@@ -849,7 +962,8 @@ def test_custom_setup_records_personal_server_placement(tmp_path: Path) -> None:
 
 def test_persona_authoring_flow_builds_an_original_persona(tmp_path: Path) -> None:
     answers = [
-        ("mode", "quick"),
+        ("provider", "fake"),
+        ("connectors", "skip"),
         ("persona", "author"),
         ("persona-name", "Clear Eyed"),
         ("persona-id", ""),
@@ -861,13 +975,10 @@ def test_persona_authoring_flow_builds_an_original_persona(tmp_path: Path) -> No
         ("persona-axis-challenge", "demanding"),
         ("persona-axis-sensitive_topic_handling", "practical"),
         ("persona-accept", "y"),
-        ("provider-preference", "browse"),
-        ("provider", "fake"),
         ("profile", "skip"),
-        ("connectors", "skip"),
+        ("review-action", "continue"),
         ("first-message", "Hello."),
         ("first-message-action", "accept"),
-        ("review-confirm", "y"),
     ]
     outcome, ui = run_workflow(tmp_path, answers)
 
@@ -885,7 +996,7 @@ def test_persona_authoring_flow_builds_an_original_persona(tmp_path: Path) -> No
 def test_the_status_view_loads_without_network_and_offers_actions(
     tmp_path: Path,
 ) -> None:
-    run_workflow(tmp_path, list(QUICK_FAKE_ANSWERS))
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
 
     def forbidden_transport(request, timeout: float) -> bytes:
         raise AssertionError("the status view must not make network calls")
@@ -899,20 +1010,21 @@ def test_the_status_view_loads_without_network_and_offers_actions(
     assert outcome.status == "managed"
     displayed = "\n".join(ui.lines)
     assert "Installation status" in displayed
-    assert "placement: local" in displayed
-    assert "persona: Simon" in displayed
-    assert "fake (demo mode)" in displayed
-    assert "gateway: not running; start with reckoning gateway" in displayed
-    assert "telegram not-configured" in displayed
-    assert "draft: none" in displayed
-    assert "migration: current" in displayed
+    assert "Storage: local" in displayed
+    assert "Agent style: Simon" in displayed
+    assert "AI provider and model: fake (demo mode)" in displayed
+    assert "Interfaces: Terminal ready; Web ready" in displayed
+    assert "Telegram: Not configured" in displayed
+    assert "Gateway: Stopped; start with `reckoning gateway`" in displayed
+    assert "Setup draft: none" in displayed
+    assert "Installation format: current" in displayed
     assert "Verify all" in displayed
 
 
 def test_status_repairs_an_invalid_draft_only_after_confirmation(
     tmp_path: Path,
 ) -> None:
-    run_workflow(tmp_path, list(QUICK_FAKE_ANSWERS))
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
     draft_path = tmp_path / "setup-draft.json"
     draft_path.write_text("not json", encoding="utf-8")
 
@@ -933,7 +1045,7 @@ def test_status_repairs_an_invalid_draft_only_after_confirmation(
     assert not draft_path.exists()
     displayed = "\n".join(ui.lines)
     assert displayed.count("Remove the invalid setup draft?") == 2
-    assert "draft: none" in displayed
+    assert "Setup draft: none" in displayed
 
 
 def test_verify_all_asks_before_a_paid_refresh(tmp_path: Path) -> None:
@@ -968,7 +1080,7 @@ def test_verify_all_asks_before_a_paid_refresh(tmp_path: Path) -> None:
 def test_section_editing_changes_the_persona_without_rerunning_setup(
     tmp_path: Path,
 ) -> None:
-    run_workflow(tmp_path, list(QUICK_FAKE_ANSWERS))
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
 
     outcome, ui = run_workflow(
         tmp_path,
@@ -985,6 +1097,59 @@ def test_section_editing_changes_the_persona_without_rerunning_setup(
     personas = json.loads((tmp_path / "data" / "personas.json").read_text())
     assert personas["active_persona_id"] == "steady"
     assert "Active persona: Steady" in "\n".join(ui.lines)
+
+
+def test_status_view_reports_a_running_gateway(tmp_path: Path) -> None:
+    from reckoning.runtime_status import record_gateway_runtime
+
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
+    with record_gateway_runtime(tmp_path / "data"):
+        outcome, ui = run_workflow(
+            tmp_path,
+            [("status-action", "exit")],
+        )
+
+    assert outcome.status == "managed"
+    assert "Gateway: Running (pid " in "\n".join(ui.lines)
+
+
+def test_review_edits_one_row_and_returns_to_review(tmp_path: Path) -> None:
+    answers = [
+        ("provider", "fake"),
+        ("connectors", "skip"),
+        ("persona", "simon"),
+        ("persona-accept", "y"),
+        ("profile", "skip"),
+        ("review-action", "persona"),
+        ("persona", "steady"),
+        ("persona-accept", "y"),
+        ("review-action", "continue"),
+        ("first-message", "Hello."),
+        ("first-message-action", "accept"),
+    ]
+
+    outcome, ui = run_workflow(tmp_path, answers)
+
+    assert outcome.status == "activated"
+    assert outcome.persona_id == "steady"
+    # Editing one row returns to Review without repeating the provider step.
+    assert (
+        sum(
+            line == "Step 1/5 — AI provider and model" for line in ui.lines
+        )
+        == 1
+    )
+    instance = json.loads((tmp_path / "data" / "instance.json").read_text())
+    assert instance["active_persona_id"] == "steady"
+
+
+def test_personal_server_placement_requires_a_directory(tmp_path: Path) -> None:
+    with pytest.raises(SetupInputError, match="server-data-dir is required"):
+        run_workflow(
+            tmp_path,
+            [],
+            preselected={"placement": "personal-server"},
+        )
 
 
 def test_migration_previews_backs_up_and_commits_atomically(tmp_path: Path) -> None:
@@ -1025,7 +1190,7 @@ def test_non_interactive_setup_matches_the_interactive_result(
 
     interactive = tmp_path / "interactive"
     interactive.mkdir()
-    run_workflow(interactive, list(QUICK_FAKE_ANSWERS))
+    run_workflow(interactive, list(GUIDED_FAKE_ANSWERS))
 
     scripted = tmp_path / "scripted"
     scripted.mkdir()
@@ -1033,6 +1198,7 @@ def test_non_interactive_setup_matches_the_interactive_result(
         {
             "profile": "skip",
             "connectors": "skip",
+            "review-action": "continue",
             "first-message": "Automated first message.",
             "first-message-action": "accept",
         },
@@ -1042,7 +1208,7 @@ def test_non_interactive_setup_matches_the_interactive_result(
         paths=make_paths(scripted),
         ui=ui,
         services=offline_services(),
-        preselected={"mode": "quick", "persona": "simon", "provider": "fake"},
+        preselected={"persona": "simon", "provider": "fake"},
     )
     outcome = workflow.run()
 
@@ -1070,9 +1236,9 @@ def test_non_interactive_setup_fails_loudly_on_a_missing_answer(
         paths=make_paths(tmp_path),
         ui=ui,
         services=offline_services(),
-        preselected={"mode": "quick", "persona": "simon"},
+        preselected={"persona": "simon"},
     )
-    with pytest.raises(SetupInputError, match="provider-preference"):
+    with pytest.raises(SetupInputError, match="provider"):
         workflow.run()
     assert not (tmp_path / "data").exists()
 
@@ -1084,22 +1250,20 @@ def test_the_optional_live_persona_sample_runs_after_verification(
     outcome, ui = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
-            ("persona", "simon"),
-            ("persona-accept", "y"),
-            ("provider-preference", "direct"),
-            ("provider-use-recommendation", "y"),
+            ("provider", "deepseek"),
             ("provider-key-source", "new"),
             ("provider-key", "sk-sample"),
             ("provider-model", "recommended"),
             ("provider-verify-consent", "y"),
             ("persona-live-sample", "y"),
             ("persona-live-sample-keep", "y"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Hello."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         services=offline_services(transport=transport),
     )
@@ -1117,20 +1281,17 @@ def test_resuming_after_profile_onboarding_keeps_the_proposals(
     first_outcome, _ = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
+            ("provider", "fake"),
+            ("connectors", "skip"),
             ("persona", "simon"),
             ("persona-accept", "y"),
-            ("provider-preference", "browse"),
-            ("provider", "fake"),
             ("profile", "guided"),
             ("profile-address", "Mary"),
-            ("profile-situation", ""),
-            ("profile-goals", ""),
-            ("profile-constraints", ""),
+            ("profile-work", ""),
+            ("profile-priorities", ""),
             ("profile-preferences", ""),
-            ("profile-commitments", ""),
             ("profile-boundaries", ""),
-            ("connectors", "__exit__"),
+            ("review-action", "__exit__"),
         ],
     )
     assert first_outcome.status == "draft"
@@ -1139,10 +1300,9 @@ def test_resuming_after_profile_onboarding_keeps_the_proposals(
         tmp_path,
         [
             ("resume", "resume"),
-            ("connectors", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Hello after resuming."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
     )
 
@@ -1151,7 +1311,7 @@ def test_resuming_after_profile_onboarding_keeps_the_proposals(
         tmp_path / "data" / "personal-context" / "personal-context.json"
     ).all_versions()
     assert [item.original_text for item in versions] == ["Mary"]
-    assert "Profile proposals: 1" in ui.lines
+    assert "About you: 1 unconfirmed proposals" in ui.lines
 
 
 def test_keyless_local_provider_remains_active_in_the_installed_runtime(
@@ -1169,20 +1329,18 @@ def test_keyless_local_provider_remains_active_in_the_installed_runtime(
     outcome, _ = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
-            ("persona", "simon"),
-            ("persona-accept", "y"),
-            ("provider-test-detected", "y"),
-            ("provider-detected", "ollama"),
+            ("provider", "ollama"),
             ("provider-model", "manual"),
             ("provider-model-manual", "qwen3"),
             ("provider-verify-consent", "y"),
             ("persona-live-sample", "n"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "First local message."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         services=services,
     )
@@ -1193,7 +1351,10 @@ def test_keyless_local_provider_remains_active_in_the_installed_runtime(
         [("status-action", "exit")],
         services=services,
     )
-    assert any("[ok] provider: ollama, model qwen3" in line for line in status_ui.lines)
+    assert any(
+        "[ok] AI provider and model: ollama, model qwen3" in line
+        for line in status_ui.lines
+    )
 
     settings = RuntimeProviderSettings.load(
         tmp_path / "data",
@@ -1232,10 +1393,6 @@ def test_keyless_custom_provider_remains_active_in_the_installed_runtime(
     outcome, _ = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
-            ("persona", "simon"),
-            ("persona-accept", "y"),
-            ("provider-preference", "browse"),
             ("provider", "custom"),
             ("provider-base-url", "http://127.0.0.1:9000/v1"),
             ("provider-custom-key", ""),
@@ -1244,11 +1401,13 @@ def test_keyless_custom_provider_remains_active_in_the_installed_runtime(
             ("provider-model-manual", "local-model"),
             ("provider-verify-consent", "y"),
             ("persona-live-sample", "n"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "First custom message."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         services=offline_services(transport=transport),
     )
@@ -1298,14 +1457,13 @@ def test_scripted_custom_provider_stores_an_environment_reference(
             ("provider-model-manual", "custom-model"),
             ("provider-verify-consent", "y"),
             ("persona-live-sample", "n"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Use the custom provider."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         preselected={
-            "mode": "quick",
             "persona": "simon",
             "provider": "custom",
             "credential-env": "CUSTOM_LLM_TOKEN",
@@ -1351,14 +1509,13 @@ def test_custom_headers_use_the_process_environment_through_first_conversation(
             ("provider-model-manual", "custom-model"),
             ("provider-verify-consent", "y"),
             ("persona-live-sample", "n"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Use the process environment."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         preselected={
-            "mode": "quick",
             "persona": "simon",
             "provider": "custom",
             "credential-env": "CUSTOM_LLM_TOKEN",
@@ -1404,14 +1561,13 @@ def test_custom_model_discovery_uses_advanced_environment_backed_headers(
             ("provider-model-pick", "custom-model"),
             ("provider-verify-consent", "y"),
             ("persona-live-sample", "n"),
-            ("profile", "skip"),
             ("connectors", "skip"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
             ("first-message", "Use the discovered model."),
             ("first-message-action", "accept"),
-            ("review-confirm", "y"),
         ],
         preselected={
-            "mode": "quick",
             "persona": "simon",
             "provider": "custom",
         },
@@ -1428,7 +1584,7 @@ def test_custom_model_discovery_uses_advanced_environment_backed_headers(
 def test_reopen_failure_rolls_back_the_new_installation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ui = ScriptedUI(list(QUICK_FAKE_ANSWERS))
+    ui = ScriptedUI(list(GUIDED_FAKE_ANSWERS))
     workflow = SetupWorkflow(
         paths=make_paths(tmp_path),
         ui=ui,
@@ -1457,7 +1613,7 @@ def test_partial_setup_failure_rolls_back_created_installation_files(
     monkeypatch.setattr("reckoning.setup_workflow.setup_instance", fail_partway)
 
     with pytest.raises(OperationError, match="Activation failed"):
-        run_workflow(tmp_path, list(QUICK_FAKE_ANSWERS))
+        run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
 
     assert not (tmp_path / "data").exists()
     assert (tmp_path / "setup-draft.json").exists()
@@ -1472,7 +1628,7 @@ def test_activation_never_erases_a_nonempty_installation_root(
     sentinel.write_text("keep me", encoding="utf-8")
 
     with pytest.raises(OperationError, match="empty installation root"):
-        run_workflow(tmp_path, list(QUICK_FAKE_ANSWERS))
+        run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
 
     assert sentinel.read_text(encoding="utf-8") == "keep me"
 
@@ -1485,16 +1641,15 @@ def test_verified_credential_is_not_activated_before_setup_finishes(
     outcome, _ = run_workflow(
         tmp_path,
         [
-            ("mode", "quick"),
-            ("persona", "simon"),
-            ("persona-accept", "y"),
-            ("provider-preference", "direct"),
-            ("provider-use-recommendation", "y"),
+            ("provider", "deepseek"),
             ("provider-key-source", "new"),
             ("provider-key", "sk-pending-activation"),
             ("provider-model", "recommended"),
             ("provider-verify-consent", "y"),
             ("persona-live-sample", "n"),
+            ("connectors", "skip"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
             ("profile", "__exit__"),
         ],
         services=offline_services(transport=transport),
@@ -1509,7 +1664,7 @@ def test_verified_credential_is_not_activated_before_setup_finishes(
 def test_provider_edit_updates_the_authoritative_installed_provider(
     tmp_path: Path,
 ) -> None:
-    run_workflow(tmp_path, list(QUICK_FAKE_ANSWERS))
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
     transport, _ = chat_transport()
 
     _, ui = run_workflow(
@@ -1517,8 +1672,7 @@ def test_provider_edit_updates_the_authoritative_installed_provider(
         [
             ("status-action", "edit"),
             ("edit-section", "provider"),
-            ("provider-preference", "direct"),
-            ("provider-use-recommendation", "y"),
+            ("provider", "deepseek"),
             ("provider-key-source", "new"),
             ("provider-key", "sk-edited"),
             ("provider-model", "recommended"),
@@ -1531,8 +1685,10 @@ def test_provider_edit_updates_the_authoritative_installed_provider(
 
     instance = json.loads((tmp_path / "data" / "instance.json").read_text())
     assert instance["activation"]["provider"] == "deepseek"
-    assert any("[ok] provider: deepseek" in line for line in ui.lines)
-    assert sum("provider: fake (demo mode)" in line for line in ui.lines) == 1
+    assert any(
+        "[ok] AI provider and model: deepseek" in line for line in ui.lines
+    )
+    assert sum("fake (demo mode)" in line for line in ui.lines) == 1
 
 
 def test_provider_edit_rolls_back_when_the_installed_settings_do_not_reopen(
@@ -1540,7 +1696,7 @@ def test_provider_edit_rolls_back_when_the_installed_settings_do_not_reopen(
 ) -> None:
     from reckoning.config import RuntimeProviderSettings
 
-    run_workflow(tmp_path, list(QUICK_FAKE_ANSWERS))
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
     transport, _ = chat_transport()
     original_load = RuntimeProviderSettings.load.__func__
     load_calls = 0
@@ -1564,8 +1720,7 @@ def test_provider_edit_rolls_back_when_the_installed_settings_do_not_reopen(
             [
                 ("status-action", "edit"),
                 ("edit-section", "provider"),
-                ("provider-preference", "direct"),
-                ("provider-use-recommendation", "y"),
+                ("provider", "deepseek"),
                 ("provider-key-source", "new"),
                 ("provider-key", "sk-edited"),
                 ("provider-model", "recommended"),
@@ -1598,7 +1753,6 @@ def test_provider_edit_can_make_fake_authoritative_over_saved_credentials(
         [
             ("status-action", "edit"),
             ("edit-section", "provider"),
-            ("provider-test-detected", "n"),
             ("provider", "fake"),
             ("status-action", "exit"),
         ],
@@ -1610,7 +1764,10 @@ def test_provider_edit_can_make_fake_authoritative_over_saved_credentials(
     assert instance["activation"]["provider"] == "fake"
     assert store.default_provider is None
     assert store.api_key_for("deepseek") == "sk-test-deepseek"
-    assert any("[ok] provider: fake (demo mode)" in line for line in ui.lines)
+    assert any(
+        "[ok] AI provider and model: fake (demo mode)" in line
+        for line in ui.lines
+    )
 
 
 def test_failed_migration_restores_every_live_file(
@@ -1643,3 +1800,57 @@ def test_failed_migration_restores_every_live_file(
 
     assert (tmp_path / "data" / "instance.json").read_bytes() == original_instance
     assert credential_path.read_bytes() == original_credentials
+
+
+def test_installed_state_migration_preserves_choices_and_authorization(
+    tmp_path: Path,
+) -> None:
+    from reckoning.operations import load_installation_runtime
+    from reckoning.personas import DEFAULT_PERSONAS
+
+    server_dir = tmp_path / "server"
+    profile = tmp_path / "about-me.md"
+    profile.write_text(
+        "# About me\nI study computer science.\n", encoding="utf-8"
+    )
+    steady = next(item for item in DEFAULT_PERSONAS if item.id == "steady")
+    setup_instance(
+        tmp_path / "data",
+        "personal-server",
+        steady,
+        server_data_dir=server_dir,
+        user_profile=profile,
+    )
+    ProviderCredentialStore().save(tmp_path / "provider.json")
+    TelegramConnectorConfig(
+        "bot-token", "reckoning_test_bot", "42", "fake"
+    ).save(tmp_path / "telegram.json")
+
+    outcome, _ui = run_workflow(
+        tmp_path,
+        [
+            ("migrate", "migrate"),
+            ("migrate-confirm", "y"),
+            ("status-action", "exit"),
+        ],
+    )
+
+    assert outcome.status == "managed"
+    instance = json.loads((tmp_path / "data" / "instance.json").read_text())
+    assert instance["active_persona_id"] == "steady"
+    assert instance["placement_profile"] == "personal-server"
+    assert instance["storage_roots"]["server"] == str(server_dir)
+    assert "activation" in instance
+
+    telegram = TelegramConnectorConfig.load(tmp_path / "telegram.json")
+    assert telegram.paired_chat_id == "42"
+
+    runtime = load_installation_runtime(
+        tmp_path / "data", server_data_dir=server_dir
+    )
+    versions = JsonFilePersonalContextRepository(
+        runtime.state_path("personal-context", "personal-context.json")
+    ).all_versions()
+    assert [item.original_text for item in versions] == [
+        "I study computer science."
+    ]

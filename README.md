@@ -10,32 +10,16 @@ you choose a real provider. It uses a deterministic fake provider so you can
 inspect the product safely. Connect OrcaRouter or DeepSeek when you want real
 model responses.
 
-## Commands changed in 0.2.0
-
-0.2.0 installs exactly one binary, `reckoning`. The 0.1.x binaries are gone —
-no shims, no deprecation period. Your data, credentials, and configuration
-files are untouched.
-
-| 0.1.x | 0.2.0 |
-| --- | --- |
-| `reckoning-ops setup` | `reckoning setup` |
-| `reckoning-ops diagnose` | `reckoning doctor` |
-| `reckoning-ops backup` | `reckoning backup` |
-| `reckoning-ops restore` | `reckoning restore` |
-| `reckoning-ops export` | `reckoning export` |
-| `reckoning-ops migrate` | `reckoning migrate` |
-| `reckoning-telegram` | `reckoning gateway` |
-| `reckoning` (web interface) | `reckoning` (unchanged) |
-
 ## Quickstart
 
 You need Python 3.13 or newer. From the repository root:
 
 ```bash
 pipx install .        # or: uv tool install .
-reckoning setup       # first-run wizard; proves the core continuity loop
-reckoning             # web interface at http://127.0.0.1:8000
-reckoning gateway     # optional: run the channels you configured
+reckoning setup       # guided first run, ending in a real first conversation
+reckoning             # talk to your agent in the terminal
+reckoning web         # open the web interface at http://127.0.0.1:8000
+reckoning gateway     # optional: run the messaging channels you configured
 ```
 
 If you cannot use pipx or uv, `python3 -m pip install .` works too, inside a
@@ -48,10 +32,12 @@ packages.
 
 | Group | Command | What it does |
 | --- | --- | --- |
-| Run | `reckoning` | Run the web interface. |
+| Run | `reckoning` | Start a Terminal conversation. |
+| Run | `reckoning web` | Run the local Web interface. |
 | Run | `reckoning gateway` | Run every configured channel (Telegram today). |
-| Setup | `reckoning setup` | First-run setup wizard; re-run to manage providers and channels. |
+| Setup | `reckoning setup` | Guided setup, plus status and editing on a configured installation. |
 | Setup | `reckoning doctor` | Report installation health and how to fix problems. |
+| Setup | `reckoning reset` | Remove installation state after an explicit preview. |
 | Data | `reckoning backup` | Create an encrypted recovery archive. |
 | Data | `reckoning restore` | Restore into a clean installation. |
 | Data | `reckoning export` | Create an encrypted transfer export. |
@@ -59,11 +45,13 @@ packages.
 
 ## Which command when
 
-- **Start the product** → `reckoning`
-- **Install or repair an installation** → `reckoning setup`
+- **Talk to your agent** → `reckoning`
+- **Use the browser interface** → `reckoning web`
+- **Install, inspect, or edit configuration** → `reckoning setup`
 - **Check whether the installation is healthy** → `reckoning doctor`
 - **Check a provider key live, right now** → `reckoning doctor --ping`
 - **Talk over Telegram** → `reckoning gateway`
+- **Remove an installation** → `reckoning reset`
 - **Protect the instance before maintenance** → `reckoning backup`
 - **Recover onto a clean machine** → `reckoning restore`
 - **Move state to another Reckoning instance** → `reckoning export`
@@ -71,19 +59,24 @@ packages.
 
 ## Setup
 
-`reckoning setup` runs a five-step wizard: instance (data directory and
-placement policy), desired-self persona preset (Simon, Steady, or an original
-you author), model provider, channels (Telegram, skippable), and an automatic
-proof step. The proof step sends one round-trip through the chosen provider,
-creates and confirms a continuity record, and re-opens the store to prove the
-record survives a restart. Setup only reports success when the proof passes;
-otherwise it reports the setup as incomplete and points at `reckoning doctor`.
+`reckoning setup` runs one guided journey with five visible sections: AI
+provider and model, Ways to use Reckoning, Agent style, About you, and Review.
+Review shows every choice — provider, model, Agent style, About you status,
+interface status, Telegram state, and local-first storage — and every row can
+be edited. After Review, Reckoning asks one real first question and answers it
+with the selected provider and Desired-self persona while tools, external
+writes, routines, and personal-context confirmation stay disabled. Only an
+accepted exchange becomes durable. Setup only reports success after it reopens
+the installed state and finds that accepted exchange.
 
-Re-running `reckoning setup` on a configured installation opens a management
-menu instead: add a provider, replace a key, remove a provider, or change the
-default. Pressing Enter at the key prompt keeps the current key.
+Re-running `reckoning setup` on a configured installation opens the
+installation status view instead: provider and model, verification freshness,
+Agent style, About you proposals, storage, interfaces, Telegram, and Gateway
+runtime state. Opening the view makes no network request; the explicit **Verify
+all** action discloses any possible paid use before it runs. Every section can
+be edited in place.
 
-For scripts and CI, every wizard answer has a flag or environment variable:
+For scripts and CI, every guided answer has a flag or environment variable:
 
 ```bash
 DEEPSEEK_API_KEY=replace-with-your-key reckoning setup \
@@ -101,21 +94,25 @@ fails with a clear message instead of prompting.
 
 You do not need this section for the default fake provider.
 
-Run `reckoning setup` and choose **DeepSeek** or **OrcaRouter** in the provider
-step. Setup asks for the provider's API key with hidden input and verifies the
-key against the provider. The key never echoes to the terminal. If verification
-fails, setup offers to re-enter the key, save it unverified, or abort without
-saving anything. After each provider, setup asks whether to add another one,
-then asks which configured provider is the default.
+Run `reckoning setup` and choose **DeepSeek**, **OrcaRouter**, or another
+supported provider in the first section. Setup shows detected usable access
+first without revealing any secret value, then the supported catalog in stable
+order, with Demo separated at the bottom. It asks for the provider's API key
+with hidden input, shows the selected provider, endpoint domain, and any
+possible paid charge, and then sends one small fixed, non-personal test
+request. The key never echoes to the terminal. If verification fails, setup
+offers Retry, Edit, Back, Save for later (the credential stays inactive), or
+Exit. A searchable model screen follows, with the recommended model
+preselected and manual entry under Advanced.
 
 Keys are saved in `~/.config/reckoning/provider.json` with owner-only
 permissions. The file can hold one key per provider plus the default-provider
 marker. Keys are never written to the instance data. Credential files saved by
 older versions migrate to the multi-provider format automatically.
 
-`reckoning` and `reckoning gateway` use the saved default provider
-automatically; no `.env` file or `--provider` flag is needed. You can still
-override with environment variables or an ignored `.env` file in the
+`reckoning`, `reckoning web`, and `reckoning gateway` use the installed
+provider automatically; no `.env` file or `--provider` flag is needed. You can
+still override with environment variables or an ignored `.env` file in the
 repository root; those values take precedence over the saved credential. See
 [operations](docs/operations.md) for the variable names.
 

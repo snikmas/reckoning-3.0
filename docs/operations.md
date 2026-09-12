@@ -21,7 +21,7 @@ installs exactly one command, `reckoning`.
 Run the web interface on the default loopback address:
 
 ```bash
-reckoning
+reckoning web
 ```
 
 The server accepts `http://127.0.0.1:8000`, `http://localhost:8000`, and
@@ -47,7 +47,7 @@ For a private HTTPS origin behind an authenticated reverse proxy, allow the
 exact public origin when you start Reckoning:
 
 ```bash
-reckoning --allowed-origin https://reckoning.private.example
+reckoning web --allowed-origin https://reckoning.private.example
 ```
 
 Keep the backend bound to loopback, preserve the original Host, and terminate
@@ -68,26 +68,29 @@ Run guided setup:
 reckoning setup
 ```
 
-Fresh installations offer **Quick Setup** (desired-self persona and one
-primary provider, with local placement shown as the visible default) and
-**Custom Setup** (every placement, persona, provider, profile, and connector
-choice in order). Providers come from the bundled, versioned registry grouped
-as Direct, Gateway, Local, and Custom; entries that have not passed the shared
-provider contract sit in a dim, non-selectable *Coming soon* section. Setup
-detects configured environment references and reachable localhost runtimes
-without displaying secret values, and asks before any live provider test.
+Fresh installations run one guided journey with five sections: AI provider and
+model, Ways to use Reckoning, Agent style, About you, and Review. Providers
+come from the bundled, versioned registry; detected usable access appears
+first without revealing any secret value, followed by the supported catalog in
+stable order and Demo separated at the bottom. Setup hides unavailable
+providers and shows one quiet *More providers coming soon* note instead.
 
 A provider becomes active only after one small real completion with a fixed,
 non-personal prompt; the test screen names the provider, model, destination
 domain, and any possible paid charge first. A failed test offers Retry, Edit,
 Back, Save for later (the credential stays inactive), or Exit. Verified keys
 are saved in `~/.config/reckoning/provider.json` with owner-only permissions;
-environment references are stored as references, never copied. After the
-provider works, optional profile onboarding (skip, guided questions, or a
-UTF-8 Markdown import that saves reviewable, unconfirmed proposals) and the
-Telegram connector follow. Telegram verification reports *Bot verified*;
-optional `/connect` pairing records one authorized private chat and reports
-*Ready*. Setup never starts the Gateway; it prints the exact command.
+environment references are stored as references, never copied. A searchable
+model screen follows, with the recommended model preselected and manual entry
+under Advanced.
+
+Ways to use Reckoning reports Terminal and Web as ready capabilities and
+offers optional Telegram configuration. Telegram verification reports *Bot
+verified*; optional `/connect` pairing records one authorized private chat and
+reports *Ready*. Setup never starts the Gateway; it prints the exact command.
+About you offers five optional guided questions, starter-file generation, a
+UTF-8 Markdown import that saves reviewable, unconfirmed proposals, or Skip
+for now.
 
 Setup ends with a real first message answered by the selected persona and
 provider (tools, external writes, routines, and memory confirmation are
@@ -112,13 +115,10 @@ reckoning gateway --provider deepseek
 To manage an existing installation, re-run setup; it opens the
 installation status view (loaded without network access) with an explicit
 **Verify all** action, failure-first repair, and section-specific editing.
-Focused commands manage one section directly:
+All configuration has one home under `reckoning setup`:
 
 ```bash
 reckoning setup      # status, verify, repair, edit one section
-reckoning provider   # add or verify providers, change the primary model
-reckoning persona    # select, author, edit, duplicate, rename, remove
-reckoning channel    # Telegram setup and owner pairing
 reckoning reset      # remove installation state after a previewed confirmation
 ```
 
