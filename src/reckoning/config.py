@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from reckoning.json_store import atomic_write_json, read_json
-from reckoning.provider_registry import available_providers, find_provider
+from reckoning.provider_registry import PROVIDER_REGISTRY, find_provider
 from reckoning.provider_validation import (
     is_safe_header_value,
     is_valid_env_name,
@@ -31,7 +31,9 @@ DEFAULT_PROVIDER_CREDENTIALS = Path.home() / ".config" / "reckoning" / "provider
 
 ENV_REFERENCE_PREFIX = "env:"
 
-CREDENTIAL_PROVIDER_NAMES = tuple(item.id for item in available_providers())
+# Every catalog provider, including coming-soon entries, so saved credentials
+# survive until a provider becomes selectable. Selection is gated separately.
+CREDENTIAL_PROVIDER_NAMES = tuple(item.id for item in PROVIDER_REGISTRY)
 
 
 def env_reference(env_name: str) -> str:
@@ -200,24 +202,25 @@ class ProviderCredentialStore:
             return None
         return entry.resolve_secret(environ)
 
-    def save(self, path: Path = DEFAULT_PROVIDER_CREDENTIALS) -> None:
-        atomic_write_json(
-            path,
-            {
-                "schema_version": 2,
-                "default_provider": self.default_provider,
-                "providers": {
-                    name: {
-                        "secret": entry.secret,
-                        "model": entry.model,
-                        "base_url": entry.base_url,
-                        "verified": entry.verified,
-                        "verified_at": entry.verified_at,
-                    }
-                    for name, entry in self.providers.items()
-                },
+    def payload(self) -> dict[str, object]:
+        """The exact schema-v2 document written to disk; secrets included."""
+        return {
+            "schema_version": 2,
+            "default_provider": self.default_provider,
+            "providers": {
+                name: {
+                    "secret": entry.secret,
+                    "model": entry.model,
+                    "base_url": entry.base_url,
+                    "verified": entry.verified,
+                    "verified_at": entry.verified_at,
+                }
+                for name, entry in self.providers.items()
             },
-        )
+        }
+
+    def save(self, path: Path = DEFAULT_PROVIDER_CREDENTIALS) -> None:
+        atomic_write_json(path, self.payload())
         path.chmod(0o600)
 
 

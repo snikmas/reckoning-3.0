@@ -383,7 +383,7 @@ class TestKeylessLocalContract:
 
 class TestCustomEndpointContract:
     def test_custom_endpoint_uses_the_given_base_url_and_model(self) -> None:
-        adapter = setup_adapter_for("custom")
+        adapter = candidate_adapter_for("custom")
         transport = RecordingTransport([completion_payload()])
 
         result = adapter.verify(
@@ -401,7 +401,7 @@ class TestCustomEndpointContract:
         assert result.model == "test-model"
 
     def test_custom_endpoint_works_without_a_key(self) -> None:
-        adapter = setup_adapter_for("custom")
+        adapter = candidate_adapter_for("custom")
         transport = RecordingTransport([completion_payload()])
 
         adapter.verify(
@@ -413,7 +413,7 @@ class TestCustomEndpointContract:
         assert "Authorization" not in request.headers
 
     def test_custom_endpoint_rejects_an_invalid_base_url(self) -> None:
-        adapter = setup_adapter_for("custom")
+        adapter = candidate_adapter_for("custom")
         with pytest.raises(ProviderVerificationError, match="invalid"):
             adapter.verify(
                 AdapterConfig(base_url="not-a-url", model="m"),
@@ -430,7 +430,7 @@ class TestCustomEndpointContract:
     def test_custom_endpoint_rejects_secret_bearing_base_urls_without_echo(
         self, base_url: str
     ) -> None:
-        adapter = setup_adapter_for("custom")
+        adapter = candidate_adapter_for("custom")
         transport = RecordingTransport([])
 
         with pytest.raises(ProviderVerificationError, match="invalid") as failure:
@@ -443,14 +443,14 @@ class TestCustomEndpointContract:
         assert transport.requests == []
 
     def test_custom_endpoint_requires_a_base_url(self) -> None:
-        adapter = setup_adapter_for("custom")
+        adapter = candidate_adapter_for("custom")
         with pytest.raises(ProviderVerificationError, match="base URL"):
             adapter.verify(
                 AdapterConfig(model="m"), transport=RecordingTransport([])
             )
 
     def test_custom_endpoint_adds_non_secret_advanced_headers(self) -> None:
-        adapter = setup_adapter_for("custom")
+        adapter = candidate_adapter_for("custom")
         transport = RecordingTransport([completion_payload()])
 
         adapter.verify(
@@ -477,7 +477,7 @@ class TestCustomEndpointContract:
     def test_custom_endpoint_rejects_unsafe_headers_without_echoing_values(
         self, name: str, value: str
     ) -> None:
-        adapter = setup_adapter_for("custom")
+        adapter = candidate_adapter_for("custom")
 
         with pytest.raises(ProviderVerificationError) as failure:
             adapter.verify(
@@ -491,8 +491,24 @@ class TestCustomEndpointContract:
 
         assert value not in str(failure.value)
 
+    def test_custom_endpoint_discovery_uses_advanced_headers(self) -> None:
+        adapter = candidate_adapter_for("custom")
+        transport = RecordingTransport([models_payload("b-model", "a-model")])
+
+        models = adapter.discover_models(
+            AdapterConfig(
+                base_url="https://llm.example.test/v1",
+                headers=(("X-Tenant", "tenant-a"),),
+            ),
+            transport=transport,
+        )
+
+        assert models == ("a-model", "b-model")
+        (request,) = transport.requests
+        assert request.headers["X-tenant"] == "tenant-a"
+
     def test_custom_endpoint_redacts_environment_backed_header_values(self) -> None:
-        adapter = setup_adapter_for("custom")
+        adapter = candidate_adapter_for("custom")
         secret = "tenant-header-secret"
         transport = RecordingTransport(
             [http_error(401, f"unknown tenant {secret}")]
@@ -555,6 +571,107 @@ class TestOpenAICandidateContract:
         assert candidate_adapter_for("openai").definition.available is False
         with pytest.raises(KeyError, match="not available"):
             setup_adapter_for("openai")
+
+
+def _gated_config(provider_id: str) -> AdapterConfig:
+    if provider_id == "custom":
+        return AdapterConfig(
+            api_key=SECRET,
+            base_url="https://llm.example.test/v1",
+            model="test-model",
+        )
+    return AdapterConfig(api_key=SECRET, model="test-model")
+
+
+@pytest.mark.parametrize("provider_id", ["openai", "custom"])
+class TestGatedOpenAICompatibleCandidates:
+    def test_client_error_fails_without_retries_and_redacts_secrets(
+        self, provider_id: str
+    ) -> None:
+        adapter = candidate_adapter_for(provider_id)
+        transport = RecordingTransport([http_error(401, f"invalid key {SECRET}")])
+
+        with pytest.raises(ProviderVerificationError) as failure:
+            adapter.verify(_gated_config(provider_id), transport=transport, max_retries=3)
+
+        assert len(transport.requests) == 1
+        assert "HTTP 401" in str(failure.value)
+        assert SECRET not in str(failure.value)
+
+    def test_rate_limits_are_retried(self, provider_id: str) -> None:
+        adapter = candidate_adapter_for(provider_id)
+        transport = RecordingTransport([http_error(429), completion_payload()])
+
+        result = adapter.verify(
+            _gated_config(provider_id), transport=transport, max_retries=1
+        )
+
+        assert result.retries == 1
+        assert len(transport.requests) == 2
+
+    def test_server_errors_stop_at_the_retry_limit(self, provider_id: str) -> None:
+        adapter = candidate_adapter_for(provider_id)
+        transport = RecordingTransport([http_error(500)] * 5)
+
+        with pytest.raises(ProviderVerificationError, match="HTTP 500"):
+            adapter.verify(
+                _gated_config(provider_id), transport=transport, max_retries=2
+            )
+
+        assert len(transport.requests) == 3
+
+    def test_transport_failures_are_normalized(self, provider_id: str) -> None:
+        adapter = candidate_adapter_for(provider_id)
+        transport = RecordingTransport([URLError("offline")])
+
+        with pytest.raises(ProviderVerificationError, match="could not be reached"):
+            adapter.verify(
+                _gated_config(provider_id), transport=transport, max_retries=0
+            )
+
+    def test_malformed_json_is_normalized(self, provider_id: str) -> None:
+        adapter = candidate_adapter_for(provider_id)
+        transport = RecordingTransport([b"{not json"])
+
+        with pytest.raises(ProviderVerificationError, match="invalid response"):
+            adapter.verify(_gated_config(provider_id), transport=transport)
+
+    def test_missing_content_is_normalized(self, provider_id: str) -> None:
+        adapter = candidate_adapter_for(provider_id)
+        transport = RecordingTransport(
+            [response_payload(include_content=False)]
+        )
+
+        with pytest.raises(ProviderVerificationError, match="invalid response"):
+            adapter.verify(_gated_config(provider_id), transport=transport)
+
+    def test_length_termination_has_a_safe_specific_error(
+        self, provider_id: str
+    ) -> None:
+        adapter = candidate_adapter_for(provider_id)
+        transport = RecordingTransport(
+            [response_payload(content=None, finish_reason="length")]
+        )
+
+        with pytest.raises(ProviderVerificationError, match="before a final answer"):
+            adapter.verify(_gated_config(provider_id), transport=transport)
+
+    def test_missing_usage_defaults_to_zero(self, provider_id: str) -> None:
+        adapter = candidate_adapter_for(provider_id)
+        transport = RecordingTransport(
+            [
+                json.dumps(
+                    {
+                        "model": "test-model",
+                        "choices": [{"message": {"content": "ready"}}],
+                    }
+                ).encode("utf-8")
+            ]
+        )
+
+        result = adapter.verify(_gated_config(provider_id), transport=transport)
+
+        assert result.usage == ProviderUsage(0, 0, 0)
 
 
 def anthropic_completion_payload(content: str = "ready") -> bytes:

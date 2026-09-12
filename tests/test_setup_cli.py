@@ -91,12 +91,18 @@ def test_setup_edits_the_agent_style_section(
     assert instance["activation"]["provider"] == "fake"
 
 
+class _TtyStdin(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 def test_reset_previews_exact_targets_and_requires_confirmation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data_dir = quick_setup(tmp_path)
     ProviderCredentialStore().save(tmp_path / "provider.json")
 
+    monkeypatch.setattr("reckoning.command.sys.stdin", _TtyStdin())
     monkeypatch.setattr("builtins.input", lambda prompt: "no")
     returncode, stdout, _ = run_cli(
         "reset",
@@ -207,6 +213,144 @@ def test_reset_removes_the_configured_personal_server_root(tmp_path: Path) -> No
     assert str(server_dir) in stdout
     assert not data_dir.exists()
     assert not server_dir.exists()
+
+
+def test_non_interactive_reset_without_yes_is_refused(tmp_path: Path) -> None:
+    data_dir = quick_setup(tmp_path)
+
+    returncode, stdout, stderr = run_cli(
+        "reset",
+        "--data-dir",
+        str(data_dir),
+        *cli_paths(tmp_path),
+    )
+
+    assert returncode == 2
+    assert "--yes" in stderr
+    assert data_dir.exists()
+    assert "removed" not in stdout
+
+
+def test_reset_include_credentials_removes_the_store(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    setup_instance(data_dir, "local")
+    store = ProviderCredentialStore()
+    store.set_key("deepseek", "sk-remove", verified=True)
+    store.save(tmp_path / "provider.json")
+
+    returncode, stdout, stderr = run_cli(
+        "reset",
+        "--yes",
+        "--include-credentials",
+        "--data-dir",
+        str(data_dir),
+        *cli_paths(tmp_path),
+    )
+
+    assert returncode == 0, stderr
+    assert "provider credentials preserved" not in stdout
+    assert not (tmp_path / "provider.json").exists()
+    assert not data_dir.exists()
+
+
+def test_reset_removes_a_hybrid_installation_and_server_root(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    server_dir = tmp_path / "server"
+    setup_instance(data_dir, "hybrid", server_data_dir=server_dir)
+
+    returncode, stdout, stderr = run_cli(
+        "reset",
+        "--yes",
+        "--data-dir",
+        str(data_dir),
+        *cli_paths(tmp_path),
+    )
+
+    assert returncode == 0, stderr
+    assert str(server_dir) in stdout
+    assert not data_dir.exists()
+    assert not server_dir.exists()
+
+
+def test_reset_cancellation_changes_no_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = quick_setup(tmp_path)
+    credentials = ProviderCredentialStore()
+    credentials.set_key("deepseek", "sk-kept", verified=True)
+    credentials.save(tmp_path / "provider.json")
+    before = (tmp_path / "provider.json").read_bytes()
+
+    monkeypatch.setattr("reckoning.command.sys.stdin", _TtyStdin())
+    monkeypatch.setattr("builtins.input", lambda prompt: "no")
+    returncode, stdout, _ = run_cli(
+        "reset",
+        "--data-dir",
+        str(data_dir),
+        *cli_paths(tmp_path),
+    )
+
+    assert returncode == 1
+    assert "aborted" in stdout
+    assert data_dir.exists()
+    assert (tmp_path / "provider.json").read_bytes() == before
+
+
+def test_reset_rejects_a_filesystem_root(tmp_path: Path) -> None:
+    returncode, _stdout, stderr = run_cli(
+        "reset",
+        "--yes",
+        "--data-dir",
+        "/",
+        *cli_paths(tmp_path),
+    )
+
+    assert returncode == 2
+    assert "refusing to reset broad path" in stderr
+
+
+def test_reset_rejects_malformed_server_root_configuration(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    setup_instance(data_dir, "local")
+    instance_path = data_dir / "instance.json"
+    instance = json.loads(instance_path.read_text(encoding="utf-8"))
+    instance["placement_profile"] = "personal-server"
+    instance["storage_roots"]["server"] = None
+    instance_path.write_text(json.dumps(instance), encoding="utf-8")
+
+    returncode, _stdout, stderr = run_cli(
+        "reset",
+        "--yes",
+        "--data-dir",
+        str(data_dir),
+        *cli_paths(tmp_path),
+    )
+
+    assert returncode == 2
+    assert "personal-server root" in stderr
+    assert data_dir.exists()
+
+
+def test_reset_rejects_overlapping_configured_roots(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    setup_instance(data_dir, "local")
+    instance_path = data_dir / "instance.json"
+    instance = json.loads(instance_path.read_text(encoding="utf-8"))
+    instance["placement_profile"] = "personal-server"
+    instance["storage_roots"]["server"] = str(data_dir)
+    instance_path.write_text(json.dumps(instance), encoding="utf-8")
+
+    returncode, _stdout, stderr = run_cli(
+        "reset",
+        "--yes",
+        "--data-dir",
+        str(data_dir),
+        *cli_paths(tmp_path),
+    )
+
+    assert returncode == 2
+    assert "overlap" in stderr
+    assert data_dir.exists()
 
 
 def test_setup_on_a_configured_installation_opens_the_status_view(

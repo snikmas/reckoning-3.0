@@ -78,7 +78,7 @@ def test_custom_openai_compatible_live_completion() -> None:
     if not base_url or not model:
         pytest.skip("RECKONING_CUSTOM_BASE_URL and RECKONING_CUSTOM_MODEL are not set")
     key = os.environ.get("RECKONING_CUSTOM_API_KEY", "").strip() or None
-    adapter = setup_adapter_for("custom")
+    adapter = candidate_adapter_for("custom")
     result = adapter.verify(
         AdapterConfig(api_key=key, base_url=base_url, model=model)
     )

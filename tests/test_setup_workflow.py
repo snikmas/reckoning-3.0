@@ -693,6 +693,61 @@ def test_reasoning_only_truncated_verification_preserves_recovery_and_inactive_s
     assert len(calls) == 1
 
 
+def test_manual_model_entry_stays_available_when_discovery_fails(
+    tmp_path: Path,
+) -> None:
+    import io
+    from urllib.error import HTTPError
+    from urllib.request import Request
+
+    calls: list[Request] = []
+
+    def transport(request: Request, timeout: float) -> bytes:
+        calls.append(request)
+        if request.get_method() == "GET":
+            raise HTTPError(
+                request.full_url, 503, "Service Unavailable", {}, io.BytesIO(b"{}")
+            )
+        return json.dumps(
+            {
+                "model": "deepseek-manual",
+                "choices": [{"message": {"role": "assistant", "content": "ready"}}],
+                "usage": {},
+            }
+        ).encode("utf-8")
+
+    outcome, _ui = run_workflow(
+        tmp_path,
+        [
+            ("provider", "deepseek"),
+            ("provider-key-source", "new"),
+            ("provider-key", "sk-manual"),
+            ("provider-model", "discover"),
+            ("provider-failure", "edit"),
+            ("provider-key-source", "new"),
+            ("provider-key", "sk-manual"),
+            ("provider-model", "manual"),
+            ("provider-model-manual", "deepseek-manual"),
+            ("provider-verify-consent", "y"),
+            ("persona-live-sample", "n"),
+            ("connectors", "skip"),
+            ("persona", "simon"),
+            ("persona-accept", "y"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
+            ("first-message", "Hello."),
+            ("first-message-action", "accept"),
+        ],
+        services=offline_services(transport=transport),
+    )
+
+    assert outcome.status == "activated"
+    assert outcome.provider_id == "deepseek"
+    assert outcome.model == "deepseek-manual"
+    assert any(call.get_method() == "GET" for call in calls)
+    assert any(call.get_method() == "POST" for call in calls)
+
+
 def test_an_environment_reference_is_reused_without_copying_its_value(
     tmp_path: Path,
 ) -> None:
@@ -868,6 +923,35 @@ def test_telegram_can_be_saved_verified_without_pairing(tmp_path: Path) -> None:
     assert client.sent == []
     displayed = "\n".join(ui.lines)
     assert "Verified, not paired" in displayed
+
+
+def test_status_view_edits_the_telegram_section_in_place(tmp_path: Path) -> None:
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
+    client = StubTelegramClient(PAIRING_UPDATES)
+
+    outcome, ui = run_workflow(
+        tmp_path,
+        [
+            ("status-action", "edit"),
+            ("edit-section", "connectors"),
+            ("telegram-token", "bot-token"),
+            ("telegram-pair", "y"),
+            ("status-action", "exit"),
+        ],
+        services=offline_services(
+            telegram_api_factory=lambda token: client,
+            telegram_pairing_code="abc123",
+            telegram_max_polls=1,
+        ),
+    )
+
+    assert outcome.status == "managed"
+    config = TelegramConnectorConfig.load(tmp_path / "telegram.json")
+    assert config.paired_chat_id == "42"
+    assert "Ready" in "\n".join(ui.lines)
+    # Editing the Telegram section did not disturb the installed provider.
+    instance = json.loads((tmp_path / "data" / "instance.json").read_text())
+    assert instance["activation"]["provider"] == "fake"
 
 
 def test_guided_profile_answers_become_unconfirmed_proposals(
@@ -1382,203 +1466,45 @@ def test_keyless_local_provider_remains_active_in_the_installed_runtime(
     assert calls[-1].full_url == "http://127.0.0.1:11434/v1/chat/completions"
 
 
-def test_keyless_custom_provider_remains_active_in_the_installed_runtime(
+def test_custom_provider_is_not_selectable_until_its_smoke_passes(
     tmp_path: Path,
 ) -> None:
-    from reckoning.application import create_local_application
-    from reckoning.config import RuntimeProviderSettings
-    from reckoning.operations import load_installation_runtime
-
-    transport, calls = chat_transport("Custom runtime answer.")
-    outcome, _ = run_workflow(
-        tmp_path,
-        [
-            ("provider", "custom"),
-            ("provider-base-url", "http://127.0.0.1:9000/v1"),
-            ("provider-custom-key", ""),
-            ("provider-custom-advanced", "n"),
-            ("provider-model", "manual"),
-            ("provider-model-manual", "local-model"),
-            ("provider-verify-consent", "y"),
-            ("persona-live-sample", "n"),
-            ("connectors", "skip"),
-            ("persona", "simon"),
-            ("persona-accept", "y"),
-            ("profile", "skip"),
-            ("review-action", "continue"),
-            ("first-message", "First custom message."),
-            ("first-message-action", "accept"),
-        ],
-        services=offline_services(transport=transport),
-    )
-    assert outcome.provider_id == "custom"
-
-    settings = RuntimeProviderSettings.load(
-        tmp_path / "data",
-        credentials_path=tmp_path / "provider.json",
-        environ={},
-    )
-    runtime = load_installation_runtime(tmp_path / "data")
-    application = create_local_application(
-        runtime.state_path("confirmed-state", "continuity.json"),
-        provider_name=settings.provider_name,
-        provider_config=AdapterConfig(
-            api_key=settings.api_key,
-            base_url=settings.base_url,
-            model=settings.model,
-        ),
-        provider_transport=transport,
-        persona=runtime.persona,
-        placement=runtime.application_placement,
+    from reckoning.provider_adapters import (
+        candidate_adapter_for,
+        setup_adapter_for,
     )
 
-    answer = application.send_message("Use the installed custom provider.")
-
-    assert answer.content == "Custom runtime answer."
-    assert calls[-1].full_url == "http://127.0.0.1:9000/v1/chat/completions"
-    assert "Authorization" not in calls[-1].headers
-
-
-def test_scripted_custom_provider_stores_an_environment_reference(
-    tmp_path: Path,
-) -> None:
-    transport, calls = chat_transport("Custom environment answer.")
-    secret = "custom-secret-value"
-
-    outcome, _ = run_workflow(
-        tmp_path,
-        [
-            ("provider-base-url", "https://llm.example.test/v1"),
-            ("provider-custom-advanced", "y"),
-            ("provider-custom-protocol", "openai-chat-completions"),
-            ("provider-custom-context", "32000"),
-            ("provider-custom-header-env", "X-Tenant=CUSTOM_TENANT"),
-            ("provider-model", "manual"),
-            ("provider-model-manual", "custom-model"),
-            ("provider-verify-consent", "y"),
-            ("persona-live-sample", "n"),
-            ("connectors", "skip"),
-            ("profile", "skip"),
-            ("review-action", "continue"),
-            ("first-message", "Use the custom provider."),
-            ("first-message-action", "accept"),
-        ],
-        preselected={
-            "persona": "simon",
-            "provider": "custom",
-            "credential-env": "CUSTOM_LLM_TOKEN",
-        },
-        services=offline_services(
-            environ={
-                "CUSTOM_LLM_TOKEN": secret,
-                "CUSTOM_TENANT": "tenant-secret",
-            },
-            transport=transport,
-        ),
-    )
+    outcome, ui = run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
 
     assert outcome.status == "activated"
-    saved = (tmp_path / "provider.json").read_text(encoding="utf-8")
-    assert secret not in saved
-    assert "tenant-secret" not in saved
-    assert "env:CUSTOM_LLM_TOKEN" in saved
-    assert calls[0].headers["Authorization"] == f"Bearer {secret}"
-    assert calls[0].headers["X-tenant"] == "tenant-secret"
-    instance = (tmp_path / "data" / "instance.json").read_text(encoding="utf-8")
-    assert "tenant-secret" not in instance
-    assert "CUSTOM_TENANT" in instance
-    assert '"context_window": 32000' in instance
+    rendered = "\n".join(ui.lines)
+    assert "option: custom " not in rendered
+    assert "More providers coming soon" in rendered
+    with pytest.raises(KeyError, match="not available"):
+        setup_adapter_for("custom")
+    assert candidate_adapter_for("custom").definition.available is False
 
 
-def test_custom_headers_use_the_process_environment_through_first_conversation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("CUSTOM_LLM_TOKEN", "process-key")
-    monkeypatch.setenv("CUSTOM_TENANT", "process-tenant")
-    transport, calls = chat_transport("Custom process-environment answer.")
+def test_preselected_coming_soon_provider_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(SetupInputError, match="coming soon"):
+        run_workflow(
+            tmp_path,
+            [],
+            preselected={"provider": "custom"},
+        )
+    assert not (tmp_path / "data").exists()
 
-    outcome, _ = run_workflow(
-        tmp_path,
-        [
-            ("provider-base-url", "https://llm.example.test/v1"),
-            ("provider-custom-advanced", "y"),
-            ("provider-custom-protocol", "openai-chat-completions"),
-            ("provider-custom-context", ""),
-            ("provider-custom-header-env", "X-Tenant=CUSTOM_TENANT"),
-            ("provider-model", "manual"),
-            ("provider-model-manual", "custom-model"),
-            ("provider-verify-consent", "y"),
-            ("persona-live-sample", "n"),
-            ("connectors", "skip"),
-            ("profile", "skip"),
-            ("review-action", "continue"),
-            ("first-message", "Use the process environment."),
-            ("first-message-action", "accept"),
-        ],
-        preselected={
-            "persona": "simon",
-            "provider": "custom",
-            "credential-env": "CUSTOM_LLM_TOKEN",
-        },
-        services=offline_services(environ=None, transport=transport),
+
+def test_custom_header_references_are_validated() -> None:
+    environ = {"CUSTOM_TENANT": "tenant-secret"}
+    references = SetupWorkflow._parse_header_env(
+        "X-Tenant=CUSTOM_TENANT", environ
     )
-
-    assert outcome.status == "activated"
-    assert len(calls) == 2
-    assert all(call.headers["X-tenant"] == "process-tenant" for call in calls)
-
-
-def test_custom_model_discovery_uses_advanced_environment_backed_headers(
-    tmp_path: Path,
-) -> None:
-    from urllib.request import Request
-
-    calls: list[Request] = []
-
-    def transport(request: Request, timeout: float) -> bytes:
-        calls.append(request)
-        if request.get_method() == "GET":
-            return json.dumps({"data": [{"id": "custom-model"}]}).encode()
-        return json.dumps(
-            {
-                "model": "custom-model",
-                "choices": [{"message": {"content": "Custom answer."}}],
-                "usage": {},
-            }
-        ).encode()
-
-    outcome, _ = run_workflow(
-        tmp_path,
-        [
-            ("provider-base-url", "https://llm.example.test/v1"),
-            ("provider-custom-key", ""),
-            ("provider-custom-advanced", "y"),
-            ("provider-custom-protocol", "openai-chat-completions"),
-            ("provider-custom-context", ""),
-            ("provider-custom-header-env", "X-Tenant=CUSTOM_TENANT"),
-            ("provider-model", "discover"),
-            ("provider-model-filter", ""),
-            ("provider-model-pick", "custom-model"),
-            ("provider-verify-consent", "y"),
-            ("persona-live-sample", "n"),
-            ("connectors", "skip"),
-            ("profile", "skip"),
-            ("review-action", "continue"),
-            ("first-message", "Use the discovered model."),
-            ("first-message-action", "accept"),
-        ],
-        preselected={
-            "persona": "simon",
-            "provider": "custom",
-        },
-        services=offline_services(
-            environ={"CUSTOM_TENANT": "tenant-secret"}, transport=transport
-        ),
-    )
-
-    assert outcome.status == "activated"
-    assert calls[0].get_method() == "GET"
-    assert calls[0].headers["X-tenant"] == "tenant-secret"
+    assert references == {"X-Tenant": "CUSTOM_TENANT"}
+    with pytest.raises(SetupInputError, match="Header=ENV_VAR"):
+        SetupWorkflow._parse_header_env("X-Tenant", environ)
+    with pytest.raises(SetupInputError, match="not set"):
+        SetupWorkflow._parse_header_env("X-Tenant=MISSING_TENANT", environ)
 
 
 def test_reopen_failure_rolls_back_the_new_installation(
@@ -1770,36 +1696,299 @@ def test_provider_edit_can_make_fake_authoritative_over_saved_credentials(
     )
 
 
-def test_failed_migration_restores_every_live_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _legacy_installation(tmp_path: Path) -> None:
     setup_instance(tmp_path / "data", "local")
-    credential_path = tmp_path / "provider.json"
-    credential_path.write_text(
+    (tmp_path / "provider.json").write_text(
         json.dumps(
             {"default_provider": "deepseek", "providers": {"deepseek": "sk-old"}}
         ),
         encoding="utf-8",
     )
-    original_instance = (tmp_path / "data" / "instance.json").read_bytes()
-    original_credentials = credential_path.read_bytes()
-    workflow = SetupWorkflow(
-        paths=make_paths(tmp_path),
-        ui=ScriptedUI(
-            [("migrate", "migrate"), ("migrate-confirm", "y")]
+    (tmp_path / "telegram.json").write_text(
+        json.dumps(
+            {
+                "bot_token": "bot-token",
+                "bot_username": "reckoning_test_bot",
+                "allowed_chat_ids": ["42"],
+                "provider_name": "fake",
+            }
         ),
-        services=offline_services(),
+        encoding="utf-8",
     )
 
-    def fail_save(self, path=credential_path) -> None:
-        raise OSError("simulated credential write failure")
 
-    monkeypatch.setattr(ProviderCredentialStore, "save", fail_save)
+def _flaky_replace(monkeypatch: pytest.MonkeyPatch, fail_on: int) -> None:
+    import os as os_module
+
+    real_replace = os_module.replace
+    state = {"calls": 0, "failed": False}
+
+    def flaky(source: object, destination: object) -> None:
+        state["calls"] += 1
+        if state["calls"] == fail_on and not state["failed"]:
+            state["failed"] = True
+            raise OSError("simulated interruption")
+        real_replace(source, destination)
+
+    monkeypatch.setattr("reckoning.setup_workflow.os.replace", flaky)
+
+
+@pytest.mark.parametrize("fail_on", (1, 2, 3))
+def test_interrupted_migration_restores_the_original_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_on: int
+) -> None:
+    _legacy_installation(tmp_path)
+    instance_path = tmp_path / "data" / "instance.json"
+    original_instance = instance_path.read_bytes()
+    original_credentials = (tmp_path / "provider.json").read_bytes()
+    original_telegram = (tmp_path / "telegram.json").read_bytes()
+    _flaky_replace(monkeypatch, fail_on)
+
+    workflow = SetupWorkflow(
+        paths=make_paths(tmp_path),
+        ui=ScriptedUI([("migrate", "migrate"), ("migrate-confirm", "y")]),
+        services=offline_services(),
+    )
+    with pytest.raises(OperationError, match="Migration failed"):
+        workflow.run()
+
+    assert instance_path.read_bytes() == original_instance
+    assert (tmp_path / "provider.json").read_bytes() == original_credentials
+    assert (tmp_path / "telegram.json").read_bytes() == original_telegram
+
+
+def test_interrupted_migration_leaves_a_reopenable_legacy_installation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reckoning.operations import diagnose, load_installation_runtime
+
+    _legacy_installation(tmp_path)
+    _flaky_replace(monkeypatch, 3)
+    workflow = SetupWorkflow(
+        paths=make_paths(tmp_path),
+        ui=ScriptedUI([("migrate", "migrate"), ("migrate-confirm", "y")]),
+        services=offline_services(),
+    )
+    with pytest.raises(OperationError, match="Migration failed"):
+        workflow.run()
+
+    # The legacy installation is still readable after the interruption.
+    instance = json.loads((tmp_path / "data" / "instance.json").read_text())
+    assert "activation" not in instance
+    assert ProviderCredentialStore.load(
+        tmp_path / "provider.json"
+    ).api_key_for("deepseek") == "sk-old"
+    assert load_installation_runtime(tmp_path / "data") is not None
+    assert diagnose(tmp_path / "data")
+
+
+def test_migration_backup_failure_leaves_every_file_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil as shutil_module
+
+    _legacy_installation(tmp_path)
+    original_instance = (tmp_path / "data" / "instance.json").read_bytes()
+
+    def fail_copy(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated backup failure")
+
+    monkeypatch.setattr(shutil_module, "copy2", fail_copy)
+    workflow = SetupWorkflow(
+        paths=make_paths(tmp_path),
+        ui=ScriptedUI([("migrate", "migrate"), ("migrate-confirm", "y")]),
+        services=offline_services(),
+    )
     with pytest.raises(OperationError, match="Migration failed"):
         workflow.run()
 
     assert (tmp_path / "data" / "instance.json").read_bytes() == original_instance
-    assert credential_path.read_bytes() == original_credentials
+    assert not (tmp_path / "data" / "instance.json.bak").exists()
+
+
+def test_migration_preview_only_and_cancellation_change_nothing(
+    tmp_path: Path,
+) -> None:
+    _legacy_installation(tmp_path)
+    original_instance = (tmp_path / "data" / "instance.json").read_bytes()
+
+    outcome, ui = run_workflow(
+        tmp_path,
+        [
+            ("migrate", "migrate"),
+            ("migrate-confirm", "n"),
+            ("status-action", "exit"),
+        ],
+    )
+
+    assert outcome.status == "managed"
+    assert "cancelled" in "\n".join(ui.lines)
+    assert (tmp_path / "data" / "instance.json").read_bytes() == original_instance
+    assert not (tmp_path / "data" / "instance.json.bak").exists()
+    assert not (tmp_path / "provider.json.bak").exists()
+
+
+def test_migration_skip_changes_nothing(tmp_path: Path) -> None:
+    _legacy_installation(tmp_path)
+    original_instance = (tmp_path / "data" / "instance.json").read_bytes()
+
+    outcome, _ui = run_workflow(
+        tmp_path,
+        [("migrate", "skip"), ("status-action", "exit")],
+    )
+
+    assert outcome.status == "managed"
+    assert (tmp_path / "data" / "instance.json").read_bytes() == original_instance
+    assert "activation" not in json.loads(
+        (tmp_path / "data" / "instance.json").read_text()
+    )
+
+
+def test_corrupt_credential_store_is_rejected_without_changes(
+    tmp_path: Path,
+) -> None:
+    _legacy_installation(tmp_path)
+    credential_path = tmp_path / "provider.json"
+    credential_path.write_text("{not valid json", encoding="utf-8")
+    original = credential_path.read_bytes()
+
+    outcome, ui = run_workflow(
+        tmp_path,
+        [("status-action", "exit")],
+    )
+
+    assert outcome.status == "managed"
+    assert "cannot be migrated safely" in "\n".join(ui.lines)
+    assert credential_path.read_bytes() == original
+
+
+def test_unknown_provider_credentials_are_rejected(tmp_path: Path) -> None:
+    _legacy_installation(tmp_path)
+    (tmp_path / "provider.json").write_text(
+        json.dumps(
+            {
+                "default_provider": "mystery",
+                "providers": {"mystery": "sk-unknown"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = (tmp_path / "provider.json").read_bytes()
+
+    outcome, ui = run_workflow(tmp_path, [("status-action", "exit")])
+
+    assert outcome.status == "managed"
+    assert "cannot be migrated safely" in "\n".join(ui.lines)
+    assert (tmp_path / "provider.json").read_bytes() == original
+
+
+def test_complete_migration_preserves_every_supported_state(
+    tmp_path: Path,
+) -> None:
+    from reckoning.config import RuntimeProviderSettings
+    from reckoning.interfaces import JsonFileInterfaceRepository
+    from reckoning.operations import diagnose, load_installation_runtime
+    from reckoning.personas import DEFAULT_PERSONAS
+
+    server_dir = tmp_path / "server"
+    profile = tmp_path / "about-me.md"
+    profile.write_text(
+        "# About me\nI study computer science.\n", encoding="utf-8"
+    )
+    steady = next(item for item in DEFAULT_PERSONAS if item.id == "steady")
+    setup_instance(
+        tmp_path / "data",
+        "personal-server",
+        steady,
+        server_data_dir=server_dir,
+        user_profile=profile,
+        first_conversation=("What should I focus on?", "Protect your mornings."),
+    )
+    (tmp_path / "provider.json").write_text(
+        json.dumps(
+            {
+                "default_provider": "deepseek",
+                "providers": {
+                    "deepseek": {
+                        "secret": "sk-preserved",
+                        "model": "deepseek-chat",
+                        "base_url": None,
+                        "verified": True,
+                        "verified_at": "2026-09-01T00:00:00+00:00",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "telegram.json").write_text(
+        json.dumps(
+            {
+                "bot_token": "bot-token",
+                "bot_username": "reckoning_test_bot",
+                "allowed_chat_ids": ["42"],
+                "provider_name": "deepseek",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    outcome, ui = run_workflow(
+        tmp_path,
+        [
+            ("migrate", "migrate"),
+            ("migrate-confirm", "y"),
+            ("status-action", "exit"),
+        ],
+    )
+
+    assert outcome.status == "managed"
+    assert "Migration committed" in "\n".join(ui.lines)
+    instance = json.loads((tmp_path / "data" / "instance.json").read_text())
+    assert instance["activation"]["provider"] == "deepseek"
+    assert instance["activation"]["model"] == "deepseek-chat"
+    assert instance["active_persona_id"] == "steady"
+    assert instance["placement_profile"] == "personal-server"
+    assert instance["storage_roots"]["server"] == str(server_dir)
+
+    store = ProviderCredentialStore.load(tmp_path / "provider.json")
+    assert store.api_key_for("deepseek") == "sk-preserved"
+    assert store.credential_for("deepseek").model == "deepseek-chat"
+
+    telegram = TelegramConnectorConfig.load(tmp_path / "telegram.json")
+    assert telegram.paired_chat_id == "42"
+    assert telegram.provider_name == "deepseek"
+
+    runtime = load_installation_runtime(
+        tmp_path / "data", server_data_dir=server_dir
+    )
+    versions = JsonFilePersonalContextRepository(
+        runtime.state_path("personal-context", "personal-context.json")
+    ).all_versions()
+    assert [item.original_text for item in versions] == [
+        "I study computer science."
+    ]
+
+    confirmed = next(
+        route for route in runtime.routes if route.category == "confirmed-state"
+    )
+    state = JsonFileInterfaceRepository(confirmed.root / "interfaces.json").load()
+    messages = [
+        (message.role, message.content)
+        for session in state.sessions
+        for message in session.messages
+    ]
+    assert ("user", "What should I focus on?") in messages
+    assert ("assistant", "Protect your mornings.") in messages
+
+    # The migrated installation reopens through setup and doctor.
+    assert RuntimeProviderSettings.load(
+        tmp_path / "data",
+        credentials_path=tmp_path / "provider.json",
+        environ={},
+    ).provider_name == "deepseek"
+    report = diagnose(tmp_path / "data", server_data_dir=server_dir)
+    assert report is not None
 
 
 def test_installed_state_migration_preserves_choices_and_authorization(

@@ -6,6 +6,7 @@ This module owns setup policy and never prints terminal UI directly; a
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -611,7 +612,12 @@ class SetupWorkflow:
         self._ui = ui
         self._services = services or SetupServices()
         self._preselected = preselected or {}
-        self._store = ProviderCredentialStore.load(paths.credentials_path)
+        self._store_error: RuntimeError | None = None
+        try:
+            self._store = ProviderCredentialStore.load(paths.credentials_path)
+        except RuntimeError as error:
+            self._store = ProviderCredentialStore()
+            self._store_error = error
         self._draft = SetupDraft()
         self._profile_entries: list[UserProfileEntry] = []
         self._accepted: tuple[str, str] | None = None
@@ -629,6 +635,11 @@ class SetupWorkflow:
                 return SetupOutcome(
                     status="managed", data_dir=self._paths.data_dir
                 )
+        if self._store_error is not None:
+            raise OperationError(
+                "The provider credential store is unreadable. Fix or remove "
+                f"{self._paths.credentials_path} and rerun setup."
+            )
         existing: SetupDraft | None = None
         if self._paths.draft_path.exists():
             raw_draft = read_json(self._paths.draft_path, default={})
@@ -2452,10 +2463,20 @@ class SetupWorkflow:
         instance = read_json(self._paths.data_dir / "instance.json", default={})
         if not instance or "activation" in instance:
             return
+        try:
+            plan = build_migration_plan(self._paths)
+        except (OperationError, RuntimeError, ValueError, KeyError) as error:
+            self._ui.failure(
+                f"This installation cannot be migrated safely: {error}"
+            )
+            self._ui.info("No files were changed.")
+            return
         self._ui.warning(
             "This installation predates the current setup format and needs "
             "migration."
         )
+        for line in plan.preview:
+            self._ui.info(line)
         action = self._ui.choose(
             "migrate",
             "Migrate now?",
@@ -2471,79 +2492,301 @@ class SetupWorkflow:
             return
         if action != "migrate":
             raise SetupInputError(f"Unknown migration action: {action}")
-        changes = [
-            "instance.json gains an activation record",
-            "provider credentials rewrite to schema v2 (backup kept)",
-            "telegram config rewrites to schema v2 (backup kept)",
-        ]
-        for change in changes:
-            self._ui.info(f"- {change}")
         if not self._ui.confirm(
             "migrate-confirm", "Apply these changes?", default=True
         ):
+            self._ui.info("Migration cancelled; no files were changed.")
             return
-        self._migrate_installation(instance)
+        commit_migration_plan(self._paths, plan)
         self._ui.success("Migration committed; backups sit next to the files.")
 
-    def _migrate_installation(self, instance: dict[str, Any]) -> None:
-        paths = (
-            self._paths.credentials_path,
-            self._paths.telegram_config_path,
-            self._paths.data_dir / "instance.json",
+
+@dataclass(frozen=True)
+class MigrationWrite:
+    """One validated file the migration will replace."""
+
+    kind: Literal["credentials", "telegram", "instance"]
+    label: str
+    path: Path
+    payload: bytes
+    mode: int
+    activation: bool = False
+
+
+@dataclass(frozen=True)
+class MigrationPlan:
+    """A read-only migration inspection; nothing is written until commit."""
+
+    writes: tuple[MigrationWrite, ...]
+    preview: tuple[str, ...]
+
+
+def _json_bytes(payload: Mapping[str, Any]) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _migration_paths(paths: SetupPaths) -> tuple[Path, Path, Path]:
+    data_dir = paths.data_dir.expanduser().resolve()
+    return (
+        paths.credentials_path.expanduser(),
+        paths.telegram_config_path.expanduser(),
+        data_dir / "instance.json",
+    )
+
+
+def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
+    """Validate every supported setup format before proposing any change."""
+    credentials_path, telegram_path, instance_path = _migration_paths(paths)
+    if not instance_path.exists():
+        raise OperationError("there is no installation to migrate")
+    instance = read_json(instance_path, default={})
+    if not instance:
+        raise OperationError("the installation record is empty")
+    if "activation" in instance:
+        raise OperationError("the installation is already migrated")
+    placement = instance.get("placement_profile")
+    if placement not in ("local", "personal-server", "hybrid"):
+        raise OperationError("the installation has no supported storage placement")
+    roots = instance.get("storage_roots")
+    if not isinstance(roots, dict) or roots.get("local") != "local-data-dir":
+        raise OperationError("the installation has no enforceable storage roots")
+
+    store, credentials_payload = _inspect_credentials(credentials_path)
+    telegram_payload = _inspect_telegram(telegram_path)
+    _inspect_personas(instance_path.parent)
+    _inspect_runtime_state(paths, instance, roots)
+
+    provider_id = store.default_provider or "fake"
+    try:
+        definition = find_provider(provider_id)
+    except KeyError as error:
+        raise OperationError(
+            "the primary provider in the credential store is not supported"
+        ) from error
+    credential = store.credential_for(provider_id)
+    model = (
+        (credential.model if credential is not None else None)
+        or definition.recommended_model
+        or "deterministic-fake"
+    )
+    base_url = (
+        (credential.base_url if credential is not None else None)
+        or definition.base_url
+    )
+    activation: dict[str, Any] = {
+        "status": "activated",
+        "provider": provider_id,
+        "model": model,
+        "base_url": base_url,
+        "protocol": "openai-chat-completions",
+        "context_window": None,
+        "header_env": {},
+        "demo": provider_id == "fake",
+        "verified_at": credential.verified_at if credential is not None else None,
+        "activated_at": instance.get("created_at"),
+        "migrated_at": datetime.now(UTC).isoformat(),
+    }
+    migrated = {**instance, "activation": activation}
+
+    writes: list[MigrationWrite] = []
+    if credentials_payload is not None:
+        writes.append(
+            MigrationWrite(
+                "credentials",
+                "provider credentials",
+                credentials_path,
+                credentials_payload,
+                0o600,
+            )
         )
-        snapshots = tuple(_FileSnapshot.capture(path) for path in paths)
-        try:
-            for path in paths:
-                if path.exists():
-                    shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
-            store = ProviderCredentialStore.load(self._paths.credentials_path)
-            telegram_config = (
-                TelegramConnectorConfig.load(self._paths.telegram_config_path)
-                if self._paths.telegram_config_path.exists()
-                else None
+    if telegram_payload is not None:
+        writes.append(
+            MigrationWrite(
+                "telegram",
+                "Telegram connector",
+                telegram_path,
+                telegram_payload,
+                0o600,
             )
-            provider_id = store.default_provider or "fake"
-            credential = store.credential_for(provider_id)
-            definition = find_provider(provider_id)
-            migrated = {
-                **instance,
-                "activation": {
-                    "status": "activated",
-                    "provider": provider_id,
-                    "model": (
-                        (credential.model if credential is not None else None)
-                        or definition.recommended_model
-                        or "deterministic-fake"
-                    ),
-                    "base_url": (
-                        (credential.base_url if credential is not None else None)
-                        or definition.base_url
-                    ),
-                    "demo": provider_id == "fake",
-                    "verified_at": (
-                        credential.verified_at if credential is not None else None
-                    ),
-                    "activated_at": instance.get("created_at"),
-                    "migrated_at": datetime.now(UTC).isoformat(),
-                },
-            }
-            atomic_write_json(self._paths.data_dir / "instance.json", migrated)
-            if store.providers:
-                store.save(self._paths.credentials_path)
-            if telegram_config is not None:
-                telegram_config.save(self._paths.telegram_config_path)
-        except (KeyError, OSError, RuntimeError, ValueError) as error:
-            rollback_errors: list[str] = []
-            for snapshot in snapshots:
-                try:
-                    snapshot.restore()
-                except OSError as rollback_error:
-                    rollback_errors.append(str(rollback_error))
-            detail = (
-                f" Rollback also failed: {'; '.join(rollback_errors)}."
-                if rollback_errors
-                else ""
-            )
+        )
+    writes.append(
+        MigrationWrite(
+            "instance",
+            "installation activation",
+            instance_path,
+            _json_bytes(migrated),
+            0o600,
+            activation=True,
+        )
+    )
+    preview = [
+        "Migration preview (nothing changes until you confirm):",
+        f"- installation: {instance_path} gains an activation record",
+        f"- primary provider: {provider_id}; model: {model}",
+        "- provider credentials rewrite to schema v2 (backup kept)",
+        "- Telegram connector rewrites to schema v2 (backup kept)",
+        (
+            "- the activation record is written last so an interruption "
+            "leaves a valid legacy or migrated installation"
+        ),
+    ]
+    return MigrationPlan(tuple(writes), tuple(preview))
+
+
+def _inspect_credentials(
+    path: Path,
+) -> tuple[ProviderCredentialStore, bytes | None]:
+    if not path.exists():
+        return ProviderCredentialStore(), None
+    raw = read_json(path, default={})
+    known = set(_registry_ids())
+    raw_providers = raw.get("providers")
+    if raw_providers is not None:
+        if not isinstance(raw_providers, dict):
+            raise OperationError("the provider credential store is malformed")
+        named = {str(name).strip().casefold() for name in raw_providers}
+    else:
+        legacy = str(raw.get("provider_name", "")).strip().casefold()
+        named = {legacy} if legacy else set()
+    unknown = named - known
+    if unknown:
+        raise OperationError(
+            "the provider credential store names an unsupported provider"
+        )
+    store = ProviderCredentialStore.load(path)
+    payload = store.payload()
+    if raw == payload:
+        return store, None
+    return store, _json_bytes(payload)
+
+
+def _inspect_telegram(path: Path) -> bytes | None:
+    if not path.exists():
+        return None
+    try:
+        config = TelegramConnectorConfig.load(path)
+    except (ValueError, RuntimeError) as error:
+        raise OperationError(f"the Telegram connector state is unreadable: {error}")
+    payload = config.payload()
+    if read_json(path, default={}) == payload:
+        return None
+    return _json_bytes(payload)
+
+
+def _inspect_personas(data_dir: Path) -> None:
+    try:
+        PersonaService(
+            JsonFilePersonaRepository(data_dir / "personas.json")
+        ).active()
+    except (KeyError, LookupError, RuntimeError, ValueError) as error:
+        raise OperationError(f"the persona configuration is invalid: {error}")
+
+
+def _inspect_runtime_state(
+    paths: SetupPaths, instance: dict[str, Any], roots: dict[str, Any]
+) -> None:
+    from reckoning.interfaces import JsonFileInterfaceRepository
+
+    raw_server = roots.get("server")
+    server_root = (
+        Path(raw_server).expanduser()
+        if isinstance(raw_server, str) and raw_server
+        else None
+    )
+    try:
+        runtime = load_installation_runtime(
+            paths.data_dir, server_data_dir=server_root
+        )
+    except (OperationError, RuntimeError, ValueError) as error:
+        raise OperationError(f"the installation state is invalid: {error}")
+    try:
+        context_repository = JsonFilePersonalContextRepository(
+            runtime.state_path("personal-context", "personal-context.json")
+        )
+        context_repository.all_versions()
+        confirmed = next(
+            route for route in runtime.routes if route.category == "confirmed-state"
+        )
+        JsonFileInterfaceRepository(confirmed.root / "interfaces.json").load()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise OperationError(f"the durable conversation state is invalid: {error}")
+
+
+def _registry_ids() -> tuple[str, ...]:
+    from reckoning.provider_registry import PROVIDER_REGISTRY
+
+    return tuple(item.id for item in PROVIDER_REGISTRY)
+
+
+def _stage_migration_write(write: MigrationWrite) -> Path:
+    write.path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "wb",
+            dir=write.path.parent,
+            prefix=f".{write.path.name}.migrate-",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(write.payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+    except OSError:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+    temporary_path.chmod(write.mode)
+    return temporary_path
+
+
+def _validate_staged_migration(write: MigrationWrite, staged: Path) -> None:
+    if write.kind == "credentials":
+        ProviderCredentialStore.load(staged)
+    elif write.kind == "telegram":
+        TelegramConnectorConfig.load(staged)
+    else:
+        staged_instance = read_json(staged, default={})
+        if "activation" not in staged_instance:
             raise OperationError(
-                f"Migration failed and live state was restored: {error}.{detail}"
-            ) from error
+                "the staged installation lost its activation record"
+            )
+
+
+def commit_migration_plan(paths: SetupPaths, plan: MigrationPlan) -> None:
+    """Write backups, stage every file, then activate the marker last."""
+    del paths
+    snapshots = tuple(
+        _FileSnapshot.capture(write.path) for write in plan.writes
+    )
+    staged: list[tuple[MigrationWrite, Path]] = []
+    try:
+        for write in plan.writes:
+            if write.path.exists():
+                shutil.copy2(
+                    write.path, write.path.with_suffix(write.path.suffix + ".bak")
+                )
+        for write in plan.writes:
+            staged.append((write, _stage_migration_write(write)))
+        for write, temporary_path in staged:
+            _validate_staged_migration(write, temporary_path)
+        for write, temporary_path in staged:
+            os.replace(temporary_path, write.path)
+            write.path.chmod(write.mode)
+    except (OSError, OperationError, RuntimeError, ValueError) as error:
+        for _write, temporary_path in staged:
+            temporary_path.unlink(missing_ok=True)
+        rollback_errors: list[str] = []
+        for snapshot in snapshots:
+            try:
+                snapshot.restore()
+            except OSError as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        detail = (
+            f" Rollback also failed: {'; '.join(rollback_errors)}."
+            if rollback_errors
+            else ""
+        )
+        raise OperationError(
+            f"Migration failed and live state was restored: {error}.{detail}"
+        ) from error
