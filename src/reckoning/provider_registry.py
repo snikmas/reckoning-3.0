@@ -108,7 +108,9 @@ PROVIDER_REGISTRY: tuple[ProviderDefinition, ...] = (
         env_names=("OPENAI_API_KEY",),
         base_url="https://api.openai.com/v1",
         required_host="api.openai.com",
-        recommended_model="gpt-5-mini",
+        # gpt-5-mini snapshots retire 2026-12-11; OpenAI names gpt-5.6-terra
+        # as the replacement (platform.openai.com/docs/deprecations).
+        recommended_model="gpt-5.6-terra",
         badges=("API key required", "paid credit may be used"),
     ),
     ProviderDefinition(

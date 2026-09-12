@@ -76,6 +76,12 @@ def test_cloud_providers_pin_their_official_host() -> None:
     ("provider_id", "env_name", "host", "model"),
     (
         (
+            "openai",
+            "OPENAI_API_KEY",
+            "api.openai.com",
+            "gpt-5.6-terra",
+        ),
+        (
             "anthropic",
             "ANTHROPIC_API_KEY",
             "api.anthropic.com",
