@@ -929,7 +929,7 @@ class TestGeminiCandidateContract:
         )
 
         assert models == ("gemini-a", "gemini-z")
-        assert discovery.requests[0].full_url.endswith("/v1beta/models")
+        assert discovery.requests[0].full_url.endswith("/v1beta/models?pageSize=1000")
         verification = RecordingTransport([gemini_completion_payload()])
         adapter.verify(AdapterConfig(api_key=SECRET), transport=verification)
         assert verification.requests[0].full_url.endswith(
@@ -937,6 +937,145 @@ class TestGeminiCandidateContract:
         )
         request_body = json.loads(verification.requests[0].data.decode())
         assert request_body["generationConfig"] == {"maxOutputTokens": 8}
+
+    def test_gemini_model_discovery_follows_pagination(self) -> None:
+        adapter = candidate_adapter_for("google-gemini")
+        discovery = RecordingTransport(
+            [
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "name": "models/gemini-b",
+                                "supportedGenerationMethods": ["generateContent"],
+                            }
+                        ],
+                        "nextPageToken": "page-two",
+                    }
+                ).encode(),
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "name": "models/gemini-a",
+                                "supportedGenerationMethods": ["generateContent"],
+                            }
+                        ]
+                    }
+                ).encode(),
+            ]
+        )
+
+        models = adapter.discover_models(
+            AdapterConfig(api_key=SECRET), transport=discovery
+        )
+
+        assert models == ("gemini-a", "gemini-b")
+        assert len(discovery.requests) == 2
+        assert discovery.requests[0].full_url.endswith("/v1beta/models?pageSize=1000")
+        assert discovery.requests[1].full_url.endswith(
+            "/v1beta/models?pageSize=1000&pageToken=page-two"
+        )
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            json.dumps({"models": []}).encode(),
+            json.dumps({"data": []}).encode(),
+            json.dumps(
+                {
+                    "models": [
+                        {
+                            "name": "models/embedding-only",
+                            "supportedGenerationMethods": ["embedContent"],
+                        }
+                    ]
+                }
+            ).encode(),
+        ],
+        ids=["empty", "missing-models", "no-generation-method"],
+    )
+    def test_gemini_model_discovery_rejects_empty_or_malformed_pages(
+        self, payload: bytes
+    ) -> None:
+        adapter = candidate_adapter_for("google-gemini")
+        transport = RecordingTransport([payload])
+
+        with pytest.raises(ModelDiscoveryError):
+            adapter.discover_models(AdapterConfig(api_key=SECRET), transport=transport)
+
+    def test_gemini_verification_accepts_a_manual_model_id(self) -> None:
+        adapter = candidate_adapter_for("google-gemini")
+        transport = RecordingTransport([gemini_completion_payload("ready")])
+
+        result = adapter.verify(
+            AdapterConfig(api_key=SECRET, model="gemini-manual-20260101"),
+            transport=transport,
+        )
+
+        assert transport.requests[0].full_url.endswith(
+            "/models/gemini-manual-20260101:generateContent"
+        )
+        assert result.usage == ProviderUsage(11, 3, 14)
+        assert result.latency_ms >= 0
+
+    def test_gemini_verification_reports_a_blocked_prompt(self) -> None:
+        adapter = candidate_adapter_for("google-gemini")
+        transport = RecordingTransport(
+            [json.dumps({"promptFeedback": {"blockReason": "SAFETY"}}).encode()]
+        )
+
+        with pytest.raises(ProviderVerificationError, match="blocked the provider test"):
+            adapter.verify(AdapterConfig(api_key=SECRET), transport=transport)
+
+    def test_gemini_verification_reports_a_truncated_answer(self) -> None:
+        adapter = candidate_adapter_for("google-gemini")
+        transport = RecordingTransport(
+            [
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "content": {"parts": [{"text": ""}]},
+                                "finishReason": "MAX_TOKENS",
+                            }
+                        ]
+                    }
+                ).encode()
+            ]
+        )
+
+        with pytest.raises(
+            ProviderVerificationError, match="before a final answer"
+        ):
+            adapter.verify(AdapterConfig(api_key=SECRET), transport=transport)
+
+    def test_gemini_retries_rate_limits_and_server_errors(self) -> None:
+        adapter = candidate_adapter_for("google-gemini")
+        transport = RecordingTransport(
+            [http_error(429), http_error(503), gemini_completion_payload()]
+        )
+
+        result = adapter.verify(
+            AdapterConfig(api_key=SECRET), transport=transport, max_retries=2
+        )
+
+        assert result.retries == 2
+        assert len(transport.requests) == 3
+
+    @pytest.mark.parametrize("code", [400, 401, 403, 404, 422])
+    def test_gemini_does_not_retry_non_retryable_client_errors(
+        self, code: int
+    ) -> None:
+        adapter = candidate_adapter_for("google-gemini")
+        transport = RecordingTransport([http_error(code)] * 3)
+
+        with pytest.raises(ProviderVerificationError):
+            adapter.verify(
+                AdapterConfig(api_key=SECRET), transport=transport, max_retries=3
+            )
+
+        assert len(transport.requests) == 1
 
 
 @pytest.mark.parametrize(
