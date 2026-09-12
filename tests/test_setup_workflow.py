@@ -334,12 +334,14 @@ def test_guided_setup_persists_the_accepted_first_conversation(
     assert instance["placement_profile"] == "local"
 
     # The accepted exchange survived in the installed state.
-    interfaces = json.loads(
-        (tmp_path / "data" / "confirmed-state" / "interfaces.json").read_text()
-    )
-    sessions = interfaces["state"]["sessions"]
+    from reckoning.interfaces import JsonFileInterfaceRepository
+
+    installed = JsonFileInterfaceRepository(
+        tmp_path / "data" / "confirmed-state" / "interfaces.json"
+    ).load()
+    sessions = installed.sessions
     assert len(sessions) == 1
-    contents = [(m["role"], m["content"]) for m in sessions[0]["messages"]]
+    contents = [(message.role, message.content) for message in sessions[0].messages]
     assert contents[0] == ("user", "I need to protect my mornings for study.")
     assert contents[1][0] == "assistant"
 
