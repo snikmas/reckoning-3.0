@@ -191,6 +191,10 @@ class LocalOperationalRecordSource:
             connector_health=tuple(connector_health),
         )
 
+    @staticmethod
+    def _as_items(value: object) -> Iterable[object]:
+        return value if isinstance(value, (list, tuple)) else ()
+
     def _automation_snapshot(self) -> OperationalSnapshot:
         from reckoning.store_migration import has_sqlite_authority
 
@@ -212,8 +216,8 @@ class LocalOperationalRecordSource:
                 "runs": [
                     {
                         **run_data,
-                        "steps": list(run_data.get("steps", ())),
-                        "results": list(run_data.get("results", ())),
+                        "steps": list(self._as_items(run_data.get("steps"))),
+                        "results": list(self._as_items(run_data.get("results"))),
                     }
                     for run_data in (
                         _run_to_data(item) for item in repository.list_runs()
@@ -221,10 +225,12 @@ class LocalOperationalRecordSource:
                 ],
                 "receipts": [
                     {
-                        **_receipt_to_data(item),
-                        "results": list(_receipt_to_data(item).get("results", ())),
+                        **receipt_data,
+                        "results": list(self._as_items(receipt_data.get("results"))),
                     }
-                    for item in repository.list_receipts()
+                    for receipt_data in (
+                        _receipt_to_data(item) for item in repository.list_receipts()
+                    )
                 ],
             }
         else:

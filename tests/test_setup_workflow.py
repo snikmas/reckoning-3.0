@@ -1735,10 +1735,42 @@ def _flaky_replace(monkeypatch: pytest.MonkeyPatch, fail_on: int) -> None:
     monkeypatch.setattr("reckoning.setup_workflow.os.replace", flaky)
 
 
-@pytest.mark.parametrize("fail_on", (1, 2, 3))
+def test_interrupted_store_inspection_changes_nothing_and_can_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interruption during the store-authority write that precedes the
+    migration offer is reported safely; no migration question is asked, no
+    setup file changes, and the next run offers the migration again."""
+    _legacy_installation(tmp_path)
+    instance_path = tmp_path / "data" / "instance.json"
+    original_instance = instance_path.read_bytes()
+    original_credentials = (tmp_path / "provider.json").read_bytes()
+    original_telegram = (tmp_path / "telegram.json").read_bytes()
+    _flaky_replace(monkeypatch, 1)
+
+    outcome, ui = run_workflow(tmp_path, [("status-action", "exit")])
+
+    assert outcome.status == "managed"
+    rendered = "\n".join(ui.lines)
+    assert "cannot be migrated safely" in rendered
+    assert "No files were changed." in rendered
+    assert instance_path.read_bytes() == original_instance
+    assert (tmp_path / "provider.json").read_bytes() == original_credentials
+    assert (tmp_path / "telegram.json").read_bytes() == original_telegram
+
+    # Without the interruption, the same installation is offered the
+    # migration again and can decline it.
+    outcome, ui = run_workflow(tmp_path, [("migrate", "exit")])
+    assert outcome.status == "managed"
+    assert any("needs" in line and "migration" in line for line in ui.lines)
+
+
+@pytest.mark.parametrize("fail_on", (2, 3, 4))
 def test_interrupted_migration_restores_the_original_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_on: int
 ) -> None:
+    # The first os.replace in a legacy run is the interface store's protected
+    # authority write during plan inspection; commit-phase replaces follow.
     _legacy_installation(tmp_path)
     instance_path = tmp_path / "data" / "instance.json"
     original_instance = instance_path.read_bytes()
@@ -1765,7 +1797,7 @@ def test_interrupted_migration_leaves_a_reopenable_legacy_installation(
     from reckoning.operations import diagnose, load_installation_runtime
 
     _legacy_installation(tmp_path)
-    _flaky_replace(monkeypatch, 3)
+    _flaky_replace(monkeypatch, 4)  # the activation marker commits last
     workflow = SetupWorkflow(
         paths=make_paths(tmp_path),
         ui=ScriptedUI([("migrate", "migrate"), ("migrate-confirm", "y")]),
