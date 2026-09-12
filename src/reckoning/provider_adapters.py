@@ -36,6 +36,8 @@ VERIFICATION_PROMPT = "Reply with the single word: ready"
 VERIFICATION_MAX_TOKENS = 8
 ANTHROPIC_MODEL_PAGE_LIMIT = 1000
 ANTHROPIC_MODEL_PAGE_MAX = 50
+GEMINI_MODEL_PAGE_SIZE = 1000
+GEMINI_MODEL_PAGE_MAX = 50
 
 
 class ProviderVerificationError(RuntimeError):
@@ -748,42 +750,59 @@ class GeminiProviderAdapter(OpenAICompatibleAdapter):
         transport: Transport = urlopen_transport,
         timeout_seconds: float = 15.0,
     ) -> tuple[str, ...]:
-        request = Request(
-            f"{_validated_base_url(self._definition, config.base_url)}/models",
-            headers=self._request_headers(config),
-            method="GET",
-        )
-        try:
-            parsed = json.loads(transport(request, timeout_seconds).decode("utf-8"))
-            data = parsed["models"]
-            if not isinstance(data, list):
-                raise TypeError("model data is not a list")
-            models = tuple(
-                sorted(
-                    item["name"].removeprefix("models/").strip()
-                    for item in data
-                    if isinstance(item, dict)
-                    and isinstance(item.get("name"), str)
-                    and "generateContent"
-                    in item.get("supportedGenerationMethods", ())
-                )
+        base_url = _validated_base_url(self._definition, config.base_url)
+        collected: dict[str, None] = {}
+        page_token: str | None = None
+        for _page in range(GEMINI_MODEL_PAGE_MAX):
+            query = f"?pageSize={GEMINI_MODEL_PAGE_SIZE}"
+            if page_token is not None:
+                query += f"&pageToken={quote(page_token, safe='')}"
+            request = Request(
+                f"{base_url}/models{query}",
+                headers=self._request_headers(config),
+                method="GET",
             )
-        except HTTPError as error:
+            try:
+                parsed = json.loads(transport(request, timeout_seconds).decode("utf-8"))
+                data = parsed["models"]
+                if not isinstance(data, list):
+                    raise TypeError("model data is not a list")
+                for item in data:
+                    if not isinstance(item, dict) or not isinstance(
+                        item.get("name"), str
+                    ):
+                        continue
+                    methods = item.get("supportedGenerationMethods") or ()
+                    if "generateContent" not in methods:
+                        continue
+                    name = item["name"].removeprefix("models/").strip()
+                    if name:
+                        collected[name] = None
+                next_token = parsed.get("nextPageToken")
+            except HTTPError as error:
+                raise ModelDiscoveryError(
+                    _redact(
+                        f"Google Gemini returned HTTP {error.code} while listing models.",
+                        config.api_key,
+                    )
+                ) from error
+            except (URLError, TimeoutError, OSError) as error:
+                reason = getattr(error, "reason", error)
+                raise ModelDiscoveryError(
+                    f"Google Gemini could not be reached: {reason}"
+                ) from error
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise ModelDiscoveryError(
+                    "Google Gemini returned an invalid model list."
+                ) from error
+            if not isinstance(next_token, str) or not next_token.strip():
+                break
+            page_token = next_token.strip()
+        else:
             raise ModelDiscoveryError(
-                _redact(
-                    f"Google Gemini returned HTTP {error.code} while listing models.",
-                    config.api_key,
-                )
-            ) from error
-        except (URLError, TimeoutError, OSError) as error:
-            reason = getattr(error, "reason", error)
-            raise ModelDiscoveryError(
-                f"Google Gemini could not be reached: {reason}"
-            ) from error
-        except (KeyError, TypeError, json.JSONDecodeError) as error:
-            raise ModelDiscoveryError(
-                "Google Gemini returned an invalid model list."
-            ) from error
+                "Google Gemini model listing exceeded the page limit."
+            )
+        models = tuple(sorted(collected))
         if not models:
             raise ModelDiscoveryError(
                 "Google Gemini listed no generation models; "
@@ -875,7 +894,14 @@ class GeminiProviderAdapter(OpenAICompatibleAdapter):
         timer: Callable[[], float],
     ) -> ProviderVerification:
         parsed = json.loads(raw.decode("utf-8"))
-        parts = parsed["candidates"][0]["content"]["parts"]
+        candidates = parsed.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise ProviderVerificationError(self._gemini_block_message(parsed))
+        candidate = candidates[0]
+        if not isinstance(candidate, dict):
+            raise TypeError("candidate is not an object")
+        content = candidate.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
         if not isinstance(parts, list):
             raise TypeError("parts is not a list")
         text = "".join(
@@ -884,6 +910,11 @@ class GeminiProviderAdapter(OpenAICompatibleAdapter):
             if isinstance(part, dict) and isinstance(part.get("text"), str)
         ).strip()
         if not text:
+            if candidate.get("finishReason") == "MAX_TOKENS":
+                raise ProviderVerificationError(
+                    "Google Gemini provider test ended before a final answer. "
+                    "Retry the test or edit provider settings."
+                )
             raise ValueError("content has no text")
         usage = parsed.get("usageMetadata") or {}
         if not isinstance(usage, dict):
@@ -902,6 +933,19 @@ class GeminiProviderAdapter(OpenAICompatibleAdapter):
             retries=attempt,
             usage=ProviderUsage(input_tokens, output_tokens, total_tokens),
         )
+
+    @staticmethod
+    def _gemini_block_message(parsed: dict[str, object]) -> str:
+        feedback = parsed.get("promptFeedback")
+        if isinstance(feedback, dict):
+            block_reason = feedback.get("blockReason")
+            if isinstance(block_reason, str) and block_reason.strip():
+                return (
+                    "Google Gemini blocked the provider test "
+                    f"({block_reason.strip()}). Edit provider settings or "
+                    "choose another model."
+                )
+        return "Google Gemini returned an invalid response."
 
     def _request_headers(self, config: AdapterConfig) -> dict[str, str]:
         if config.headers:
