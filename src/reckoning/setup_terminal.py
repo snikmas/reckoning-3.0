@@ -1,23 +1,65 @@
-"""Terminal adapters for the setup workflow.
+"""Terminal adapters for the setup workflow: the Signal presentation.
 
 Three implementations share the SetupUI seam:
 
-- ``InteractiveUI``: arrow-key menus with semantic colors on a real terminal.
+- ``InteractiveUI``: the Signal renderer — arrow-key menus, semantic colors,
+  progress dots, and searchable lists — on capable terminals.
 - ``PlainTextUI``: numbered prompts for limited or non-interactive terminals.
 - ``NonInteractiveUI``: answers from a mapping for scripts and CI.
 
-All copy comes from setup_copy; meaning never depends on color or symbols.
+Signal semantics: cyan marks the brand and the selected row, violet marks the
+current section and the selected row's explanation, green marks verified
+success, amber and red mark warnings and failures, and dim text carries
+secondary copy. Color and symbols never carry meaning alone; every state also
+has text.
+
+Setup uses the normal terminal buffer and redraws only the active menu
+region, so scrollback is preserved. All user-facing copy lives in
+``setup_copy`` for later localization. Behavior is identical on Linux, macOS,
+and WSL: any posix terminal with a TTY gets the interactive renderer, color
+degrades from 256-color to basic ANSI to none (``NO_COLOR``), and box symbols
+degrade to ASCII when the terminal encoding is not UTF-8.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import textwrap
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from getpass import getpass
-from typing import Any
+from typing import Any, Literal
 
-from reckoning.setup_copy import BRAND_LINE, HELP_HINT
+from reckoning.setup_copy import (
+    BRAND_LINE,
+    BRAND_NAME,
+    CONTROL_BACK,
+    CONTROL_EXIT,
+    CONTROL_FILTER,
+    CONTROL_HELP,
+    CONTROL_MOVE,
+    CONTROL_SAVE_AND_EXIT,
+    CONTROL_SELECT,
+    FILTER_EMPTY,
+    FILTER_LABEL,
+    FILTER_PLACEHOLDER,
+    HELP_HINT,
+    MORE_ABOVE,
+    MORE_BELOW,
+    PLAIN_BACK_HINT,
+    PLAIN_ENTER_NUMBER,
+    PLAIN_EXIT_HINT,
+    PLAIN_NOT_SELECTABLE,
+    PLAIN_PROGRESS,
+    PLAIN_VALUE_REQUIRED,
+    PROGRESS_POSITION,
+    SELECTED_ECHO,
+    STATUS_FAILURE_PREFIX,
+    STATUS_OK_PREFIX,
+    STATUS_WARNING_PREFIX,
+)
 from reckoning.setup_workflow import (
     MenuOption,
     SetupBack,
@@ -27,6 +69,286 @@ from reckoning.setup_workflow import (
 
 BACK_KEYWORDS = ("back", "b")
 EXIT_KEYWORDS = ("exit", "quit", "q")
+
+# Lists at or above this size gain the filter line and typed filtering;
+# smaller decision menus stay arrow-only so the footer names only the
+# controls the screen actually supports.
+SEARCH_MIN_OPTIONS = 7
+
+# Bounds for the scroll window over long lists; the actual size adapts to
+# the terminal height between these limits.
+MENU_MIN_ROWS = 5
+MENU_MAX_ROWS = 12
+MENU_RESERVED_LINES = 10
+
+ColorMode = Literal["extended", "basic", "none"]
+ColorRole = Literal[
+    "brand", "navigation", "current", "verified", "warning", "failure", "muted"
+]
+
+_EXTENDED_CODES: dict[ColorRole, str] = {
+    "brand": "38;5;45",
+    "navigation": "38;5;45",
+    "current": "38;5;141",
+    "verified": "38;5;84",
+    "warning": "38;5;221",
+    "failure": "38;5;203",
+    "muted": "38;5;246",
+}
+_BASIC_CODES: dict[ColorRole, str] = {
+    "brand": "36",
+    "navigation": "36",
+    "current": "35",
+    "verified": "32",
+    "warning": "33",
+    "failure": "31",
+    "muted": "2",
+}
+
+
+def _detect_color_mode(no_color: bool) -> ColorMode:
+    if no_color or "NO_COLOR" in os.environ:
+        return "none"
+    term = os.environ.get("TERM", "")
+    colorterm = os.environ.get("COLORTERM", "").casefold()
+    if "256color" in term or colorterm in ("truecolor", "24bit"):
+        return "extended"
+    return "basic"
+
+
+def _detect_unicode() -> bool:
+    encoding = (getattr(sys.stdout, "encoding", None) or "").casefold()
+    return "utf" in encoding
+
+
+@dataclass(frozen=True)
+class SignalTheme:
+    """Semantic Signal colors and terminal-safe symbols with fallbacks."""
+
+    mode: ColorMode
+    unicode: bool
+
+    def paint(self, role: ColorRole, text: str, *, bold: bool = False) -> str:
+        if self.mode == "none" or not text:
+            return text
+        codes = _EXTENDED_CODES if self.mode == "extended" else _BASIC_CODES
+        prefix = "1;" if bold and codes[role] != "2" else ""
+        return f"\x1b[{prefix}{codes[role]}m{text}\x1b[0m"
+
+    def bold(self, text: str) -> str:
+        if self.mode == "none" or not text:
+            return text
+        return f"\x1b[1m{text}\x1b[0m"
+
+    # --- symbols ------------------------------------------------------------
+
+    @property
+    def progress_done(self) -> str:
+        return "●" if self.unicode else "*"
+
+    @property
+    def progress_current(self) -> str:
+        return "●" if self.unicode else ">"
+
+    @property
+    def progress_remaining(self) -> str:
+        return "○" if self.unicode else "-"
+
+    @property
+    def row_idle(self) -> str:
+        return "○" if self.unicode else "-"
+
+    @property
+    def row_open(self) -> str:
+        return "┌─" if self.unicode else ">"
+
+    @property
+    def row_detail(self) -> str:
+        return "│" if self.unicode else "|"
+
+    @property
+    def row_close(self) -> str | None:
+        return "└─" if self.unicode else None
+
+    @property
+    def scroll_above(self) -> str:
+        return "↑" if self.unicode else "^"
+
+    @property
+    def scroll_below(self) -> str:
+        return "↓" if self.unicode else "v"
+
+    @property
+    def key_move(self) -> str:
+        return "↑↓" if self.unicode else "Up/Down"
+
+    @property
+    def rule(self) -> str:
+        return "─" if self.unicode else "-"
+
+
+class MenuSession:
+    """The state and rendering of one interactive menu, without any IO.
+
+    Pure transitions keep selection, filtering, and windowing testable
+    without a terminal; ``InteractiveUI`` only reads keys and paints lines.
+    """
+
+    def __init__(
+        self,
+        prompt: str,
+        options: tuple[MenuOption, ...],
+        *,
+        allow_back: bool,
+        help_available: bool,
+        searchable: bool | None = None,
+    ) -> None:
+        self.prompt = prompt
+        self.options = options
+        self.allow_back = allow_back
+        self.help_available = help_available
+        self.searchable = (
+            len(options) >= SEARCH_MIN_OPTIONS if searchable is None else searchable
+        )
+        self.query = ""
+        selectable = [option.id for option in options if self._selectable(option)]
+        self.selected_id: str | None = selectable[0] if selectable else None
+
+    @staticmethod
+    def _selectable(option: MenuOption) -> bool:
+        return option.available and not option.dim
+
+    def visible_options(self) -> tuple[MenuOption, ...]:
+        if not self.query:
+            return self.options
+        needle = self.query.casefold()
+        return tuple(
+            option
+            for option in self.options
+            if needle in option.label.casefold() or needle in option.note.casefold()
+        )
+
+    def move(self, delta: int) -> None:
+        selectable = [
+            option.id for option in self.visible_options() if self._selectable(option)
+        ]
+        if not selectable:
+            self.selected_id = None
+            return
+        if self.selected_id in selectable:
+            index = selectable.index(self.selected_id)
+            self.selected_id = selectable[(index + delta) % len(selectable)]
+        else:
+            self.selected_id = selectable[0]
+
+    def type_char(self, char: str) -> None:
+        if not self.searchable:
+            return
+        self.query += char
+        self._reset_selection()
+
+    def backspace(self) -> None:
+        if not self.searchable or not self.query:
+            return
+        self.query = self.query[:-1]
+        self._reset_selection()
+
+    def escape(self) -> Literal["cleared", "back", "exit"]:
+        """Esc clears an active filter first, then navigates."""
+        if self.searchable and self.query:
+            self.query = ""
+            self._reset_selection()
+            return "cleared"
+        return "back" if self.allow_back else "exit"
+
+    def _reset_selection(self) -> None:
+        selectable = [
+            option.id for option in self.visible_options() if self._selectable(option)
+        ]
+        if self.selected_id not in selectable:
+            self.selected_id = selectable[0] if selectable else None
+
+    def footer_controls(self, theme: SignalTheme) -> list[str]:
+        controls = [f"{theme.key_move} {CONTROL_MOVE}"]
+        if self.searchable:
+            controls.append(CONTROL_FILTER)
+        controls.append(f"Enter {CONTROL_SELECT}")
+        if self.help_available:
+            controls.append(f"? {CONTROL_HELP}")
+        controls.append(f"Esc {CONTROL_BACK if self.allow_back else CONTROL_EXIT}")
+        controls.append(f"Ctrl+C {CONTROL_SAVE_AND_EXIT}")
+        return controls
+
+    def lines(self, theme: SignalTheme, *, width: int, max_rows: int) -> list[str]:
+        visible = self.visible_options()
+        lines = [theme.bold(self.prompt)]
+        if self.searchable:
+            if self.query:
+                query_text = theme.paint("navigation", self.query)
+            else:
+                query_text = theme.paint("muted", FILTER_PLACEHOLDER)
+            lines.append(f"  {theme.bold(FILTER_LABEL)}  {query_text}")
+        lines.append("")
+
+        selected_index = next(
+            (
+                index
+                for index, option in enumerate(visible)
+                if option.id == self.selected_id
+            ),
+            0,
+        )
+        max_rows = max(MENU_MIN_ROWS, max_rows)
+        start = 0
+        if len(visible) > max_rows:
+            half = max_rows // 2
+            start = min(max(0, selected_index - half), len(visible) - max_rows)
+        window = visible[start : start + max_rows]
+
+        if start > 0:
+            lines.append(
+                theme.paint(
+                    "muted", f"  {theme.scroll_above} {MORE_ABOVE.format(count=start)}"
+                )
+            )
+        for option in window:
+            lines.extend(self._row_lines(theme, option, width=width))
+        remaining = len(visible) - (start + len(window))
+        if remaining > 0:
+            lines.append(
+                theme.paint(
+                    "muted",
+                    f"  {theme.scroll_below} {MORE_BELOW.format(count=remaining)}",
+                )
+            )
+        if not visible:
+            lines.append(theme.paint("muted", f"  {FILTER_EMPTY}"))
+
+        lines.append("")
+        lines.append(theme.paint("muted", "  " + "   ".join(self.footer_controls(theme))))
+        return lines
+
+    def _row_lines(
+        self, theme: SignalTheme, option: MenuOption, *, width: int
+    ) -> list[str]:
+        if not self._selectable(option):
+            note = f"  {option.note}" if option.note else ""
+            return [theme.paint("muted", f"    {option.label}{note}")]
+        if option.id != self.selected_id:
+            return [f"  {theme.row_idle} {option.label}"]
+        header = theme.paint(
+            "navigation", f"  {theme.row_open} {option.label}", bold=True
+        )
+        rows = [header]
+        if option.note:
+            indent = f"  {theme.row_detail}  "
+            for wrapped in textwrap.wrap(
+                option.note, width=max(28, width - len(indent))
+            ):
+                rows.append(theme.paint("current", f"{indent}{wrapped}"))
+        if theme.row_close is not None:
+            rows.append(theme.paint("navigation", f"  {theme.row_close}"))
+        return rows
 
 
 def _default_line_reader(prompt: str) -> str:
@@ -62,8 +384,7 @@ class PlainTextUI:
 
     def step(self, index: int, total: int, title: str) -> None:
         self._output(
-            f"Progress: {index - 1} complete; current section "
-            f"{index} of {total} — {title}"
+            PLAIN_PROGRESS.format(done=index - 1, index=index, total=total, title=title)
         )
 
     def info(self, text: str) -> None:
@@ -73,13 +394,13 @@ class PlainTextUI:
         self._output(text)
 
     def success(self, text: str) -> None:
-        self._output(f"OK: {text}")
+        self._output(f"{STATUS_OK_PREFIX}: {text}")
 
     def warning(self, text: str) -> None:
-        self._output(f"Warning: {text}")
+        self._output(f"{STATUS_WARNING_PREFIX}: {text}")
 
     def failure(self, text: str) -> None:
-        self._output(f"Failed: {text}")
+        self._output(f"{STATUS_FAILURE_PREFIX}: {text}")
 
     def choose(
         self,
@@ -99,10 +420,10 @@ class PlainTextUI:
                 self._output(f"  {len(selectable)}. {option.label}{note}")
             else:
                 note = f" — {option.note}" if option.note else ""
-                self._output(f"  -. {option.label} (not selectable){note}")
+                self._output(f"  -. {option.label} {PLAIN_NOT_SELECTABLE}{note}")
         if allow_back:
-            self._output("  Type 'back' to return to the previous step.")
-        self._output(f"  Type 'exit' to save a draft and leave. {HELP_HINT}")
+            self._output(f"  {PLAIN_BACK_HINT}")
+        self._output(f"  {PLAIN_EXIT_HINT} {HELP_HINT}")
         while True:
             raw = self._read("> ").strip()
             lowered = raw.casefold()
@@ -122,10 +443,10 @@ class PlainTextUI:
                 )
                 if match is not None:
                     return match.id
-                self._output(f"Enter a number from 1 to {len(selectable)}.")
+                self._output(PLAIN_ENTER_NUMBER.format(count=len(selectable)))
                 continue
             if choice < 1 or choice > len(selectable):
-                self._output(f"Enter a number from 1 to {len(selectable)}.")
+                self._output(PLAIN_ENTER_NUMBER.format(count=len(selectable)))
                 continue
             return selectable[choice - 1].id
 
@@ -149,7 +470,7 @@ class PlainTextUI:
             value = raw or default
             if value or allow_empty:
                 return value
-            self._output("A value is required.")
+            self._output(PLAIN_VALUE_REQUIRED)
 
     def confirm(self, key: str, question: str, *, default: bool = False) -> bool:
         suffix = "[Y/n]" if default else "[y/N]"
@@ -160,10 +481,11 @@ class PlainTextUI:
 
 
 class InteractiveUI(PlainTextUI):
-    """Arrow-key menus with semantic colors on capable terminals.
+    """The Signal renderer: arrow-key menus with semantic colors.
 
-    Falls back to numbered prompts when stdin is not a TTY, when ANSI is
-    unsupported, or when NO_COLOR is set.
+    Falls back to numbered prompts when stdin is not a TTY or the platform
+    is not posix. ``NO_COLOR`` keeps the interactive menus but removes all
+    color; a non-UTF-8 terminal encoding replaces box symbols with ASCII.
     """
 
     def __init__(
@@ -174,50 +496,70 @@ class InteractiveUI(PlainTextUI):
         output: Callable[[str], None] | None = None,
         stream: Any = None,
         no_color: bool = False,
+        theme: SignalTheme | None = None,
     ) -> None:
         super().__init__(
             line_reader=line_reader, secret_reader=secret_reader, output=output
         )
         self._stream = stream if stream is not None else sys.stdin
-        self._no_color = no_color or "NO_COLOR" in os.environ
+        self._theme = theme or SignalTheme(
+            mode=_detect_color_mode(no_color), unicode=_detect_unicode()
+        )
 
     def _interactive_capable(self) -> bool:
         return (
-            not self._no_color
-            and hasattr(self._stream, "isatty")
+            hasattr(self._stream, "isatty")
             and bool(self._stream.isatty())
             and os.name == "posix"
         )
 
-    def _color(self, text: str, code: str) -> str:
-        if self._no_color:
-            return text
-        return f"\x1b[{code}m{text}\x1b[0m"
+    @property
+    def _width(self) -> int:
+        return max(56, min(76, shutil.get_terminal_size((72, 24)).columns - 4))
+
+    @property
+    def _menu_rows(self) -> int:
+        lines = shutil.get_terminal_size((72, 24)).lines
+        return max(MENU_MIN_ROWS, min(MENU_MAX_ROWS, lines - MENU_RESERVED_LINES))
 
     def banner(self) -> None:
-        self._output(self._color(BRAND_LINE, "36"))  # cyan branding
+        self._output(self._theme.paint("brand", BRAND_LINE, bold=True))
 
     def step(self, index: int, total: int, title: str) -> None:
-        progress = " ".join(
-            "✓" if position < index else "◆" if position == index else "○"
-            for position in range(1, total + 1)
+        theme = self._theme
+        dots: list[str] = []
+        for position in range(1, total + 1):
+            if position < index:
+                dots.append(theme.paint("verified", theme.progress_done))
+            elif position == index:
+                dots.append(theme.paint("current", theme.progress_current, bold=True))
+            else:
+                dots.append(theme.paint("muted", theme.progress_remaining))
+        brand = theme.paint("brand", BRAND_NAME, bold=True)
+        progress = " ".join(dots)
+        rule = theme.paint("muted", theme.rule * self._width)
+        position_text = theme.paint(
+            "muted", PROGRESS_POSITION.format(index=index, total=total)
         )
-        self._output(
-            f"{progress}  {self._color(title, '35')} "
-            f"(section {index} of {total})"
-        )
+        self._output("")
+        self._output(rule)
+        gap = " " * max(2, self._width - len(BRAND_NAME) - len(" ".join(dots)))
+        self._output(f"{brand}{gap}{progress}")
+        self._output("")
+        self._output(f"{theme.bold(title)}  {position_text}")
+        self._output("")
 
     def success(self, text: str) -> None:
-        self._output(self._color(f"OK: {text}", "32"))
+        self._output(self._theme.paint("verified", f"{STATUS_OK_PREFIX}: {text}"))
 
     def secondary(self, text: str) -> None:
-        self._output(self._color(text, "2"))
+        self._output(self._theme.paint("muted", text))
 
     def warning(self, text: str) -> None:
-        self._output(self._color(f"Warning: {text}", "33"))
+        self._output(self._theme.paint("warning", f"{STATUS_WARNING_PREFIX}: {text}"))
 
     def failure(self, text: str) -> None:
-        self._output(self._color(f"Failed: {text}", "31"))
+        self._output(self._theme.paint("failure", f"{STATUS_FAILURE_PREFIX}: {text}"))
 
     def choose(
         self,
@@ -252,79 +594,19 @@ class InteractiveUI(PlainTextUI):
         import termios
         import tty
 
-        controls = (
-            (("__back__", "Back"),) if allow_back else ()
-        ) + (("__exit__", "Exit and save progress"),)
-        query = ""
-        selected_id: str = next(
-            (
-                option.id
-                for option in options
-                if option.available and not option.dim
-            ),
-            controls[0][0],
+        session = MenuSession(
+            prompt,
+            options,
+            allow_back=allow_back,
+            help_available=help_text is not None,
         )
         previous_height = 0
 
-        def visible_options() -> tuple[MenuOption, ...]:
-            if not query:
-                return options
-            needle = query.casefold()
-            return tuple(
-                option
-                for option in options
-                if needle in option.label.casefold()
-                or needle in option.note.casefold()
-            )
-
-        def entries() -> tuple[tuple[str, str, bool, str, bool], ...]:
-            option_entries = tuple(
-                (
-                    option.id,
-                    option.label,
-                    option.available and not option.dim,
-                    option.note,
-                    False,
-                )
-                for option in visible_options()
-            )
-            control_entries = tuple(
-                (item_id, label, True, "", True) for item_id, label in controls
-            )
-            return option_entries + control_entries
-
-        def select_first_available() -> None:
-            nonlocal selected_id
-            current = entries()
-            if any(item[0] == selected_id and item[2] for item in current):
-                return
-            selected_id = next(item[0] for item in current if item[2])
-
         def render(*, redraw: bool) -> None:
             nonlocal previous_height
-            current = entries()
-            lines = [prompt]
-            if query:
-                lines.append(self._color(f"Filter: {query}", "2"))
-            for item_id, label, enabled, note, control in current:
-                if not enabled:
-                    lines.append(self._color(f"    {label}", "2"))
-                elif item_id == selected_id:
-                    lines.append(self._color(f"  ◆ {label}", "35"))
-                    if note:
-                        lines.append(self._color(f"    {note}", "2"))
-                elif control:
-                    lines.append(self._color(f"  › {label}", "36"))
-                else:
-                    lines.append(f"  ○ {label}")
-            supported = ["Up/Down to move"]
-            if options:
-                supported.append("type to filter")
-            supported.append("Enter to select")
-            if help_text:
-                supported.append("'?' for help")
-            supported.append("Esc to go back" if allow_back else "Esc to exit")
-            lines.append(", ".join(supported))
+            lines = session.lines(
+                self._theme, width=self._width, max_rows=self._menu_rows
+            )
             if redraw:
                 self._output(f"\x1b[{previous_height}A\x1b[J{lines[0]}")
                 for line in lines[1:]:
@@ -350,49 +632,42 @@ class InteractiveUI(PlainTextUI):
                 if char == b"\x1b":
                     ready, _, _ = select.select([stream.fileno()], [], [], 0.03)
                     if not ready:
-                        if allow_back:
+                        action = session.escape()
+                        if action == "cleared":
+                            render(redraw=True)
+                            continue
+                        if action == "back":
                             raise SetupBack
                         raise SetupExit
                     rest = os.read(stream.fileno(), 2)
-                    current = entries()
-                    selectable = [item[0] for item in current if item[2]]
-                    selected_index = selectable.index(selected_id)
                     if rest == b"[A":
-                        selected_id = selectable[
-                            (selected_index - 1) % len(selectable)
-                        ]
+                        session.move(-1)
                     elif rest == b"[B":
-                        selected_id = selectable[
-                            (selected_index + 1) % len(selectable)
-                        ]
+                        session.move(1)
                     render(redraw=True)
                 elif char in (b"\r", b"\n"):
-                    break
+                    if session.selected_id is not None:
+                        break
                 elif char == b"?":
                     text = help_text or HELP_HINT
                     self._output("")
                     self._output(text)
                     previous_height += text.count("\n") + 2
                 elif char in (b"\x7f", b"\x08"):
-                    if query:
-                        query = query[:-1]
-                        select_first_available()
-                        render(redraw=True)
+                    session.backspace()
+                    render(redraw=True)
                 elif char == b"\x03":  # Ctrl+C
                     raise SetupExit
                 elif len(char) == 1 and 32 <= char[0] <= 126:
-                    query += char.decode("ascii")
-                    select_first_available()
+                    session.type_char(char.decode("ascii"))
                     render(redraw=True)
         finally:
             termios.tcsetattr(stream, termios.TCSADRAIN, old_settings)
-        if selected_id == "__back__":
-            raise SetupBack
-        if selected_id == "__exit__":
-            raise SetupExit
-        chosen = next(item for item in entries() if item[0] == selected_id)
-        self._output(f"Selected: {chosen[1]}")
-        return selected_id
+        chosen = next(
+            item for item in session.visible_options() if item.id == session.selected_id
+        )
+        self._output(SELECTED_ECHO.format(label=chosen.label))
+        return chosen.id
 
 
 class NonInteractiveUI:
@@ -420,13 +695,13 @@ class NonInteractiveUI:
         self._output(text)
 
     def success(self, text: str) -> None:
-        self._output(f"OK: {text}")
+        self._output(f"{STATUS_OK_PREFIX}: {text}")
 
     def warning(self, text: str) -> None:
-        self._output(f"Warning: {text}")
+        self._output(f"{STATUS_WARNING_PREFIX}: {text}")
 
     def failure(self, text: str) -> None:
-        self._output(f"Failed: {text}")
+        self._output(f"{STATUS_FAILURE_PREFIX}: {text}")
 
     def choose(
         self,

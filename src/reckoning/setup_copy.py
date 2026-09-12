@@ -212,3 +212,37 @@ RESUME_EXIT = "Exit without changes"
 START_OVER_PREVIEW = "Starting over removes this draft; verified credentials stay."
 
 HELP_HINT = "Enter '?' for help, 'back' to go back, 'exit' to save and exit."
+
+# --- Signal renderer chrome -------------------------------------------------
+# Short structural labels used by the interactive and plain renderers. Keys
+# and symbols live in the renderer theme; these strings carry the meaning.
+
+BRAND_NAME = "RECKONING"
+PROGRESS_POSITION = "section {index} of {total}"
+FILTER_LABEL = "Filter"
+FILTER_PLACEHOLDER = "Start typing to filter"
+FILTER_EMPTY = "No matches; Backspace changes the filter."
+SELECTED_ECHO = "Selected: {label}"
+MORE_ABOVE = "{count} more above"
+MORE_BELOW = "{count} more below"
+
+CONTROL_MOVE = "move"
+CONTROL_FILTER = "type to filter"
+CONTROL_SELECT = "select"
+CONTROL_HELP = "help"
+CONTROL_BACK = "back"
+CONTROL_EXIT = "exit"
+CONTROL_SAVE_AND_EXIT = "save & exit"
+
+STATUS_OK_PREFIX = "OK"
+STATUS_WARNING_PREFIX = "Warning"
+STATUS_FAILURE_PREFIX = "Failed"
+
+PLAIN_PROGRESS = (
+    "Progress: {done} complete; current section {index} of {total} — {title}"
+)
+PLAIN_NOT_SELECTABLE = "(not selectable)"
+PLAIN_BACK_HINT = "Type 'back' to return to the previous step."
+PLAIN_EXIT_HINT = "Type 'exit' to save a draft and leave."
+PLAIN_ENTER_NUMBER = "Enter a number from 1 to {count}."
+PLAIN_VALUE_REQUIRED = "A value is required."
