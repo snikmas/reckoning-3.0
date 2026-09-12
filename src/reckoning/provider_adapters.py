@@ -34,6 +34,8 @@ def urlopen_transport(request: Request, timeout: float) -> bytes:
 
 VERIFICATION_PROMPT = "Reply with the single word: ready"
 VERIFICATION_MAX_TOKENS = 8
+ANTHROPIC_MODEL_PAGE_LIMIT = 1000
+ANTHROPIC_MODEL_PAGE_MAX = 50
 
 
 class ProviderVerificationError(RuntimeError):
@@ -546,41 +548,56 @@ class AnthropicProviderAdapter(OpenAICompatibleAdapter):
         transport: Transport = urlopen_transport,
         timeout_seconds: float = 15.0,
     ) -> tuple[str, ...]:
-        request = Request(
-            f"{_validated_base_url(self._definition, config.base_url)}/models",
-            headers=self._request_headers(config),
-            method="GET",
-        )
-        try:
-            parsed = json.loads(transport(request, timeout_seconds).decode("utf-8"))
-            data = parsed["data"]
-            if not isinstance(data, list):
-                raise TypeError("model data is not a list")
-            models = tuple(
-                sorted(
-                    item["id"].strip()
-                    for item in data
-                    if isinstance(item, dict)
-                    and isinstance(item.get("id"), str)
-                    and item["id"].strip()
-                )
+        base_url = _validated_base_url(self._definition, config.base_url)
+        collected: dict[str, None] = {}
+        after_id: str | None = None
+        for _page in range(ANTHROPIC_MODEL_PAGE_MAX):
+            query = f"?limit={ANTHROPIC_MODEL_PAGE_LIMIT}"
+            if after_id is not None:
+                query += f"&after_id={quote(after_id, safe='')}"
+            request = Request(
+                f"{base_url}/models{query}",
+                headers=self._request_headers(config),
+                method="GET",
             )
-        except HTTPError as error:
+            try:
+                parsed = json.loads(transport(request, timeout_seconds).decode("utf-8"))
+                data = parsed["data"]
+                if not isinstance(data, list):
+                    raise TypeError("model data is not a list")
+                for item in data:
+                    if isinstance(item, dict) and isinstance(item.get("id"), str):
+                        model_id = item["id"].strip()
+                        if model_id:
+                            collected[model_id] = None
+                has_more = parsed.get("has_more") is True
+                last_id = parsed.get("last_id")
+            except HTTPError as error:
+                raise ModelDiscoveryError(
+                    _redact(
+                        f"Anthropic returned HTTP {error.code} while listing models.",
+                        config.api_key,
+                    )
+                ) from error
+            except (URLError, TimeoutError, OSError) as error:
+                reason = getattr(error, "reason", error)
+                raise ModelDiscoveryError(
+                    f"Anthropic could not be reached: {reason}"
+                ) from error
+            except (KeyError, TypeError, json.JSONDecodeError) as error:
+                raise ModelDiscoveryError(
+                    "Anthropic returned an invalid model list."
+                ) from error
+            if not has_more:
+                break
+            if not isinstance(last_id, str) or not last_id.strip():
+                raise ModelDiscoveryError("Anthropic returned an invalid model page.")
+            after_id = last_id.strip()
+        else:
             raise ModelDiscoveryError(
-                _redact(
-                    f"Anthropic returned HTTP {error.code} while listing models.",
-                    config.api_key,
-                )
-            ) from error
-        except (URLError, TimeoutError, OSError) as error:
-            reason = getattr(error, "reason", error)
-            raise ModelDiscoveryError(
-                f"Anthropic could not be reached: {reason}"
-            ) from error
-        except (KeyError, TypeError, json.JSONDecodeError) as error:
-            raise ModelDiscoveryError(
-                "Anthropic returned an invalid model list."
-            ) from error
+                "Anthropic model listing exceeded the page limit."
+            )
+        models = tuple(sorted(collected))
         if not models:
             raise ModelDiscoveryError(
                 "Anthropic listed no models; enter a model ID manually under Advanced."
