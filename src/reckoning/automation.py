@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+import os
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from uuid import uuid4
 
 from reckoning.json_store import atomic_write_json, read_json
+
+
+class RoutineRunClaimConflict(RuntimeError):
+    """Another worker owns the active execution claim for this routine run."""
 
 RoutineProposalStatus = Literal["proposed", "confirmed", "superseded"]
 RoutineRunStatus = Literal["running", "success", "partial", "blocked", "failed"]
@@ -116,7 +123,50 @@ class AutomationRepository(Protocol):
 
     def list_proposals(self) -> tuple[RoutineProposal, ...]: ...
 
+    def create_proposal(
+        self, routine_id: str, build: Callable[[int], RoutineProposal]
+    ) -> RoutineProposal: ...
+
+    def revise_proposal(
+        self,
+        current_id: str,
+        build: Callable[[RoutineProposal, int], RoutineProposal],
+    ) -> RoutineProposal: ...
+
+    def confirm_proposal(self, proposal_id: str) -> RoutineProposal: ...
+
     def save_run(self, run: RoutineRun) -> None: ...
+
+    def start_run(self, run: RoutineRun) -> RoutineRun: ...
+
+    def claim_run(self, run_id: str, *, owner: str, claimed_at: datetime) -> int: ...
+
+    def release_run(self, run_id: str, owner: str) -> None: ...
+
+    def recover_run(
+        self,
+        run_id: str,
+        *,
+        expected_revision: int,
+        new_owner: str,
+        reason: str,
+        recovered_at: datetime,
+    ) -> int: ...
+
+    def run_revision(self, run_id: str) -> int: ...
+
+    def save_run_progress(
+        self, run: RoutineRun, *, owner: str, expected_revision: int
+    ) -> int: ...
+
+    def finalize_run(
+        self,
+        run: RoutineRun,
+        receipt: RoutineReceipt,
+        *,
+        owner: str,
+        expected_revision: int,
+    ) -> int: ...
 
     def get_run(self, run_id: str) -> RoutineRun: ...
 
@@ -132,6 +182,7 @@ class InMemoryAutomationRepository:
         self.proposals: dict[str, RoutineProposal] = {}
         self.runs: dict[str, RoutineRun] = {}
         self.receipts: dict[str, RoutineReceipt] = {}
+        self._claims: dict[str, list[object]] = {}
 
     def save_proposal(self, proposal: RoutineProposal) -> None:
         self.proposals[proposal.id] = proposal
@@ -150,8 +201,170 @@ class InMemoryAutomationRepository:
     def list_proposals(self) -> tuple[RoutineProposal, ...]:
         return tuple(self.proposals.values())
 
+    def create_proposal(
+        self, routine_id: str, build: Callable[[int], RoutineProposal]
+    ) -> RoutineProposal:
+        version = (
+            max(
+                (
+                    item.version
+                    for item in self.proposals.values()
+                    if item.routine_id == routine_id
+                ),
+                default=0,
+            )
+            + 1
+        )
+        proposal = build(version)
+        self.proposals[proposal.id] = proposal
+        return proposal
+
+    def revise_proposal(
+        self,
+        current_id: str,
+        build: Callable[[RoutineProposal, int], RoutineProposal],
+    ) -> RoutineProposal:
+        current = self.get_proposal(current_id)
+        if current.status != "confirmed":
+            raise ValueError("Only a confirmed routine contract can be revised.")
+        version = (
+            max(
+                (
+                    item.version
+                    for item in self.proposals.values()
+                    if item.routine_id == current.routine_id
+                ),
+                default=0,
+            )
+            + 1
+        )
+        candidate = build(current, version)
+        self.proposals[candidate.id] = candidate
+        return candidate
+
+    def confirm_proposal(self, proposal_id: str) -> RoutineProposal:
+        proposal = self.get_proposal(proposal_id)
+        if proposal.status != "proposed":
+            raise ValueError(f"Cannot confirm a {proposal.status} routine proposal.")
+        if proposal.supersedes_proposal_id is not None:
+            previous = self.proposals.get(proposal.supersedes_proposal_id)
+            if previous is not None and previous.status == "confirmed":
+                self.proposals[previous.id] = replace(previous, status="superseded")
+        for other in tuple(self.proposals.values()):
+            if (
+                other.routine_id == proposal.routine_id
+                and other.id != proposal.id
+                and other.status == "confirmed"
+            ):
+                self.proposals[other.id] = replace(other, status="superseded")
+        confirmed = replace(proposal, status="confirmed")
+        self.proposals[proposal.id] = confirmed
+        return confirmed
+
     def save_run(self, run: RoutineRun) -> None:
         self.runs[run.id] = run
+
+    def start_run(self, run: RoutineRun) -> RoutineRun:
+        existing = self.find_run_by_key(run.idempotency_key)
+        if existing is not None:
+            return existing
+        if run.id in self.runs:
+            raise ValueError(f"Routine run {run.id} already exists with another key.")
+        self.runs[run.id] = run
+        self._claims[run.id] = [None, "unclaimed", 1]
+        return run
+
+    def claim_run(self, run_id: str, *, owner: str, claimed_at: datetime) -> int:
+        del claimed_at
+        claim = self._claims.get(run_id)
+        if claim is None:
+            raise KeyError(f"Unknown routine run: {run_id}")
+        if claim[1] == "finalized":
+            raise RoutineRunClaimConflict(
+                f"Routine run {run_id} is already finalized."
+            )
+        if claim[1] == "active" and claim[0] != owner:
+            raise RoutineRunClaimConflict(
+                f"Routine run {run_id} is claimed by another worker."
+            )
+        claim[0] = owner
+        claim[1] = "active"
+        claim[2] = int(claim[2]) + 1
+        return int(claim[2])
+
+    def release_run(self, run_id: str, owner: str) -> None:
+        claim = self._claims.get(run_id)
+        if claim is not None and claim[0] == owner and claim[1] == "active":
+            claim[1] = "unclaimed"
+            claim[2] = int(claim[2]) + 1
+
+    def recover_run(
+        self,
+        run_id: str,
+        *,
+        expected_revision: int,
+        new_owner: str,
+        reason: str,
+        recovered_at: datetime,
+    ) -> int:
+        del reason, recovered_at
+        claim = self._claims.get(run_id)
+        if claim is None:
+            raise KeyError(f"Unknown routine run: {run_id}")
+        if int(claim[2]) != expected_revision:
+            raise RoutineRunClaimConflict(
+                f"Routine run {run_id} changed from revision "
+                f"{expected_revision} to {claim[2]}."
+            )
+        if claim[1] == "finalized":
+            raise RoutineRunClaimConflict(
+                f"Routine run {run_id} is already finalized."
+            )
+        claim[0] = new_owner
+        claim[1] = "active"
+        claim[2] = int(claim[2]) + 1
+        return int(claim[2])
+
+    def run_revision(self, run_id: str) -> int:
+        claim = self._claims.get(run_id)
+        if claim is None:
+            raise KeyError(f"Unknown routine run: {run_id}")
+        return int(claim[2])
+
+    def save_run_progress(
+        self, run: RoutineRun, *, owner: str, expected_revision: int
+    ) -> int:
+        claim = self._claims.get(run.id)
+        if claim is None:
+            raise KeyError(f"Unknown routine run: {run.id}")
+        if claim[0] != owner:
+            raise RoutineRunClaimConflict(
+                f"Routine run {run.id} is owned by another worker."
+            )
+        if int(claim[2]) != expected_revision:
+            raise RoutineRunClaimConflict(
+                f"Routine run {run.id} changed from revision "
+                f"{expected_revision} to {claim[2]}."
+            )
+        self.runs[run.id] = run
+        claim[2] = expected_revision + 1
+        return int(claim[2])
+
+    def finalize_run(
+        self,
+        run: RoutineRun,
+        receipt: RoutineReceipt,
+        *,
+        owner: str,
+        expected_revision: int,
+    ) -> int:
+        revision = self.save_run_progress(
+            run, owner=owner, expected_revision=expected_revision
+        )
+        self._claims[run.id][1] = "finalized"
+        self._claims[run.id][2] = revision + 1
+        self.receipts[receipt.run_id] = receipt
+        return revision + 1
 
     def get_run(self, run_id: str) -> RoutineRun:
         try:
@@ -172,47 +385,107 @@ class InMemoryAutomationRepository:
         return self.receipts.get(run_id)
 
 
-class JsonFileAutomationRepository(InMemoryAutomationRepository):
+class JsonFileAutomationRepository:
+    """Compatibility entry point backed by per-root SQLite transactions."""
+
     def __init__(self, path: Path) -> None:
-        super().__init__()
-        self._path = path
-        data = read_json(
-            path,
-            default={"schema_version": 1, "proposals": [], "runs": [], "receipts": []},
-        )
-        if data.get("schema_version") != 1:
-            raise RuntimeError("Unsupported automation storage schema.")
-        self.proposals = {
-            str(item["id"]): _proposal_from_data(item) for item in data["proposals"]
-        }
-        self.runs = {str(item["id"]): _run_from_data(item) for item in data["runs"]}
-        self.receipts = {
-            str(item["run_id"]): _receipt_from_data(item)
-            for item in data["receipts"]
-        }
+        from reckoning.automation_store import SQLiteAutomationRepository
+
+        self._delegate = SQLiteAutomationRepository(path)
+
+    @property
+    def database_path(self) -> Path:
+        return self._delegate.database_path
 
     def save_proposal(self, proposal: RoutineProposal) -> None:
-        super().save_proposal(proposal)
-        self._flush()
+        self._delegate.save_proposal(proposal)
+
+    def get_proposal(self, proposal_id: str) -> RoutineProposal:
+        return self._delegate.get_proposal(proposal_id)
+
+    def proposals_for(self, routine_id: str) -> tuple[RoutineProposal, ...]:
+        return self._delegate.proposals_for(routine_id)
+
+    def list_proposals(self) -> tuple[RoutineProposal, ...]:
+        return self._delegate.list_proposals()
+
+    def create_proposal(
+        self, routine_id: str, build: Callable[[int], RoutineProposal]
+    ) -> RoutineProposal:
+        return self._delegate.create_proposal(routine_id, build)
+
+    def revise_proposal(
+        self,
+        current_id: str,
+        build: Callable[[RoutineProposal, int], RoutineProposal],
+    ) -> RoutineProposal:
+        return self._delegate.revise_proposal(current_id, build)
+
+    def confirm_proposal(self, proposal_id: str) -> RoutineProposal:
+        return self._delegate.confirm_proposal(proposal_id)
 
     def save_run(self, run: RoutineRun) -> None:
-        super().save_run(run)
-        self._flush()
+        self._delegate.save_run(run)
+
+    def start_run(self, run: RoutineRun) -> RoutineRun:
+        return self._delegate.start_run(run)
+
+    def claim_run(self, run_id: str, *, owner: str, claimed_at: datetime) -> int:
+        return self._delegate.claim_run(run_id, owner=owner, claimed_at=claimed_at)
+
+    def release_run(self, run_id: str, owner: str) -> None:
+        self._delegate.release_run(run_id, owner)
+
+    def recover_run(
+        self,
+        run_id: str,
+        *,
+        expected_revision: int,
+        new_owner: str,
+        reason: str,
+        recovered_at: datetime,
+    ) -> int:
+        return self._delegate.recover_run(
+            run_id,
+            expected_revision=expected_revision,
+            new_owner=new_owner,
+            reason=reason,
+            recovered_at=recovered_at,
+        )
+
+    def run_revision(self, run_id: str) -> int:
+        return self._delegate.run_revision(run_id)
+
+    def save_run_progress(
+        self, run: RoutineRun, *, owner: str, expected_revision: int
+    ) -> int:
+        return self._delegate.save_run_progress(
+            run, owner=owner, expected_revision=expected_revision
+        )
+
+    def finalize_run(
+        self,
+        run: RoutineRun,
+        receipt: RoutineReceipt,
+        *,
+        owner: str,
+        expected_revision: int,
+    ) -> int:
+        return self._delegate.finalize_run(
+            run, receipt, owner=owner, expected_revision=expected_revision
+        )
+
+    def get_run(self, run_id: str) -> RoutineRun:
+        return self._delegate.get_run(run_id)
+
+    def find_run_by_key(self, idempotency_key: str) -> RoutineRun | None:
+        return self._delegate.find_run_by_key(idempotency_key)
 
     def save_receipt(self, receipt: RoutineReceipt) -> None:
-        super().save_receipt(receipt)
-        self._flush()
+        self._delegate.save_receipt(receipt)
 
-    def _flush(self) -> None:
-        atomic_write_json(
-            self._path,
-            {
-                "schema_version": 1,
-                "proposals": [_proposal_to_data(item) for item in self.proposals.values()],
-                "runs": [_run_to_data(item) for item in self.runs.values()],
-                "receipts": [_receipt_to_data(item) for item in self.receipts.values()],
-            },
-        )
+    def get_receipt(self, run_id: str) -> RoutineReceipt | None:
+        return self._delegate.get_receipt(run_id)
 
 
 class RoutineService:
@@ -269,41 +542,34 @@ class RoutineService:
         delegation_policy: str,
         failure_behavior: str,
     ) -> RoutineProposal:
-        previous = self._repository.proposals_for(routine_id)
-        proposal = RoutineProposal(
-            id=proposal_id,
-            routine_id=routine_id,
-            version=max((item.version for item in previous), default=0) + 1,
-            source_request=source_request.strip(),
-            created_at=created_at,
-            trigger=trigger.strip(),
-            source_scope=source_scope,
-            context_scope=context_scope,
-            tools=tools,
-            permissions=permissions,
-            delivery=delivery.strip(),
-            model_policy=model_policy.strip(),
-            cost_ceiling=cost_ceiling,
-            retry_limit=retry_limit,
-            delegation_policy=delegation_policy.strip(),
-            failure_behavior=failure_behavior.strip(),
-        )
-        self._validate_contract(proposal)
-        self._repository.save_proposal(proposal)
-        return proposal
+        def build(version: int) -> RoutineProposal:
+            proposal = RoutineProposal(
+                id=proposal_id,
+                routine_id=routine_id,
+                version=version,
+                source_request=source_request.strip(),
+                created_at=created_at,
+                trigger=trigger.strip(),
+                source_scope=source_scope,
+                context_scope=context_scope,
+                tools=tools,
+                permissions=permissions,
+                delivery=delivery.strip(),
+                model_policy=model_policy.strip(),
+                cost_ceiling=cost_ceiling,
+                retry_limit=retry_limit,
+                delegation_policy=delegation_policy.strip(),
+                failure_behavior=failure_behavior.strip(),
+            )
+            self._validate_contract(proposal)
+            return proposal
+
+        return self._repository.create_proposal(routine_id, build)
 
     def confirm(self, proposal_id: str) -> RoutineProposal:
         proposal = self._repository.get_proposal(proposal_id)
         self._validate_contract(proposal)
-        if proposal.status != "proposed":
-            raise ValueError(f"Cannot confirm a {proposal.status} routine proposal.")
-        if proposal.supersedes_proposal_id is not None:
-            previous = self._repository.get_proposal(proposal.supersedes_proposal_id)
-            if previous.status == "confirmed":
-                self._repository.save_proposal(replace(previous, status="superseded"))
-        confirmed = replace(proposal, status="confirmed")
-        self._repository.save_proposal(confirmed)
-        return confirmed
+        return self._repository.confirm_proposal(proposal_id)
 
     def revise(
         self,
@@ -313,9 +579,6 @@ class RoutineService:
         created_at: datetime,
         changes: dict[str, Any],
     ) -> RoutineProposal:
-        current = self._repository.get_proposal(confirmed_proposal_id)
-        if current.status != "confirmed":
-            raise ValueError("Only a confirmed routine contract can be revised.")
         allowed_changes = {
             "source_request",
             "trigger",
@@ -335,18 +598,21 @@ class RoutineService:
                 "Routine revision contains unsupported fields: "
                 + ", ".join(sorted(unknown))
             )
-        candidate = replace(
-            current,
-            **changes,
-            id=proposal_id,
-            version=current.version + 1,
-            created_at=created_at,
-            status="proposed",
-            supersedes_proposal_id=current.id,
-        )
-        self._validate_contract(candidate)
-        self._repository.save_proposal(candidate)
-        return candidate
+
+        def build(current: RoutineProposal, version: int) -> RoutineProposal:
+            candidate = replace(
+                current,
+                **changes,
+                id=proposal_id,
+                version=version,
+                created_at=created_at,
+                status="proposed",
+                supersedes_proposal_id=current.id,
+            )
+            self._validate_contract(candidate)
+            return candidate
+
+        return self._repository.revise_proposal(confirmed_proposal_id, build)
 
     @staticmethod
     def _validate_contract(proposal: RoutineProposal) -> None:
@@ -423,8 +689,7 @@ class RoutineService:
         ):
             raise PermissionError("The confirmed routine policy does not allow a model step.")
         run = RoutineRun(run_id, proposal_id, scheduled_for, idempotency_key, steps)
-        self._repository.save_run(run)
-        return run
+        return self._repository.start_run(run)
 
     def resume_run(
         self,
@@ -433,83 +698,106 @@ class RoutineService:
         deterministic_executor: StepExecutor,
         model_executor: StepExecutor | None,
         completed_at: datetime,
+        worker: str | None = None,
     ) -> RoutineReceipt:
         existing_receipt = self._repository.get_receipt(run_id)
         if existing_receipt is not None:
             return existing_receipt
-        run = self._repository.get_run(run_id)
-        proposal = self._repository.get_proposal(run.proposal_id)
-        results = list(run.results)
-        total_cost = sum(item.cost_units for item in results)
+        owner = worker or _run_owner()
+        revision = self._repository.claim_run(
+            run_id, owner=owner, claimed_at=completed_at
+        )
+        try:
+            run = self._repository.get_run(run_id)
+            proposal = self._repository.get_proposal(run.proposal_id)
+            results = list(run.results)
+            total_cost = sum(item.cost_units for item in results)
 
-        for index in range(run.current_step, len(run.steps)):
-            step = run.steps[index]
-            executor = deterministic_executor if step.kind == "deterministic" else model_executor
-            max_attempts = proposal.retry_limit + 1
-            step_result: StepResult | None = None
-            while run.current_step_attempts < max_attempts:
-                if executor is None:
-                    step_result = StepResult("failed", "No model executor is configured.")
-                    break
-                quoted_cost = _quote_step_cost(executor, step)
-                if total_cost + quoted_cost > proposal.cost_ceiling:
-                    step_result = StepResult(
-                        "blocked", "Routine cost ceiling would be exceeded."
+            for index in range(run.current_step, len(run.steps)):
+                step = run.steps[index]
+                executor = (
+                    deterministic_executor
+                    if step.kind == "deterministic"
+                    else model_executor
+                )
+                max_attempts = proposal.retry_limit + 1
+                step_result: StepResult | None = None
+                while run.current_step_attempts < max_attempts:
+                    if executor is None:
+                        step_result = StepResult(
+                            "failed", "No model executor is configured."
+                        )
+                        break
+                    quoted_cost = _quote_step_cost(executor, step)
+                    if total_cost + quoted_cost > proposal.cost_ceiling:
+                        step_result = StepResult(
+                            "blocked", "Routine cost ceiling would be exceeded."
+                        )
+                        break
+                    run = replace(
+                        run,
+                        attempts=run.attempts + 1,
+                        current_step_attempts=run.current_step_attempts + 1,
                     )
-                    break
+                    revision = self._repository.save_run_progress(
+                        run, owner=owner, expected_revision=revision
+                    )
+                    try:
+                        step_result = executor.execute(
+                            step, f"{run.idempotency_key}:{step.id}"
+                        )
+                        if (
+                            step_result.cost_units > quoted_cost
+                            or total_cost + step_result.cost_units
+                            > proposal.cost_ceiling
+                        ):
+                            step_result = StepResult(
+                                "blocked",
+                                "Routine executor exceeded its preflight cost quote.",
+                                cost_units=step_result.cost_units,
+                                model_calls=step_result.model_calls,
+                            )
+                        break
+                    except InterruptedError:
+                        raise
+                    except Exception as error:  # adapter failures become evidence
+                        step_result = StepResult("failed", str(error))
+                if step_result is None:
+                    step_result = StepResult("failed", "Retry limit exhausted.")
+                total_cost += step_result.cost_units
+                results.append(step_result)
                 run = replace(
                     run,
-                    attempts=run.attempts + 1,
-                    current_step_attempts=run.current_step_attempts + 1,
+                    current_step=index + 1,
+                    current_step_attempts=0,
+                    results=tuple(results),
                 )
-                self._repository.save_run(run)
-                try:
-                    step_result = executor.execute(
-                        step, f"{run.idempotency_key}:{step.id}"
-                    )
-                    if (
-                        step_result.cost_units > quoted_cost
-                        or total_cost + step_result.cost_units
-                        > proposal.cost_ceiling
-                    ):
-                        step_result = StepResult(
-                            "blocked",
-                            "Routine executor exceeded its preflight cost quote.",
-                            cost_units=step_result.cost_units,
-                            model_calls=step_result.model_calls,
-                        )
+                revision = self._repository.save_run_progress(
+                    run, owner=owner, expected_revision=revision
+                )
+                if step_result.status in ("blocked", "failed"):
                     break
-                except InterruptedError:
-                    raise
-                except Exception as error:  # adapter failures become bounded evidence
-                    step_result = StepResult("failed", str(error))
-            if step_result is None:
-                step_result = StepResult("failed", "Retry limit exhausted.")
-            total_cost += step_result.cost_units
-            results.append(step_result)
-            run = replace(
-                run,
-                current_step=index + 1,
-                current_step_attempts=0,
-                results=tuple(results),
-            )
-            self._repository.save_run(run)
-            if step_result.status in ("blocked", "failed"):
-                break
 
-        status = _aggregate_run_status(tuple(results), len(run.steps))
-        terminal = replace(run, status=status, results=tuple(results))
-        self._repository.save_run(terminal)
-        receipt = RoutineReceipt(
-            run.id,
-            run.proposal_id,
-            status,
-            completed_at,
-            run.attempts,
-            tuple(results),
-        )
-        self._repository.save_receipt(receipt)
-        return receipt
+            status = _aggregate_run_status(tuple(results), len(run.steps))
+            terminal = replace(run, status=status, results=tuple(results))
+            receipt = RoutineReceipt(
+                run.id,
+                run.proposal_id,
+                status,
+                completed_at,
+                run.attempts,
+                tuple(results),
+            )
+            self._repository.finalize_run(
+                terminal,
+                receipt,
+                owner=owner,
+                expected_revision=revision,
+            )
+            return receipt
+        except BaseException:
+            self._repository.release_run(run_id, owner)
+            raise
 
     def inspect_run(self, run_id: str) -> RoutineRun:
         return self._repository.get_run(run_id)
@@ -847,6 +1135,10 @@ def _aggregate_run_status(
     if len(results) < total_steps or any(item.status == "partial" for item in results):
         return "partial"
     return "success"
+
+
+def _run_owner() -> str:
+    return f"{os.getpid()}-{uuid4().hex}"
 
 
 def _quote_step_cost(executor: StepExecutor, step: RoutineStep) -> int:

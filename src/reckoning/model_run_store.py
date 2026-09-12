@@ -213,6 +213,9 @@ def snapshot_database(path: Path) -> bytes:
 
 
 def validate_database(path: Path) -> None:
+    from reckoning.automation_store import validate_automation_schema
+    from reckoning.external_write_store import validate_external_write_schema
+    from reckoning.interface_store import validate_interface_schema
     from reckoning.persistence import validate_continuity_schema
     from reckoning.personal_context import validate_personal_context_schema
     from reckoning.telegram_delivery import validate_telegram_delivery_schema
@@ -239,6 +242,9 @@ def validate_database(path: Path) -> None:
             validate_continuity_schema(connection)
             validate_personal_context_schema(connection)
             validate_telegram_delivery_schema(connection)
+            validate_external_write_schema(connection)
+            validate_interface_schema(connection)
+            validate_automation_schema(connection)
             validate_trial_schema(connection)
         finally:
             connection.close()

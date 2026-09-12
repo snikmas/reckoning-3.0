@@ -6,7 +6,7 @@ from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from reckoning.json_store import atomic_write_json, read_json
+
 
 
 ChannelName = Literal["terminal", "web", "telegram"]
@@ -187,45 +187,359 @@ class InterfaceState:
     sessions: tuple[ChannelSession, ...] = ()
 
 
+class InterfaceSessionConflict(RuntimeError):
+    def __init__(
+        self, channel: str, session_id: str, expected: int, actual: int
+    ) -> None:
+        super().__init__(
+            f"Interface session {channel}:{session_id} changed from revision "
+            f"{expected} to {actual}."
+        )
+        self.channel = channel
+        self.session_id = session_id
+        self.expected = expected
+        self.actual = actual
+
+
+class InterfaceProjectionConflict(RuntimeError):
+    def __init__(self, projection: str, expected: int, actual: int) -> None:
+        super().__init__(
+            f"Interface projection {projection} changed from revision "
+            f"{expected} to {actual}."
+        )
+        self.projection = projection
+        self.expected = expected
+        self.actual = actual
+
+
+def _find_session(
+    state: InterfaceState, channel: ChannelName, session_id: str
+) -> ChannelSession:
+    return next(
+        (
+            item
+            for item in state.sessions
+            if item.channel == channel and item.session_id == session_id
+        ),
+        ChannelSession(channel, session_id),
+    )
+
+
 class InterfaceRepository(Protocol):
     def load(self) -> InterfaceState: ...
 
     def save(self, state: InterfaceState) -> None: ...
 
+    def session_revision(self, channel: ChannelName, session_id: str) -> int: ...
+
+    def projection_revision(self, projection: str) -> int: ...
+
+    def append_completed_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+        *,
+        expected_revision: int,
+    ) -> ChannelSession: ...
+
+    def append_messages(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        messages: tuple[ChannelMessage, ...],
+        *,
+        expected_revision: int,
+        returning_user: bool = False,
+    ) -> ChannelSession: ...
+
+    def set_activity(
+        self,
+        activity: ActivityState,
+        *,
+        channel: ChannelName | str = "",
+        session_id: str = "",
+    ) -> None: ...
+
+    def set_returning_user(self) -> None: ...
+
+    def add_pending_approval(self, approval_id: str) -> None: ...
+
+    def resolve_approval(
+        self, approval_id: str, *, expected_revision: int | None = None
+    ) -> bool: ...
+
+    def replace_projection(
+        self, projection: str, values: tuple[str, ...], *, expected_revision: int
+    ) -> None: ...
+
+    def record_operational_run(
+        self,
+        receipt: RunReceipt,
+        *,
+        failure: OperationalFailure | None = None,
+        expected_revision: int | None = None,
+    ) -> None: ...
+
 
 class InMemoryInterfaceRepository:
     def __init__(self, state: InterfaceState | None = None) -> None:
         self._state = state or InterfaceState()
+        self._session_revisions: dict[tuple[str, str], int] = {
+            (session.channel, session.session_id): 1
+            for session in self._state.sessions
+        }
+        self._projection_revisions: dict[str, int] = {}
+        self._approval_revisions: dict[str, int] = {
+            approval_id: 1 for approval_id in self._state.pending_approvals
+        }
 
     def load(self) -> InterfaceState:
         return self._state
 
     def save(self, state: InterfaceState) -> None:
         self._state = state
+        self._session_revisions = {
+            (session.channel, session.session_id): 1 for session in state.sessions
+        }
+        self._projection_revisions = {}
+        self._approval_revisions = {
+            approval_id: 1 for approval_id in state.pending_approvals
+        }
+
+    def session_revision(self, channel: ChannelName, session_id: str) -> int:
+        return self._session_revisions.get((channel, session_id), 0)
+
+    def projection_revision(self, projection: str) -> int:
+        return self._projection_revisions.get(projection, 0)
+
+    def append_completed_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+        *,
+        expected_revision: int,
+    ) -> ChannelSession:
+        return self.append_messages(
+            channel,
+            session_id,
+            (
+                ChannelMessage("user", user_text),
+                ChannelMessage("assistant", assistant_text),
+            ),
+            expected_revision=expected_revision,
+            returning_user=True,
+        )
+
+    def append_messages(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        messages: tuple[ChannelMessage, ...],
+        *,
+        expected_revision: int,
+        returning_user: bool = False,
+    ) -> ChannelSession:
+        actual = self.session_revision(channel, session_id)
+        if actual != expected_revision:
+            raise InterfaceSessionConflict(
+                channel, session_id, expected_revision, actual
+            )
+        existing = _find_session(self._state, channel, session_id)
+        combined = existing.messages + messages
+        sessions = tuple(
+            session
+            for session in self._state.sessions
+            if not (
+                session.channel == channel and session.session_id == session_id
+            )
+        ) + (ChannelSession(channel, session_id, combined),)
+        self._state = replace(
+            self._state,
+            sessions=sessions,
+            returning_user=self._state.returning_user or returning_user,
+        )
+        self._session_revisions[(channel, session_id)] = actual + 1
+        return ChannelSession(channel, session_id, combined)
+
+    def set_activity(
+        self,
+        activity: ActivityState,
+        *,
+        channel: ChannelName | str = "",
+        session_id: str = "",
+    ) -> None:
+        del channel, session_id
+        self._state = replace(self._state, activity=activity)
+
+    def set_returning_user(self) -> None:
+        self._state = replace(self._state, returning_user=True)
+
+    def add_pending_approval(self, approval_id: str) -> None:
+        if approval_id in self._approval_revisions:
+            return
+        self._state = replace(
+            self._state, pending_approvals=self._state.pending_approvals + (approval_id,)
+        )
+        self._approval_revisions[approval_id] = 1
+
+    def resolve_approval(
+        self, approval_id: str, *, expected_revision: int | None = None
+    ) -> bool:
+        if approval_id not in self._approval_revisions:
+            return False
+        if (
+            expected_revision is not None
+            and self._approval_revisions[approval_id] != expected_revision
+        ):
+            raise InterfaceProjectionConflict(
+                approval_id, expected_revision, self._approval_revisions[approval_id]
+            )
+        self._state = replace(
+            self._state,
+            pending_approvals=tuple(
+                item for item in self._state.pending_approvals if item != approval_id
+            ),
+        )
+        del self._approval_revisions[approval_id]
+        return True
+
+    def replace_projection(
+        self, projection: str, values: tuple[str, ...], *, expected_revision: int
+    ) -> None:
+        actual = self.projection_revision(projection)
+        if actual != expected_revision:
+            raise InterfaceProjectionConflict(projection, expected_revision, actual)
+        self._state = replace(self._state, **{projection: tuple(values)})
+        self._projection_revisions[projection] = actual + 1
+
+    def record_operational_run(
+        self,
+        receipt: RunReceipt,
+        *,
+        failure: OperationalFailure | None = None,
+        expected_revision: int | None = None,
+    ) -> None:
+        del expected_revision
+        if failure is not None and failure.run_id != receipt.id:
+            raise ValueError("An operational failure must identify the same run.")
+        receipts = tuple(
+            item for item in self._state.receipts if item.id != receipt.id
+        ) + (receipt,)
+        failures = tuple(
+            item for item in self._state.failures if item.run_id != receipt.id
+        )
+        if failure is not None:
+            failures += (failure,)
+        self._state = replace(
+            self._state,
+            activity="idle",
+            receipts=receipts,
+            failures=failures,
+        )
 
 
 class JsonFileInterfaceRepository:
-    """Durable shared state for the interface slice."""
+    """Compatibility entry point backed by per-root SQLite transactions."""
 
     def __init__(self, path: Path) -> None:
-        self._path = path
+        from reckoning.interface_store import SQLiteInterfaceRepository
+
+        self._delegate = SQLiteInterfaceRepository(path)
+
+    @property
+    def database_path(self) -> Path:
+        return self._delegate.database_path
 
     def load(self) -> InterfaceState:
-        data = read_json(
-            self._path,
-            default={"schema_version": 1, "state": {}},
-        )
-        if data.get("schema_version") != 1 or not isinstance(data.get("state"), dict):
-            raise RuntimeError("Unsupported interface storage schema.")
-        try:
-            return _state_from_data(data["state"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise RuntimeError("Interface storage is invalid.") from error
+        return self._delegate.load()
 
     def save(self, state: InterfaceState) -> None:
-        atomic_write_json(
-            self._path,
-            {"schema_version": 1, "state": _state_to_data(state)},
+        self._delegate.save(state)
+
+    def session_revision(self, channel: ChannelName, session_id: str) -> int:
+        return self._delegate.session_revision(channel, session_id)
+
+    def projection_revision(self, projection: str) -> int:
+        return self._delegate.projection_revision(projection)
+
+    def append_completed_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+        *,
+        expected_revision: int,
+    ) -> ChannelSession:
+        return self._delegate.append_completed_turn(
+            channel,
+            session_id,
+            user_text,
+            assistant_text,
+            expected_revision=expected_revision,
+        )
+
+    def append_messages(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        messages: tuple[ChannelMessage, ...],
+        *,
+        expected_revision: int,
+        returning_user: bool = False,
+    ) -> ChannelSession:
+        return self._delegate.append_messages(
+            channel,
+            session_id,
+            messages,
+            expected_revision=expected_revision,
+            returning_user=returning_user,
+        )
+
+    def set_activity(
+        self,
+        activity: ActivityState,
+        *,
+        channel: ChannelName | str = "",
+        session_id: str = "",
+    ) -> None:
+        self._delegate.set_activity(
+            activity, channel=channel, session_id=session_id
+        )
+
+    def set_returning_user(self) -> None:
+        self._delegate.set_returning_user()
+
+    def add_pending_approval(self, approval_id: str) -> None:
+        self._delegate.add_pending_approval(approval_id)
+
+    def resolve_approval(
+        self, approval_id: str, *, expected_revision: int | None = None
+    ) -> bool:
+        return self._delegate.resolve_approval(
+            approval_id, expected_revision=expected_revision
+        )
+
+    def replace_projection(
+        self, projection: str, values: tuple[str, ...], *, expected_revision: int
+    ) -> None:
+        self._delegate.replace_projection(
+            projection, values, expected_revision=expected_revision
+        )
+
+    def record_operational_run(
+        self,
+        receipt: RunReceipt,
+        *,
+        failure: OperationalFailure | None = None,
+        expected_revision: int | None = None,
+    ) -> None:
+        self._delegate.record_operational_run(
+            receipt, failure=failure, expected_revision=expected_revision
         )
 
 
@@ -393,7 +707,7 @@ class ReckoningInterfaceApplication:
         return "home" if self._repository.load().returning_user else "simon"
 
     def set_activity(self, activity: ActivityState) -> None:
-        self._repository.save(replace(self._repository.load(), activity=activity))
+        self._repository.set_activity(activity)
 
     def record_operational_run(
         self,
@@ -402,21 +716,7 @@ class ReckoningInterfaceApplication:
         failure: OperationalFailure | None = None,
     ) -> None:
         """Publish one durable operational record to Control and Simon."""
-        state = self._repository.load()
-        receipts = tuple(item for item in state.receipts if item.id != receipt.id)
-        failures = tuple(item for item in state.failures if item.run_id != receipt.id)
-        if failure is not None:
-            if failure.run_id != receipt.id:
-                raise ValueError("An operational failure must identify the same run.")
-            failures += (failure,)
-        self._repository.save(
-            replace(
-                state,
-                activity="idle",
-                receipts=receipts + (receipt,),
-                failures=failures,
-            )
-        )
+        self._repository.record_operational_run(receipt, failure=failure)
 
     def home(self) -> HomeView:
         state = self._repository.load()
@@ -459,7 +759,10 @@ class ReckoningInterfaceApplication:
         if not message:
             raise ValueError("A message cannot be empty.")
         state = self._repository.load()
-        self._repository.save(replace(state, activity="listening"))
+        expected_revision = self._repository.session_revision(channel, session_id)
+        self._repository.set_activity(
+            "listening", channel=channel, session_id=session_id
+        )
         try:
             categories = (
                 self._placement.required_categories
@@ -488,8 +791,8 @@ class ReckoningInterfaceApplication:
                 confirmed_state_category is None
                 or confirmed_state_category in placement.available_categories
             )
-            self._repository.save(
-                replace(self._repository.load(), activity="reasoning")
+            self._repository.set_activity(
+                "reasoning", channel=channel, session_id=session_id
             )
             response = self._responder.respond(
                 ChannelRequest(
@@ -515,18 +818,20 @@ class ReckoningInterfaceApplication:
             if placement.status == "limited":
                 response = f"{placement.notice} {response}"
 
-            messages = history + (
-                ChannelMessage("user", message),
-                ChannelMessage("assistant", response),
+            self._repository.append_completed_turn(
+                channel,
+                session_id,
+                message,
+                response,
+                expected_revision=expected_revision,
             )
-            current_state = replace(
-                self._repository.load(), returning_user=True, activity="idle"
+            self._repository.set_activity(
+                "idle", channel=channel, session_id=session_id
             )
-            self._save_session(current_state, channel, session_id, messages)
             return ChannelReply(response, placement)
         except Exception:
-            self._repository.save(
-                replace(self._repository.load(), activity="idle")
+            self._repository.set_activity(
+                "idle", channel=channel, session_id=session_id
             )
             raise
 
@@ -562,18 +867,7 @@ class ReckoningInterfaceApplication:
     def confirm(self, confirmation_id: str) -> bool:
         if self._confirmations.confirm(confirmation_id):
             return True
-        state = self._repository.load()
-        if confirmation_id not in state.pending_approvals:
-            return False
-        self._repository.save(
-            replace(
-                state,
-                pending_approvals=tuple(
-                    item for item in state.pending_approvals if item != confirmation_id
-                ),
-            )
-        )
-        return True
+        return self._repository.resolve_approval(confirmation_id)
 
     def deliver_routine(
         self,
@@ -585,14 +879,12 @@ class ReckoningInterfaceApplication:
         content = text.strip()
         if not content:
             raise ValueError("A routine delivery cannot be empty.")
-        state = self._repository.load()
-        session = self._session(state, channel, session_id)
         delivered = ChannelMessage("assistant", content)
-        self._save_session(
-            state,
+        self._repository.append_messages(
             channel,
             session_id,
-            session.messages + (delivered,),
+            (delivered,),
+            expected_revision=self._repository.session_revision(channel, session_id),
         )
         return delivered
 
@@ -723,26 +1015,6 @@ class ReckoningInterfaceApplication:
             ),
             ChannelSession(channel, session_id),
         )
-
-    def _save_session(
-        self,
-        state: InterfaceState,
-        channel: ChannelName,
-        session_id: str,
-        messages: tuple[ChannelMessage, ...],
-    ) -> None:
-        sessions = tuple(
-            item
-            for item in state.sessions
-            if not (item.channel == channel and item.session_id == session_id)
-        )
-        self._repository.save(
-            replace(
-                state,
-                sessions=sessions + (ChannelSession(channel, session_id, messages),),
-            )
-        )
-
 
 def create_local_interface_application(
     application: MessageApplication,
