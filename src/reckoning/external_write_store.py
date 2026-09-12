@@ -492,10 +492,12 @@ class SQLiteExternalWriteRepository:
             ).fetchall()
             return tuple(
                 _with_approval(
-                    _select_prepared(connection, str(row[0])),
+                    prepared,
                     _active_approval_id(connection, str(row[0])),
                 )
                 for row in rows
+                if (prepared := _select_prepared(connection, str(row[0])))
+                is not None
             )
 
     def approve_exact(
@@ -548,7 +550,9 @@ class SQLiteExternalWriteRepository:
                 "SELECT approval_id FROM external_write_approvals ORDER BY rowid"
             ).fetchall()
             return tuple(
-                _select_approval(connection, str(row[0])) for row in rows
+                record
+                for row in rows
+                if (record := _select_approval(connection, str(row[0]))) is not None
             )
 
     def authorization(self, prepared: PreparedWrite) -> WriteAuthorization | None:
@@ -622,7 +626,9 @@ class SQLiteExternalWriteRepository:
                 "ORDER BY rowid"
             ).fetchall()
             return tuple(
-                _select_permission(connection, str(row[0])) for row in rows
+                record
+                for row in rows
+                if (record := _select_permission(connection, str(row[0]))) is not None
             )
 
     def revoke_permission(
@@ -661,7 +667,9 @@ class SQLiteExternalWriteRepository:
                 "SELECT write_id FROM external_write_receipts ORDER BY rowid"
             ).fetchall()
             return tuple(
-                _select_receipt(connection, str(row[0])) for row in rows
+                record
+                for row in rows
+                if (record := _select_receipt(connection, str(row[0]))) is not None
             )
 
     def claim_execution(

@@ -271,7 +271,7 @@ def _grant_to_data(grant: ProcessingGrant) -> dict[str, object]:
 def _grant_from_data(data: dict[str, object]) -> ProcessingGrant:
     try:
         destination_id = str(data["destination_id"]).strip()
-        version = int(data["version"])
+        version = int(str(data["version"]))
         raw_allowed = data["allowed_categories"]
         if not isinstance(raw_allowed, list):
             raise TypeError("allowed categories are not a list")

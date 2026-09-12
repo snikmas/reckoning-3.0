@@ -79,9 +79,12 @@ def _probe_interfaces(root: Path) -> dict[str, object]:
         f"{session.channel}:{session.session_id}"
         for session in JsonFileInterfaceRepository(path).load().sessions
     ]
+    expected = ["web:web-session", "telegram:telegram-session"]
     return {
-        "result": "lost-update-confirmed",
-        "expected": ["web:web-session", "telegram:telegram-session"],
+        "result": (
+            "preserved" if surviving == expected else "lost-update-confirmed"
+        ),
+        "expected": expected,
         "surviving": surviving,
     }
 
@@ -100,9 +103,14 @@ def _probe_automation(root: Path) -> dict[str, object]:
         item.id: item.status
         for item in current.list_proposals()
     }
+    expected = {"routine-a": "confirmed", "routine-b": "confirmed"}
     return {
-        "result": "confirmed-authority-rollback",
-        "expected": {"routine-a": "confirmed", "routine-b": "confirmed"},
+        "result": (
+            "preserved"
+            if statuses == expected
+            else "confirmed-authority-rollback"
+        ),
+        "expected": expected,
         "observed": statuses,
     }
 
@@ -197,16 +205,24 @@ def _probe_external_writes(root: Path) -> dict[str, object]:
         SyntheticAdapter(),
         completed_at=NOW,
     )
+    revoked_restored = (
+        getattr(authority_result, "authorization_kind", None)
+        == "standing_permission"
+    )
+    failed = (
+        surviving != ["write-a", "write-b"]
+        or unexpectedly_pending != []
+        or revoked_restored
+    )
     return {
-        "result": "lost-update-and-authority-rollback",
+        "result": (
+            "preserved" if not failed else "lost-update-and-authority-rollback"
+        ),
         "expected_prepared": ["write-a", "write-b"],
         "surviving_prepared": surviving,
         "expected_pending_after_two_approvals": [],
         "observed_pending_after_two_approvals": unexpectedly_pending,
-        "revoked_permission_restored": (
-            getattr(authority_result, "authorization_kind", None)
-            == "standing_permission"
-        ),
+        "revoked_permission_restored": revoked_restored,
     }
 
 

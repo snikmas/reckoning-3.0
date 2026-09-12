@@ -478,10 +478,12 @@ class ExternalWriteService:
 
     def __init__(self, path: Path | None = None) -> None:
         from reckoning.external_write_store import (
+            ExternalWriteRepository,
             InMemoryExternalWriteRepository,
             SQLiteExternalWriteRepository,
         )
 
+        self._repository: ExternalWriteRepository
         if path is None:
             self._repository = InMemoryExternalWriteRepository()
         else:

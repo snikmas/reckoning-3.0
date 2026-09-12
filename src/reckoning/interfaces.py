@@ -413,7 +413,9 @@ class InMemoryInterfaceRepository:
         actual = self.projection_revision(projection)
         if actual != expected_revision:
             raise InterfaceProjectionConflict(projection, expected_revision, actual)
-        self._state = replace(self._state, **{projection: tuple(values)})
+        self._state = replace(
+            self._state, **{projection: tuple(values)}  # type: ignore[arg-type]
+        )
         self._projection_revisions[projection] = actual + 1
 
     def record_operational_run(

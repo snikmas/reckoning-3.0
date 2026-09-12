@@ -18,7 +18,6 @@ from reckoning.automation import (
     _proposal_from_data,
     _proposal_to_data,
     _receipt_from_data,
-    _receipt_to_data,
     _run_from_data,
     _run_to_data,
 )
@@ -141,7 +140,10 @@ class SQLiteAutomationRepository:
                 "SELECT proposal_id FROM routine_proposals ORDER BY rowid"
             ).fetchall()
             return tuple(
-                _select_proposal(connection, str(row[0])) for row in rows
+                proposal
+                for row in rows
+                if (proposal := _select_proposal(connection, str(row[0])))
+                is not None
             )
 
     def save_proposal(self, proposal: RoutineProposal) -> None:
@@ -370,7 +372,11 @@ class SQLiteAutomationRepository:
             rows = connection.execute(
                 "SELECT run_id FROM routine_runs ORDER BY rowid"
             ).fetchall()
-            return tuple(_select_run(connection, str(row[0])) for row in rows)
+            return tuple(
+                run
+                for row in rows
+                if (run := _select_run(connection, str(row[0]))) is not None
+            )
 
     def save_run(self, run: RoutineRun) -> None:
         with closing(connect_database(self._path)) as connection:
@@ -396,7 +402,10 @@ class SQLiteAutomationRepository:
                 "SELECT run_id FROM routine_receipts ORDER BY rowid"
             ).fetchall()
             return tuple(
-                _select_receipt(connection, str(row[0])) for row in rows
+                receipt
+                for row in rows
+                if (receipt := _select_receipt(connection, str(row[0])))
+                is not None
             )
 
     def save_receipt(self, receipt: RoutineReceipt) -> None:

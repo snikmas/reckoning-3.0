@@ -177,12 +177,19 @@ class AutomationRepository(Protocol):
     def get_receipt(self, run_id: str) -> RoutineReceipt | None: ...
 
 
+@dataclass
+class _RunClaim:
+    owner: str | None
+    state: str
+    revision: int
+
+
 class InMemoryAutomationRepository:
     def __init__(self) -> None:
         self.proposals: dict[str, RoutineProposal] = {}
         self.runs: dict[str, RoutineRun] = {}
         self.receipts: dict[str, RoutineReceipt] = {}
-        self._claims: dict[str, list[object]] = {}
+        self._claims: dict[str, _RunClaim] = {}
 
     def save_proposal(self, proposal: RoutineProposal) -> None:
         self.proposals[proposal.id] = proposal
@@ -271,7 +278,7 @@ class InMemoryAutomationRepository:
         if run.id in self.runs:
             raise ValueError(f"Routine run {run.id} already exists with another key.")
         self.runs[run.id] = run
-        self._claims[run.id] = [None, "unclaimed", 1]
+        self._claims[run.id] = _RunClaim(None, "unclaimed", 1)
         return run
 
     def claim_run(self, run_id: str, *, owner: str, claimed_at: datetime) -> int:
@@ -279,24 +286,24 @@ class InMemoryAutomationRepository:
         claim = self._claims.get(run_id)
         if claim is None:
             raise KeyError(f"Unknown routine run: {run_id}")
-        if claim[1] == "finalized":
+        if claim.state == "finalized":
             raise RoutineRunClaimConflict(
                 f"Routine run {run_id} is already finalized."
             )
-        if claim[1] == "active" and claim[0] != owner:
+        if claim.state == "active" and claim.owner != owner:
             raise RoutineRunClaimConflict(
                 f"Routine run {run_id} is claimed by another worker."
             )
-        claim[0] = owner
-        claim[1] = "active"
-        claim[2] = int(claim[2]) + 1
-        return int(claim[2])
+        claim.owner = owner
+        claim.state = "active"
+        claim.revision += 1
+        return claim.revision
 
     def release_run(self, run_id: str, owner: str) -> None:
         claim = self._claims.get(run_id)
-        if claim is not None and claim[0] == owner and claim[1] == "active":
-            claim[1] = "unclaimed"
-            claim[2] = int(claim[2]) + 1
+        if claim is not None and claim.owner == owner and claim.state == "active":
+            claim.state = "unclaimed"
+            claim.revision += 1
 
     def recover_run(
         self,
@@ -311,25 +318,25 @@ class InMemoryAutomationRepository:
         claim = self._claims.get(run_id)
         if claim is None:
             raise KeyError(f"Unknown routine run: {run_id}")
-        if int(claim[2]) != expected_revision:
+        if claim.revision != expected_revision:
             raise RoutineRunClaimConflict(
                 f"Routine run {run_id} changed from revision "
-                f"{expected_revision} to {claim[2]}."
+                f"{expected_revision} to {claim.revision}."
             )
-        if claim[1] == "finalized":
+        if claim.state == "finalized":
             raise RoutineRunClaimConflict(
                 f"Routine run {run_id} is already finalized."
             )
-        claim[0] = new_owner
-        claim[1] = "active"
-        claim[2] = int(claim[2]) + 1
-        return int(claim[2])
+        claim.owner = new_owner
+        claim.state = "active"
+        claim.revision += 1
+        return claim.revision
 
     def run_revision(self, run_id: str) -> int:
         claim = self._claims.get(run_id)
         if claim is None:
             raise KeyError(f"Unknown routine run: {run_id}")
-        return int(claim[2])
+        return claim.revision
 
     def save_run_progress(
         self, run: RoutineRun, *, owner: str, expected_revision: int
@@ -337,18 +344,18 @@ class InMemoryAutomationRepository:
         claim = self._claims.get(run.id)
         if claim is None:
             raise KeyError(f"Unknown routine run: {run.id}")
-        if claim[0] != owner:
+        if claim.owner != owner:
             raise RoutineRunClaimConflict(
                 f"Routine run {run.id} is owned by another worker."
             )
-        if int(claim[2]) != expected_revision:
+        if claim.revision != expected_revision:
             raise RoutineRunClaimConflict(
                 f"Routine run {run.id} changed from revision "
-                f"{expected_revision} to {claim[2]}."
+                f"{expected_revision} to {claim.revision}."
             )
         self.runs[run.id] = run
-        claim[2] = expected_revision + 1
-        return int(claim[2])
+        claim.revision = expected_revision + 1
+        return claim.revision
 
     def finalize_run(
         self,
@@ -361,8 +368,8 @@ class InMemoryAutomationRepository:
         revision = self.save_run_progress(
             run, owner=owner, expected_revision=expected_revision
         )
-        self._claims[run.id][1] = "finalized"
-        self._claims[run.id][2] = revision + 1
+        self._claims[run.id].state = "finalized"
+        self._claims[run.id].revision = revision + 1
         self.receipts[receipt.run_id] = receipt
         return revision + 1
 

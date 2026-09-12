@@ -7,7 +7,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any
+from typing import Any, Literal, cast
 
 from reckoning.interfaces import (
     ChannelMessage,
@@ -739,7 +739,10 @@ def _load_state(connection: sqlite3.Connection) -> InterfaceState:
             channel=session_row[0],
             session_id=str(session_row[1]),
             messages=tuple(
-                ChannelMessage(str(message_row[0]), str(message_row[1]))
+                ChannelMessage(
+                    cast(Literal["user", "assistant"], str(message_row[0])),
+                    str(message_row[1]),
+                )
                 for message_row in connection.execute(
                     """
                     SELECT role, content FROM interface_session_messages
@@ -878,6 +881,3 @@ def _validate_legacy(state: InterfaceState) -> None:
         raise ValueError("Interface failure identifiers must be unique.")
     if len(state.pending_approvals) != len(set(state.pending_approvals)):
         raise ValueError("Interface approval identifiers must be unique.")
-
-
-
