@@ -60,22 +60,31 @@ from reckoning.provider_registry import (
     GROUP_LABELS,
     GROUP_ORDER,
     ProviderDefinition,
-    ProviderGroup,
     coming_soon_providers,
     find_provider,
     providers_in_group,
 )
 from reckoning.provider_validation import is_valid_env_name, is_valid_header_name
+from reckoning.runtime_status import gateway_runtime_status
 from reckoning.setup_copy import (
     AUTONOMY_FLOOR_TITLE,
     CONNECTOR_COMING_SOON,
+    CONNECTOR_PROMPT,
+    CONNECTOR_SKIP,
     CONNECTOR_TELEGRAM,
     CONNECTOR_TITLE,
+    FIRST_MESSAGE_ACTION_PROMPT,
+    FIRST_MESSAGE_ACTIONS,
     FIRST_MESSAGE_INTRO,
     FIRST_MESSAGE_TITLE,
-    MODE_CUSTOM,
-    MODE_QUICK,
-    MODE_TITLE,
+    GATEWAY_COMPLETE_RUNNING,
+    GATEWAY_COMPLETE_STOPPED,
+    GATEWAY_RUNNING,
+    GATEWAY_STOPPED,
+    INTERFACE_TERMINAL_COMPLETE,
+    INTERFACE_TERMINAL_READY,
+    INTERFACE_WEB_COMPLETE,
+    INTERFACE_WEB_READY,
     PERSONA_AUTHOR,
     PERSONA_BLANK,
     PERSONA_BUILDER_START,
@@ -85,7 +94,6 @@ from reckoning.setup_copy import (
     PERSONA_PREVIEW_TITLE,
     PERSONA_TITLE,
     PLACEMENT_CLOUD_NOTE,
-    PLACEMENT_LOCAL_DEFAULT,
     PLACEMENT_OPTIONS,
     PLACEMENT_TITLE,
     PROFILE_GUIDED,
@@ -94,26 +102,25 @@ from reckoning.setup_copy import (
     PROFILE_SAVED_AS_PROPOSALS,
     PROFILE_SECTIONS,
     PROFILE_SKIP,
+    PROFILE_STARTER,
+    PROFILE_STARTER_HELP,
+    PROFILE_STARTER_TEMPLATE,
     PROFILE_TITLE,
-    PROVIDER_ASK_TEST,
     PROVIDER_COMING_SOON,
+    PROVIDER_DEMO,
     PROVIDER_DETECTED_TITLE,
     PROVIDER_FAILURE_ACTIONS,
     PROVIDER_LIVE_SAMPLE,
     PROVIDER_LOCAL_MISSING,
     PROVIDER_MODEL_MANUAL,
     PROVIDER_MODEL_TITLE,
-    PROVIDER_PREFERENCE_CLOUD,
-    PROVIDER_PREFERENCE_GATEWAY,
-    PROVIDER_PREFERENCE_LOCAL,
-    PROVIDER_PREFERENCE_TITLE,
     PROVIDER_RECOMMENDED,
     PROVIDER_TITLE,
     PROVIDER_UNVERIFIED_SAVED,
+    PROVIDER_VERIFIED,
     PROVIDER_VERIFY_CHARGE,
     PROVIDER_VERIFY_FREE,
     PROVIDER_VERIFY_INTRO,
-    QUICK_EXPLANATION,
     RESUME_EXIT,
     RESUME_RESUME,
     RESUME_START_OVER,
@@ -122,13 +129,30 @@ from reckoning.setup_copy import (
     REVIEW_TITLE,
     START_OVER_PREVIEW,
     STATUS_EDIT,
+    STATUS_EDIT_CHOICES,
+    STATUS_EDIT_PROMPT,
     STATUS_EXIT,
+    STATUS_LABEL_ABOUT,
+    STATUS_LABEL_DRAFT,
+    STATUS_LABEL_FORMAT,
+    STATUS_LABEL_GATEWAY,
+    STATUS_LABEL_INTERFACES,
+    STATUS_LABEL_PROVIDER,
+    STATUS_LABEL_STORAGE,
+    STATUS_LABEL_STYLE,
+    STATUS_LABEL_TELEGRAM,
+    STATUS_NOTHING_FAILING,
     STATUS_PAID_REFRESH,
+    STATUS_PROMPT,
     STATUS_REPAIR,
+    STATUS_REPAIR_PROMPT,
     STATUS_TITLE,
     STATUS_VERIFY_ALL,
+    TELEGRAM_COMPLETE,
     TELEGRAM_GATEWAY_NOTE,
     TELEGRAM_PAIRING_PROMPT,
+    TELEGRAM_STATUS_LABELS,
+    WELCOME,
 )
 from reckoning.telegram import (
     TelegramBotApi,
@@ -142,48 +166,33 @@ from reckoning.telegram import (
 DEFAULT_DATA_DIR = Path.home() / ".local" / "state" / "reckoning"
 DEFAULT_DRAFT_PATH = Path.home() / ".config" / "reckoning" / "setup-draft.json"
 
-SETUP_DRAFT_SCHEMA = 1
+SETUP_DRAFT_SCHEMA = 2
 
-SetupMode = Literal["quick", "custom"]
 SetupStep = Literal[
-    "mode",
-    "placement",
-    "persona",
     "provider",
-    "profile",
     "connectors",
-    "first-conversation",
+    "persona",
+    "profile",
     "review",
+    "first-conversation",
 ]
 
-QUICK_STEPS: tuple[SetupStep, ...] = (
-    "persona",
+GUIDED_STEPS: tuple[SetupStep, ...] = (
     "provider",
-    "profile",
     "connectors",
-    "first-conversation",
-    "review",
-)
-
-CUSTOM_STEPS: tuple[SetupStep, ...] = (
-    "placement",
     "persona",
-    "provider",
     "profile",
-    "connectors",
-    "first-conversation",
     "review",
+    "first-conversation",
 )
 
 STEP_TITLES: dict[SetupStep, str] = {
-    "mode": MODE_TITLE,
-    "placement": PLACEMENT_TITLE,
-    "persona": PERSONA_TITLE,
-    "provider": PROVIDER_TITLE,
-    "profile": PROFILE_TITLE,
+    "provider": "AI provider and model",
     "connectors": CONNECTOR_TITLE,
-    "first-conversation": FIRST_MESSAGE_TITLE,
+    "persona": "Agent style",
+    "profile": PROFILE_TITLE,
     "review": REVIEW_TITLE,
+    "first-conversation": FIRST_MESSAGE_TITLE,
 }
 
 
@@ -216,6 +225,8 @@ class SetupUI(Protocol):
     def step(self, index: int, total: int, title: str) -> None: ...
 
     def info(self, text: str) -> None: ...
+
+    def secondary(self, text: str) -> None: ...
 
     def success(self, text: str) -> None: ...
 
@@ -250,9 +261,8 @@ class SetupUI(Protocol):
 class SetupDraft:
     """A resumable, non-secret record of an interrupted setup."""
 
-    mode: SetupMode | None = None
     completed: list[str] = field(default_factory=list)
-    placement: str | None = None
+    placement: str | None = "local"
     server_data_dir: str | None = None
     persona_id: str | None = None
     authored_persona: dict[str, Any] | None = None
@@ -282,23 +292,29 @@ class SetupDraft:
         data = read_json(path, default={})
         if not data:
             return None
-        if data.get("schema_version") != SETUP_DRAFT_SCHEMA:
+        schema_version = data.get("schema_version")
+        if schema_version not in (1, SETUP_DRAFT_SCHEMA):
             raise OperationError("The setup draft uses an unsupported schema.")
         if data.get("status", "incomplete") != "incomplete":
             raise OperationError("The setup draft has an invalid status.")
-        mode = data.get("mode")
         completed = data.get("completed", [])
         next_step = data.get("next_step")
         header_env = data.get("provider_header_env", {})
-        all_steps = frozenset(("mode", *QUICK_STEPS, *CUSTOM_STEPS))
-        if mode not in (None, "quick", "custom"):
-            raise OperationError("The setup draft has an invalid mode.")
+        legacy_steps = frozenset(
+            ("mode", "placement", "persona", "provider", "profile", "connectors", "first-conversation", "review")
+        )
+        all_steps = legacy_steps if schema_version == 1 else frozenset(GUIDED_STEPS)
         if not isinstance(completed, list) or any(
             not isinstance(step, str) or step not in all_steps for step in completed
         ):
             raise OperationError("The setup draft has invalid completed steps.")
         if next_step is not None and next_step not in all_steps:
             raise OperationError("The setup draft has an invalid next step.")
+        migrated_completed = [
+            step
+            for step in completed
+            if step in GUIDED_STEPS and step not in ("review", "first-conversation")
+        ] if schema_version == 1 else completed
         if not isinstance(header_env, dict) or any(
             not is_valid_header_name(name) or not is_valid_env_name(env_name)
             for name, env_name in header_env.items()
@@ -319,9 +335,8 @@ class SetupDraft:
         if protocol != "openai-chat-completions":
             raise OperationError("The setup draft has an invalid provider protocol.")
         return cls(
-            mode=cast(SetupMode | None, mode),
-            completed=completed,
-            placement=data.get("placement"),
+            completed=migrated_completed,
+            placement=data.get("placement") or "local",
             server_data_dir=data.get("server_data_dir"),
             persona_id=data.get("persona_id"),
             authored_persona=data.get("authored_persona"),
@@ -339,18 +354,19 @@ class SetupDraft:
             telegram_status=data.get("telegram_status"),
             provider_verified_at=data.get("provider_verified_at"),
             status="incomplete",
-            next_step=cast(SetupStep | None, next_step),
+            next_step=(
+                None
+                if schema_version == 1
+                else cast(SetupStep | None, next_step)
+            ),
+            schema_version=SETUP_DRAFT_SCHEMA,
         )
 
     def save(self, path: Path) -> None:
-        if self.mode is None:
-            self.next_step = "mode"
-        else:
-            steps = QUICK_STEPS if self.mode == "quick" else CUSTOM_STEPS
-            self.next_step = next(
-                (step for step in steps if step not in self.completed),
-                None,
-            )
+        self.next_step = next(
+            (step for step in GUIDED_STEPS if step not in self.completed),
+            None,
+        )
         atomic_write_json(path, {"schema_version": self.schema_version, **{
             key: value
             for key, value in asdict(self).items()
@@ -362,18 +378,22 @@ class SetupDraft:
         done = ", ".join(self.completed) or "none"
         remaining = [
             step
-            for step in (QUICK_STEPS if self.mode == "quick" else CUSTOM_STEPS)
+            for step in GUIDED_STEPS
             if step not in self.completed
         ]
+        about = (
+            f"{self.profile_proposal_count} unconfirmed proposals"
+            if self.profile_proposal_count
+            else self.profile_choice or "not started"
+        )
         return (
-            f"Mode: {self.mode or 'not chosen'}",
-            f"Completed steps: {done}",
-            f"Remaining steps: {', '.join(remaining) or 'none'}",
-            f"Placement: {self.placement or 'not chosen'}",
-            f"Persona: {self.persona_id or 'not chosen'}",
-            f"Provider: {self.provider_id or 'not chosen'}",
-            f"Profile: {self.profile_choice or 'not started'}",
-            f"Telegram: {self.telegram_status or 'not started'}",
+            f"Completed sections: {done}",
+            f"Remaining sections: {', '.join(remaining) or 'none'}",
+            f"{STATUS_LABEL_STORAGE}: {self.placement or 'not chosen'}",
+            f"{STATUS_LABEL_STYLE}: {self.persona_id or 'not chosen'}",
+            f"{STATUS_LABEL_PROVIDER}: {self.provider_id or 'not chosen'}",
+            f"{STATUS_LABEL_ABOUT}: {about}",
+            f"{STATUS_LABEL_TELEGRAM}: {self.telegram_status or 'not started'}",
         )
 
 
@@ -501,7 +521,8 @@ def _slugify(text: str) -> str:
 
 @dataclass(frozen=True)
 class SectionStatus:
-    name: str
+    key: str
+    label: str
     ok: bool
     detail: str
 
@@ -610,7 +631,37 @@ class SetupWorkflow:
                 )
         existing: SetupDraft | None = None
         if self._paths.draft_path.exists():
-            existing = SetupDraft.load(self._paths.draft_path)
+            raw_draft = read_json(self._paths.draft_path, default={})
+            if raw_draft.get("schema_version") == 1:
+                self._ui.warning(
+                    "Draft migration preview: keep provider, Agent style, "
+                    "About you, Telegram, and storage choices; remove the "
+                    "obsolete Quick or Custom mode. The draft changes only "
+                    "when setup next saves progress."
+                )
+            try:
+                existing = SetupDraft.load(self._paths.draft_path)
+            except (OperationError, RuntimeError, ValueError) as error:
+                self._ui.failure(f"This setup draft cannot resume: {error}")
+                self._ui.warning(f"Remove exactly: {self._paths.draft_path}")
+                action = self._ui.choose(
+                    "invalid-draft-action",
+                    "What should Reckoning do with this draft?",
+                    (
+                        MenuOption("remove", "Remove only this setup draft"),
+                        MenuOption("exit", "Exit without changes"),
+                    ),
+                )
+                if action == "exit" or not self._ui.confirm(
+                    "invalid-draft-remove",
+                    "Remove the previewed draft?",
+                    default=False,
+                ):
+                    return SetupOutcome(
+                        status="draft", data_dir=self._paths.data_dir
+                    )
+                self._paths.draft_path.unlink()
+                self._ui.success("The incompatible setup draft was removed.")
         if existing is not None:
             action = self._ui.choose(
                 "resume",
@@ -668,31 +719,31 @@ class SetupWorkflow:
 
     def _run_guided(self) -> SetupOutcome:
         try:
-            if self._draft.mode is None:
-                self._step_mode()
-                self._save_draft()
-            steps = QUICK_STEPS if self._draft.mode == "quick" else CUSTOM_STEPS
-            if self._draft.mode == "quick" and self._draft.placement is None:
-                self._ui.info(QUICK_EXPLANATION)
-                if "placement" in self._preselected:
-                    chosen = self._preselected["placement"]
-                    server_dir = self._preselected.get("server-data-dir") or None
-                    if chosen != "local" and not server_dir:
-                        raise SetupInputError(
-                            f"server-data-dir is required for {chosen} placement"
-                        )
-                    self._draft.placement = chosen
-                    self._draft.server_data_dir = server_dir
-                else:
-                    self._ui.info(PLACEMENT_LOCAL_DEFAULT)
-                    self._draft.placement = "local"
+            self._ui.info(WELCOME)
+            steps = GUIDED_STEPS
+            if "placement" in self._preselected:
+                chosen = self._preselected["placement"]
+                server_dir = self._preselected.get("server-data-dir") or None
+                if chosen not in PLACEMENT_OPTIONS:
+                    raise SetupInputError(f"Unknown placement: {chosen}")
+                if chosen != "local" and not server_dir:
+                    raise SetupInputError(
+                        f"server-data-dir is required for {chosen} placement"
+                    )
+                self._draft.placement = chosen
+                self._draft.server_data_dir = server_dir
+            elif self._draft.placement is None:
+                self._draft.placement = "local"
             index = 0
             while index < len(steps):
                 step = steps[index]
                 if step in self._draft.completed:
                     index += 1
                     continue
-                self._ui.step(index + 1, len(steps), STEP_TITLES[step])
+                if step == "first-conversation":
+                    self._ui.info(FIRST_MESSAGE_TITLE)
+                else:
+                    self._ui.step(index + 1, len(steps) - 1, STEP_TITLES[step])
                 try:
                     self._run_step(step)
                 except SetupBack:
@@ -742,24 +793,6 @@ class SetupWorkflow:
 
     def _save_draft(self) -> None:
         self._draft.save(self._paths.draft_path)
-
-    # -------------------------------------------------------------------- mode
-
-    def _step_mode(self) -> None:
-        if "mode" in self._preselected:
-            mode = self._preselected["mode"]
-        else:
-            mode = self._ui.choose(
-                "mode",
-                MODE_TITLE,
-                (
-                    MenuOption("quick", MODE_QUICK),
-                    MenuOption("custom", MODE_CUSTOM),
-                ),
-            )
-        if mode not in ("quick", "custom"):
-            raise SetupInputError(f"Unknown setup mode: {mode}")
-        self._draft.mode = cast(SetupMode, mode)
 
     # --------------------------------------------------------------- placement
 
@@ -942,54 +975,7 @@ class SetupWorkflow:
             for definition, hits in detected:
                 labels = "; ".join(hit.label for hit in hits)
                 self._ui.info(f"- {definition.display_name}: {labels}")
-            if self._ui.confirm(
-                "provider-test-detected", PROVIDER_ASK_TEST, default=False
-            ):
-                options = tuple(
-                    MenuOption(definition.id, definition.display_name)
-                    for definition, _ in detected
-                ) + (MenuOption("another", "Choose another provider"),)
-                chosen = self._ui.choose(
-                    "provider-detected", PROVIDER_TITLE, options
-                )
-                if chosen == "another":
-                    return self._choose_provider_from_catalog()
-                return find_provider(chosen)
-        else:
-            preference = self._ui.choose(
-                "provider-preference",
-                PROVIDER_PREFERENCE_TITLE,
-                (
-                    MenuOption("direct", PROVIDER_PREFERENCE_CLOUD),
-                    MenuOption("gateway", PROVIDER_PREFERENCE_GATEWAY),
-                    MenuOption("local", PROVIDER_PREFERENCE_LOCAL),
-                    MenuOption("browse", "Browse the full catalog"),
-                ),
-            )
-            if preference != "browse":
-                group: ProviderGroup = (
-                    "local"
-                    if preference == "local"
-                    else "gateway"
-                    if preference == "gateway"
-                    else "direct"
-                )
-                candidates = [
-                    item for item in providers_in_group(group) if item.available
-                ]
-                if candidates:
-                    recommended = candidates[0]
-                    self._ui.info(
-                        f"Recommended: {recommended.display_name} — "
-                        f"{recommended.summary}"
-                    )
-                    if self._ui.confirm(
-                        "provider-use-recommendation",
-                        f"Use {recommended.display_name}?",
-                        default=True,
-                    ):
-                        return recommended
-        return self._choose_provider_from_catalog()
+        return self._choose_provider_from_catalog(detected)
 
     def _detect_providers(self) -> list[tuple[ProviderDefinition, tuple[Any, ...]]]:
         import os
@@ -1012,12 +998,24 @@ class SetupWorkflow:
                 found.append((item, hits))
         return found
 
-    def _choose_provider_from_catalog(self) -> ProviderDefinition:
+    def _choose_provider_from_catalog(
+        self,
+        detected: list[tuple[ProviderDefinition, tuple[Any, ...]]] | None = None,
+    ) -> ProviderDefinition:
         while True:
             options: list[MenuOption] = []
+            detected_ids = {definition.id for definition, _ in detected or ()}
+            for definition, _hits in detected or ():
+                options.append(
+                    MenuOption(
+                        definition.id,
+                        f"{definition.display_name} (Detected access)",
+                        note=definition.summary,
+                    )
+                )
             for group in GROUP_ORDER:
                 for item in providers_in_group(group):
-                    if not item.available:
+                    if not item.available or item.id in detected_ids:
                         continue
                     badges = f" ({'; '.join(item.badges)})" if item.badges else ""
                     options.append(
@@ -1027,23 +1025,22 @@ class SetupWorkflow:
                             note=GROUP_LABELS[group],
                         )
                     )
-            coming = coming_soon_providers()
-            if coming:
-                options.append(
-                    MenuOption(
-                        "coming-soon",
-                        f"{PROVIDER_COMING_SOON}: "
-                        + ", ".join(item.display_name for item in coming),
-                        available=False,
-                        dim=True,
-                        note="These pass the provider contract in later waves.",
-                    )
+            fake_index = next(
+                (index for index, option in enumerate(options) if option.id == "fake"),
+                None,
+            )
+            if fake_index is not None:
+                fake = options[fake_index]
+                options[fake_index] = MenuOption(
+                    fake.id,
+                    "Demo — deterministic and offline",
+                    note=fake.note,
                 )
+            if coming_soon_providers():
+                self._ui.secondary(PROVIDER_COMING_SOON)
             chosen = self._ui.choose(
                 "provider", PROVIDER_TITLE, tuple(options), allow_back=True
             )
-            if chosen == "coming-soon":
-                continue
             try:
                 definition = find_provider(chosen)
             except KeyError as error:
@@ -1063,7 +1060,8 @@ class SetupWorkflow:
                 if definition.id == "fake":
                     self._store_verified(definition, config, demo=True)
                     self._ui.success(
-                        "Demo mode: the deterministic fake provider is ready."
+                        f"{PROVIDER_DEMO}: the deterministic fake provider "
+                        "is ready."
                     )
                     return
                 if self._verify_provider(definition, config):
@@ -1395,7 +1393,7 @@ class SetupWorkflow:
         )
         self._store_verified(definition, config, demo=verification.demo)
         self._ui.success(
-            f"Real provider ready: {definition.display_name} answered in "
+            f"{PROVIDER_VERIFIED}: {definition.display_name} answered in "
             f"{verification.latency_ms} ms."
         )
         return True
@@ -1484,6 +1482,7 @@ class SetupWorkflow:
             (
                 MenuOption("skip", PROFILE_SKIP),
                 MenuOption("guided", PROFILE_GUIDED),
+                MenuOption("starter", PROFILE_STARTER),
                 MenuOption("import", PROFILE_IMPORT),
             ),
             allow_back=True,
@@ -1503,6 +1502,29 @@ class SetupWorkflow:
                             source="setup-guided",
                         )
                     )
+        elif choice == "starter":
+            self._ui.secondary(PROFILE_STARTER_HELP)
+            raw_path = self._ui.ask(
+                "profile-starter-path",
+                "Where should Reckoning create the starter file? ",
+                default="about-me.md",
+                allow_empty=False,
+            )
+            profile_path = Path(raw_path).expanduser()
+            try:
+                profile_path.parent.mkdir(parents=True, exist_ok=True)
+                with profile_path.open("x", encoding="utf-8") as stream:
+                    stream.write(PROFILE_STARTER_TEMPLATE)
+            except FileExistsError as error:
+                raise SetupInputError(
+                    f"The starter profile already exists: {profile_path}"
+                ) from error
+            except OSError as error:
+                profile_path.unlink(missing_ok=True)
+                raise SetupInputError(
+                    f"Could not create the starter profile: {error}"
+                ) from error
+            self._ui.success(f"Starter profile created: {profile_path}")
         elif choice == "import":
             raw_path = self._ui.ask(
                 "profile-import-path",
@@ -1555,20 +1577,16 @@ class SetupWorkflow:
     # -------------------------------------------------------------- connectors
 
     def _step_connectors(self) -> None:
+        self._ui.info(INTERFACE_TERMINAL_READY)
+        self._ui.info(INTERFACE_WEB_READY)
         while True:
+            self._ui.secondary(CONNECTOR_COMING_SOON)
             choice = self._ui.choose(
                 "connectors",
-                CONNECTOR_TITLE,
+                CONNECTOR_PROMPT,
                 (
                     MenuOption("telegram", CONNECTOR_TELEGRAM),
-                    MenuOption(
-                        "coming-soon",
-                        f"{CONNECTOR_COMING_SOON}: Discord, WhatsApp, Slack, "
-                        "Signal, Matrix",
-                        available=False,
-                        dim=True,
-                    ),
-                    MenuOption("skip", "Skip — set up connectors later"),
+                    MenuOption("skip", CONNECTOR_SKIP),
                 ),
                 allow_back=True,
             )
@@ -1577,8 +1595,6 @@ class SetupWorkflow:
                     self._paths.telegram_config_path
                 )
                 return
-            if choice == "coming-soon":
-                continue
             if choice != "telegram":
                 raise SetupInputError(f"Unknown connector: {choice}")
             self._setup_telegram()
@@ -1662,14 +1678,10 @@ class SetupWorkflow:
                 self._ui.info(response)
                 action = self._ui.choose(
                     "first-message-action",
-                    "What do you want to do with this exchange?",
-                    (
-                        MenuOption("accept", "Accept this exchange"),
-                        MenuOption("retry", "Retry with a new message"),
-                        MenuOption("edit-persona", "Edit persona"),
-                        MenuOption("change-model", "Change model"),
-                        MenuOption("change-provider", "Change provider"),
-                        MenuOption("exit", "Exit (keep the verified provider)"),
+                    FIRST_MESSAGE_ACTION_PROMPT,
+                    tuple(
+                        MenuOption(item_id, label)
+                        for item_id, label in FIRST_MESSAGE_ACTIONS
                     ),
                 )
             if action == "accept":
@@ -1730,22 +1742,68 @@ class SetupWorkflow:
     # ------------------------------------------------------------------ review
 
     def _step_review(self) -> None:
-        definition = find_provider(self._draft.provider_id or "fake")
-        persona = self._persona_definition()
-        lines = [
-            f"Placement: {self._draft.placement or 'local'}",
-            f"Persona: {persona.name} ({persona.id})",
-            f"Provider: {definition.display_name}",
-            f"Model: {self._draft.provider_model or 'deterministic-fake'}",
-            f"Profile proposals: {self._draft.profile_proposal_count}",
-            f"Telegram: {self._draft.telegram_status or 'not configured'}",
-        ]
-        if definition.group in ("direct", "gateway") and self._draft.placement == "local":
-            lines.append(PLACEMENT_CLOUD_NOTE)
-        for line in lines:
-            self._ui.info(line)
-        if not self._ui.confirm("review-confirm", REVIEW_CONFIRM, default=True):
-            raise SetupBack
+        while True:
+            definition = find_provider(self._draft.provider_id or "fake")
+            persona = self._persona_definition()
+            storage = self._draft.placement or "local"
+            about_you = (
+                f"{self._draft.profile_proposal_count} unconfirmed proposals"
+                if self._draft.profile_proposal_count
+                else "Skipped for now"
+            )
+            telegram = self._draft.telegram_status or "not configured"
+            options = (
+                MenuOption(
+                    "provider",
+                    f"AI provider: {definition.display_name}",
+                    note=f"Model: {self._draft.provider_model or 'deterministic-fake'}",
+                ),
+                MenuOption(
+                    "connectors",
+                    "Interfaces: Terminal ready; Web ready",
+                    note=f"Telegram: {telegram}",
+                ),
+                MenuOption(
+                    "persona",
+                    f"Agent style: {persona.name}",
+                    note=f"Desired-self persona: {persona.id}",
+                ),
+                MenuOption("profile", f"About you: {about_you}"),
+                MenuOption(
+                    "placement",
+                    f"Storage: {storage}",
+                    note="Local storage is the default; model processing is separate.",
+                ),
+                MenuOption("continue", REVIEW_CONFIRM),
+            )
+            action = self._ui.choose(
+                "review-action",
+                REVIEW_TITLE,
+                options,
+                allow_back=True,
+            )
+            if action == "continue":
+                if (
+                    definition.group in ("direct", "gateway")
+                    and storage == "local"
+                ):
+                    self._ui.info(PLACEMENT_CLOUD_NOTE)
+                return
+            try:
+                if action == "provider":
+                    self._step_provider()
+                elif action == "connectors":
+                    self._step_connectors()
+                elif action == "persona":
+                    self._step_persona()
+                elif action == "profile":
+                    self._step_profile()
+                elif action == "placement":
+                    self._step_placement()
+                else:
+                    raise SetupInputError(f"Unknown review action: {action}")
+            except SetupBack:
+                continue
 
     # -------------------------------------------------------------- activation
 
@@ -1761,7 +1819,7 @@ class SetupWorkflow:
         )
         activation = {
             "status": "activated",
-            "mode": self._draft.mode or "quick",
+            "setup_schema": SETUP_DRAFT_SCHEMA,
             "provider": provider_id,
             "model": model_name,
             "base_url": self._draft.provider_base_url,
@@ -1823,14 +1881,14 @@ class SetupWorkflow:
             self._prove_reopen()
         except (OperationError, OSError, RuntimeError, ValueError) as error:
             rollback_errors: list[str] = []
-            for snapshot in reversed(root_snapshots):
+            for root_snapshot in reversed(root_snapshots):
                 try:
-                    snapshot.restore()
+                    root_snapshot.restore()
                 except OSError as rollback_error:
                     rollback_errors.append(str(rollback_error))
-            for snapshot in file_snapshots:
+            for file_snapshot in file_snapshots:
                 try:
-                    snapshot.restore()
+                    file_snapshot.restore()
                 except OSError as rollback_error:
                     rollback_errors.append(str(rollback_error))
             rollback_note = (
@@ -1845,13 +1903,25 @@ class SetupWorkflow:
         self._paths.draft_path.unlink(missing_ok=True)
         if demo:
             self._ui.success(
-                "Demo mode: setup completed with the deterministic fake "
+                f"{PROVIDER_DEMO}: setup completed with the deterministic fake "
                 "provider. No paid provider is active."
             )
         else:
             self._ui.success(
-                f"Real provider ready: {definition.display_name} is active."
+                f"{PROVIDER_VERIFIED}: {definition.display_name} is active."
             )
+        telegram_status = TELEGRAM_STATUS_LABELS.get(
+            self._draft.telegram_status or "not-configured",
+            self._draft.telegram_status or "not-configured",
+        )
+        self._ui.info(INTERFACE_TERMINAL_COMPLETE)
+        self._ui.info(INTERFACE_WEB_COMPLETE)
+        self._ui.info(TELEGRAM_COMPLETE.format(status=telegram_status))
+        gateway = gateway_runtime_status(self._paths.data_dir)
+        if gateway.running and gateway.pid is not None:
+            self._ui.info(GATEWAY_COMPLETE_RUNNING.format(pid=gateway.pid))
+        else:
+            self._ui.info(GATEWAY_COMPLETE_STOPPED)
         self._ui.success(
             "Setup complete: the installed state reopened with your accepted "
             "first conversation."
@@ -1927,18 +1997,6 @@ class SetupWorkflow:
             "conversation is missing from the installed state."
         )
 
-    def manage_section(self, section: str) -> SetupOutcome:
-        """Focused entry point for `reckoning provider/persona/channel`."""
-        if section not in ("persona", "provider", "profile", "connectors"):
-            raise SetupInputError(f"Unknown section: {section}")
-        if not (self._paths.data_dir / "instance.json").exists():
-            raise OperationError(
-                "No installation is configured; run reckoning setup first."
-            )
-        self._ui.banner()
-        self._edit_section(section)
-        return SetupOutcome(status="managed", data_dir=self._paths.data_dir)
-
     # ------------------------------------------------------- configured state
 
     def _run_configured(self) -> SetupOutcome:
@@ -1948,15 +2006,15 @@ class SetupWorkflow:
             self._ui.info(STATUS_TITLE)
             for section in sorted(sections, key=lambda item: item.ok):
                 marker = "ok" if section.ok else "FAILING"
-                render = f"[{marker}] {section.name}: {section.detail}"
+                render = f"[{marker}] {section.label}: {section.detail}"
                 if section.ok:
                     self._ui.info(render)
                 else:
                     self._ui.failure(render)
-            failing = [item.name for item in sections if not item.ok]
+            failing = [item for item in sections if not item.ok]
             action = self._ui.choose(
                 "status-action",
-                "What next?",
+                STATUS_PROMPT,
                 (
                     MenuOption("verify-all", STATUS_VERIFY_ALL),
                     MenuOption("repair", STATUS_REPAIR, available=bool(failing)),
@@ -1972,26 +2030,23 @@ class SetupWorkflow:
                 self._verify_all()
             elif action == "repair":
                 if not failing:
-                    self._ui.info("Nothing is failing.")
+                    self._ui.info(STATUS_NOTHING_FAILING)
                     continue
                 target = self._ui.choose(
                     "repair-section",
-                    "Repair which section?",
-                    tuple(MenuOption(name, name) for name in failing),
+                    STATUS_REPAIR_PROMPT,
+                    tuple(
+                        MenuOption(item.key, item.label) for item in failing
+                    ),
                 )
                 self._edit_section(target)
             elif action == "edit":
                 target = self._ui.choose(
                     "edit-section",
-                    "Edit which section?",
+                    STATUS_EDIT_PROMPT,
                     tuple(
-                        MenuOption(name, name)
-                        for name in (
-                            "persona",
-                            "provider",
-                            "profile",
-                            "connectors",
-                        )
+                        MenuOption(key, label)
+                        for key, label in STATUS_EDIT_CHOICES
                     ),
                 )
                 self._edit_section(target)
@@ -2004,11 +2059,12 @@ class SetupWorkflow:
         activation = instance.get("activation")
         placement = instance.get("placement_profile", "unknown")
         sections.append(
-            SectionStatus("placement", True, f"{placement}")
+            SectionStatus("placement", STATUS_LABEL_STORAGE, True, f"{placement}")
         )
         sections.append(
             SectionStatus(
                 "migration",
+                STATUS_LABEL_FORMAT,
                 isinstance(activation, dict),
                 "current" if isinstance(activation, dict) else "required",
             )
@@ -2021,20 +2077,32 @@ class SetupWorkflow:
                     if draft is not None
                     else "none"
                 )
-                sections.append(SectionStatus("draft", True, draft_detail))
+                sections.append(
+                    SectionStatus(
+                        "draft", STATUS_LABEL_DRAFT, True, draft_detail
+                    )
+                )
             except (OperationError, RuntimeError, ValueError) as error:
-                sections.append(SectionStatus("draft", False, str(error)))
+                sections.append(
+                    SectionStatus("draft", STATUS_LABEL_DRAFT, False, str(error))
+                )
         else:
-            sections.append(SectionStatus("draft", True, "none"))
+            sections.append(
+                SectionStatus("draft", STATUS_LABEL_DRAFT, True, "none")
+            )
         try:
             persona = PersonaService(
                 JsonFilePersonaRepository(self._paths.data_dir / "personas.json")
             ).active()
             sections.append(
-                SectionStatus("persona", True, persona.definition.name)
+                SectionStatus(
+                    "persona", STATUS_LABEL_STYLE, True, persona.definition.name
+                )
             )
         except (KeyError, LookupError, RuntimeError, ValueError) as error:
-            sections.append(SectionStatus("persona", False, str(error)))
+            sections.append(
+                SectionStatus("persona", STATUS_LABEL_STYLE, False, str(error))
+            )
         try:
             provider = RuntimeProviderSettings.load(
                 self._paths.data_dir,
@@ -2052,9 +2120,15 @@ class SetupWorkflow:
             )
             if provider.provider_name == "fake":
                 detail = f"fake (demo mode), model {provider.model}"
-            sections.append(SectionStatus("provider", True, detail))
+            sections.append(
+                SectionStatus("provider", STATUS_LABEL_PROVIDER, True, detail)
+            )
         except (KeyError, RuntimeError, ValueError) as error:
-            sections.append(SectionStatus("provider", False, str(error)))
+            sections.append(
+                SectionStatus(
+                    "provider", STATUS_LABEL_PROVIDER, False, str(error)
+                )
+            )
         try:
             runtime = load_installation_runtime(
                 self._paths.data_dir,
@@ -2066,24 +2140,42 @@ class SetupWorkflow:
             proposed = PersonalContextService(context_repo).list_proposed()
             sections.append(
                 SectionStatus(
-                    "profile", True, f"{len(proposed)} unconfirmed proposals"
+                    "profile",
+                    STATUS_LABEL_ABOUT,
+                    True,
+                    f"{len(proposed)} unconfirmed proposals",
                 )
             )
         except (OperationError, RuntimeError, ValueError) as error:
-            sections.append(SectionStatus("profile", False, str(error)))
+            sections.append(
+                SectionStatus("profile", STATUS_LABEL_ABOUT, False, str(error))
+            )
+        sections.append(
+            SectionStatus(
+                "interfaces",
+                STATUS_LABEL_INTERFACES,
+                True,
+                "Terminal ready; Web ready",
+            )
+        )
         telegram = telegram_connector_status(self._paths.telegram_config_path)
         sections.append(
             SectionStatus(
-                "gateway",
-                True,
-                "not running; start with reckoning gateway",
+                "connectors",
+                STATUS_LABEL_TELEGRAM,
+                telegram not in ("error",),
+                TELEGRAM_STATUS_LABELS.get(telegram, telegram),
             )
+        )
+        gateway = gateway_runtime_status(self._paths.data_dir)
+        gateway_detail = (
+            GATEWAY_RUNNING.format(pid=gateway.pid)
+            if gateway.running and gateway.pid is not None
+            else GATEWAY_STOPPED
         )
         sections.append(
             SectionStatus(
-                "connectors",
-                telegram not in ("error",),
-                f"telegram {telegram}",
+                "gateway", STATUS_LABEL_GATEWAY, True, gateway_detail
             )
         )
         return tuple(sections)
@@ -2417,7 +2509,6 @@ class SetupWorkflow:
                 **instance,
                 "activation": {
                     "status": "activated",
-                    "mode": "migrated",
                     "provider": provider_id,
                     "model": (
                         (credential.model if credential is not None else None)

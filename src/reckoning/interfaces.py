@@ -9,7 +9,7 @@ from typing import Any, Literal, Protocol
 from reckoning.json_store import atomic_write_json, read_json
 
 
-ChannelName = Literal["web", "telegram"]
+ChannelName = Literal["terminal", "web", "telegram"]
 ActivityState = Literal["idle", "listening", "reasoning", "executing"]
 VisualState = Literal[
     "idle", "listening", "reasoning", "approval", "execution", "warning", "degraded"

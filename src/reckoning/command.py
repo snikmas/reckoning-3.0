@@ -32,6 +32,7 @@ from reckoning.provider_adapters import (
 )
 from reckoning.provider_registry import available_providers, find_provider
 from reckoning.provider_validation import is_valid_env_name
+from reckoning.runtime_status import record_gateway_runtime
 from reckoning.setup_copy import LOCALE
 from reckoning.setup_terminal import (
     InteractiveUI,
@@ -50,13 +51,15 @@ from reckoning.telegram import (
     TelegramBotApiError,
 )
 from reckoning.telegram import main as run_gateway
+from reckoning.terminal import main as run_terminal
 from reckoning.web import main as run_web
 
 COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "Run",
         (
-            ("reckoning", "Run the web interface."),
+            ("reckoning", "Start a Terminal conversation."),
+            ("reckoning web", "Run the local Web interface."),
             (
                 "reckoning gateway",
                 "Run every configured channel (Telegram today).",
@@ -70,9 +73,6 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
                 "reckoning setup",
                 "Guided setup and the installation status hub.",
             ),
-            ("reckoning provider", "Manage providers and the primary model."),
-            ("reckoning persona", "Manage desired-self personas."),
-            ("reckoning channel", "Set up messaging connectors (Telegram)."),
             (
                 "reckoning doctor",
                 "Report installation health and how to fix problems.",
@@ -114,19 +114,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print_help()
         return 0
     if not arguments or arguments[0].startswith("-"):
-        run_web(arguments)
-        return 0
+        return run_terminal(arguments)
     command, rest = arguments[0], arguments[1:]
     if command == "setup":
         return _run_setup(rest)
+    if command == "web":
+        run_web(rest)
+        return 0
     if command == "gateway":
-        return run_gateway(rest, prog="reckoning gateway")
-    if command == "provider":
-        return _run_section("provider", rest)
-    if command == "persona":
-        return _run_section("persona", rest)
-    if command == "channel":
-        return _run_section("connectors", rest, prog="reckoning channel")
+        return _run_gateway(rest)
     if command == "reset":
         return _run_reset(rest)
     if command in _COMMAND_DESCRIPTIONS:
@@ -140,13 +136,61 @@ def print_help() -> None:
     render_help(COMMAND_GROUPS)
 
 
+_DEFAULT_DATA_DIR = Path.home() / ".local" / "state" / "reckoning"
+
+_GATEWAY_VALUE_OPTIONS = frozenset(
+    (
+        "--host",
+        "--port",
+        "--provider",
+        "--model",
+        "--base-url",
+        "--data-dir",
+        "--server-data-dir",
+        "--telegram-config",
+    )
+)
+
+
+def _gateway_command(rest: Sequence[str]) -> str:
+    skip_value = False
+    for token in rest:
+        if skip_value:
+            skip_value = False
+            continue
+        if token.startswith("-"):
+            if token in _GATEWAY_VALUE_OPTIONS:
+                skip_value = True
+            continue
+        return token
+    return "run"
+
+
+def _gateway_data_dir(rest: Sequence[str]) -> Path:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--data-dir", type=Path, default=_DEFAULT_DATA_DIR)
+    try:
+        known, _ = parser.parse_known_args(list(rest))
+    except SystemExit:
+        return _DEFAULT_DATA_DIR
+    return known.data_dir
+
+
+def _run_gateway(rest: Sequence[str]) -> int:
+    if any(token in ("-h", "--help") for token in rest) or _gateway_command(
+        rest
+    ) not in ("run", "webhook"):
+        return run_gateway(rest, prog="reckoning gateway")
+    with record_gateway_runtime(_gateway_data_dir(rest)):
+        return run_gateway(rest, prog="reckoning gateway")
+
+
 def _setup_parser(prog: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
         description=(
-            "Guided setup and maintenance: Quick or Custom setup on a fresh "
-            "machine; the status view, verification, and repair on a "
-            "configured one."
+            "Guided setup on a fresh machine; status, verification, and "
+            "focused editing on a configured installation."
         ),
     )
     parser.add_argument(
@@ -178,7 +222,6 @@ def _setup_parser(prog: str) -> argparse.ArgumentParser:
         default=Path.home() / ".config" / "reckoning" / "setup-draft.json",
         help="Non-secret resumable setup draft.",
     )
-    parser.add_argument("--mode", choices=("quick", "custom"))
     parser.add_argument(
         "--placement",
         choices=("local", "personal-server", "hybrid"),
@@ -286,7 +329,7 @@ def _non_interactive_answers(
         "first-message": arguments.first_message
         or "Setup check: confirm that Reckoning answers.",
         "first-message-action": "accept",
-        "review-confirm": "y",
+        "review-action": "continue",
         "provider-verify-consent": "y",
     }
     if arguments.profile == "import":
@@ -398,7 +441,6 @@ def _run_setup(rest: Sequence[str]) -> int:
     preselected = {
         key: value
         for key, value in (
-            ("mode", arguments.mode),
             ("placement", arguments.placement),
             ("persona", arguments.persona),
             ("provider", arguments.provider),
@@ -406,7 +448,6 @@ def _run_setup(rest: Sequence[str]) -> int:
         if value
     }
     if arguments.non_interactive:
-        preselected.setdefault("mode", "quick")
         preselected.setdefault("persona", "simon")
         preselected.setdefault("provider", "fake")
     if arguments.server_data_dir is not None:
@@ -508,84 +549,6 @@ def _outcome_json(outcome: SetupOutcome) -> str:
     )
 
 
-def _run_section(section: str, rest: Sequence[str], prog: str | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog=prog or f"reckoning {section}",
-        description=f"Manage the {section} section of the installation.",
-    )
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=Path.home() / ".local" / "state" / "reckoning",
-    )
-    parser.add_argument(
-        "--credentials", type=Path, default=DEFAULT_PROVIDER_CREDENTIALS
-    )
-    parser.add_argument(
-        "--telegram-config", type=Path, default=DEFAULT_TELEGRAM_CONFIG
-    )
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="Print the section state without changing anything.",
-    )
-    arguments = parser.parse_args(rest)
-    if arguments.list:
-        return _list_section(section, arguments)
-    paths = SetupPaths(
-        data_dir=arguments.data_dir,
-        credentials_path=arguments.credentials,
-        telegram_config_path=arguments.telegram_config,
-    )
-    ui: object
-    if not sys.stdin.isatty():
-        ui = PlainTextUI()
-    else:
-        ui = InteractiveUI()
-    try:
-        workflow = SetupWorkflow(
-            paths=paths,
-            ui=ui,  # type: ignore[arg-type]
-            services=SetupServices(environ=dict(os.environ)),
-        )
-        workflow.manage_section(section)
-    except (SetupInputError, OperationError, ValueError) as error:
-        parser.exit(2, f"reckoning {section}: {error}\n")
-    return 0
-
-
-def _list_section(section: str, arguments: argparse.Namespace) -> int:
-    if section == "provider":
-        store = ProviderCredentialStore.load(arguments.credentials)
-        if not store.providers:
-            print("no provider credentials stored")
-            return 0
-        for name, entry in store.providers.items():
-            state = "verified" if entry.verified else "inactive (unverified)"
-            default = " (default)" if name == store.default_provider else ""
-            print(f"{name}: {state}{default}")
-        return 0
-    if section == "persona":
-        from reckoning.personas import JsonFilePersonaRepository, PersonaService
-
-        service = PersonaService(
-            JsonFilePersonaRepository(arguments.data_dir / "personas.json")
-        )
-        active = None
-        try:
-            active = service.active().definition.id
-        except (KeyError, LookupError):
-            pass
-        for item in (*service.list_defaults(), *service.list_authored()):
-            marker = " (active)" if item.id == active else ""
-            print(f"{item.id}: {item.name}{marker}")
-        return 0
-    from reckoning.telegram import telegram_connector_status
-
-    print(f"telegram: {telegram_connector_status(arguments.telegram_config)}")
-    return 0
-
-
 def _run_reset(rest: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="reckoning reset",
@@ -615,6 +578,14 @@ def _run_reset(rest: Sequence[str]) -> int:
         action="store_true",
         help="Confirm the previewed removal without an interactive prompt.",
     )
+    parser.add_argument(
+        "--include-credentials",
+        action="store_true",
+        help=(
+            "Also remove the shared provider credential store. By default, "
+            "verified credentials are preserved."
+        ),
+    )
     arguments = parser.parse_args(rest)
     try:
         server_root = _configured_server_root(arguments.data_dir)
@@ -623,7 +594,7 @@ def _run_reset(rest: Sequence[str]) -> int:
     candidates = (
         arguments.data_dir,
         server_root,
-        arguments.credentials,
+        arguments.credentials if arguments.include_credentials else None,
         arguments.telegram_config,
         arguments.draft_path,
     )
@@ -640,10 +611,14 @@ def _run_reset(rest: Sequence[str]) -> int:
         targets.append(resolved)
     if not targets:
         print("reset: nothing to remove")
+        if arguments.credentials.exists() and not arguments.include_credentials:
+            print(f"provider credentials preserved: {arguments.credentials}")
         return 0
     print("reset will remove exactly:")
     for target in targets:
         print(f"  - {target}")
+    if arguments.credentials.exists() and not arguments.include_credentials:
+        print(f"provider credentials preserved: {arguments.credentials}")
     if not arguments.yes:
         answer = input("Type 'yes' to confirm: ").strip()
         if answer != "yes":

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import reckoning.command as command_module
 from reckoning.command import main
 
 
@@ -61,6 +62,48 @@ def test_grouped_help_lists_the_whole_command_tree() -> None:
         assert f"reckoning {command}" in data_section
 
 
+def test_bare_reckoning_runs_terminal_and_web_is_an_explicit_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    monkeypatch.setattr(
+        command_module,
+        "run_terminal",
+        lambda arguments: calls.append(("terminal", tuple(arguments))) or 0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        command_module,
+        "run_web",
+        lambda arguments: calls.append(("web", tuple(arguments))) or 0,
+    )
+
+    assert main([]) == 0
+    assert main(["web", "--port", "8123"]) == 0
+    assert calls == [("terminal", ()), ("web", ("--port", "8123"))]
+
+
+def test_gateway_records_truthful_runtime_while_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reckoning.runtime_status import runtime_path
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    observed: dict[str, bool] = {}
+
+    def fake_gateway(arguments: object, *, prog: str) -> int:
+        observed["recorded"] = runtime_path(data_dir).exists()
+        return 0
+
+    monkeypatch.setattr(command_module, "run_gateway", fake_gateway)
+    returncode = main(["gateway", "--data-dir", str(data_dir)])
+
+    assert returncode == 0
+    assert observed["recorded"] is True
+    assert not runtime_path(data_dir).exists()
+
+
 def test_subprocess_help_matches_the_dispatcher_seam() -> None:
     result = run_reckoning("--help")
 
@@ -74,9 +117,6 @@ def test_subprocess_help_matches_the_dispatcher_seam() -> None:
 def test_every_subcommand_accepts_help() -> None:
     for command in (
         "setup",
-        "provider",
-        "persona",
-        "channel",
         "reset",
         "gateway",
         "doctor",
@@ -89,6 +129,29 @@ def test_every_subcommand_accepts_help() -> None:
 
         assert returncode == 0, command
         assert f"usage: reckoning {command}" in stdout
+
+
+def test_setup_help_has_one_guided_path_without_a_mode_flag() -> None:
+    returncode, stdout, _ = run_dispatcher("setup", "--help")
+
+    assert returncode == 0
+    assert "[--mode " not in stdout
+    assert "  --mode " not in stdout
+    assert "Quick" not in stdout
+    assert "Custom setup" not in stdout
+
+
+def test_configuration_commands_have_one_home_under_setup() -> None:
+    returncode, stdout, _ = run_dispatcher("--help")
+
+    assert returncode == 0
+    for obsolete in ("reckoning provider", "reckoning persona", "reckoning channel"):
+        assert obsolete not in stdout
+
+    for obsolete in ("provider", "persona", "channel"):
+        returncode, _, stderr = run_dispatcher(obsolete)
+        assert returncode == 2
+        assert f"unknown command '{obsolete}'" in stderr
 
 
 def test_gateway_help_describes_channels_not_a_telegram_command() -> None:
@@ -130,16 +193,14 @@ def test_the_interactive_wizard_uses_the_plain_text_fallback(
 ) -> None:
     answers = iter(
         (
-            "quick",
-            "simon",
-            "y",
-            "browse",
             "fake",
             "skip",
+            "simon",
+            "y",
             "skip",
+            "continue",
             "I want to protect my study time.",
             "accept",
-            "y",
         )
     )
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
@@ -153,7 +214,7 @@ def test_the_interactive_wizard_uses_the_plain_text_fallback(
 
     assert returncode == 0
     assert "== RECKONING setup ==" in stdout
-    assert "Step 1/6" in stdout
+    assert "current section 1 of 5" in stdout
     assert "Demo mode" in stdout
     assert "Setup complete" in stdout
 
@@ -225,7 +286,7 @@ def test_json_reports_an_interrupted_setup_as_incomplete(
 ) -> None:
     import json as jsonlib
 
-    answers = iter(("quick", "simon", "y", "n", "exit"))
+    answers = iter(("exit",))
     monkeypatch.setattr("builtins.input", lambda prompt: next(answers))
     returncode, stdout, stderr = run_dispatcher(
         "setup",
