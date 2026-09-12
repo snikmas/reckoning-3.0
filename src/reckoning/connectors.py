@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
-import hashlib
 import json
+import os
 from pathlib import Path
 from types import MappingProxyType
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Literal, Protocol
+from uuid import uuid4
 
 from reckoning.external_content import (
     ExternalContentBoundary,
@@ -446,7 +447,7 @@ class ApprovalRequest:
 
 @dataclass(frozen=True)
 class WriteResult:
-    status: Literal["success", "failed"]
+    status: Literal["success", "failed", "unknown"]
     external_id: str | None
     detail: str
 
@@ -455,7 +456,7 @@ class WriteResult:
 class WriteReceipt:
     write_id: str
     connector_id: str
-    status: Literal["success", "failed"]
+    status: Literal["success", "failed", "unknown"]
     external_id: str | None
     detail: str
     attempts: int
@@ -473,35 +474,18 @@ class WriteConnector(Protocol):
 
 
 class ExternalWriteService:
+    """Prepare, approve, and execute external writes through transactional storage."""
+
     def __init__(self, path: Path | None = None) -> None:
-        self._path = path
-        self._writes: dict[str, PreparedWrite] = {}
-        self._permissions: dict[str, StandingPermission] = {}
-        self._receipts: dict[str, WriteReceipt] = {}
-        if path is not None:
-            data = read_json(
-                path,
-                default={
-                    "schema_version": 1,
-                    "writes": [],
-                    "permissions": [],
-                    "receipts": [],
-                },
-            )
-            if data.get("schema_version") != 1:
-                raise RuntimeError("Unsupported external-write storage schema.")
-            self._writes = {
-                str(item["id"]): _prepared_write_from_data(item)
-                for item in data["writes"]
-            }
-            self._permissions = {
-                str(item["id"]): _standing_permission_from_data(item)
-                for item in data["permissions"]
-            }
-            self._receipts = {
-                str(item["write_id"]): _write_receipt_from_data(item)
-                for item in data["receipts"]
-            }
+        from reckoning.external_write_store import (
+            InMemoryExternalWriteRepository,
+            SQLiteExternalWriteRepository,
+        )
+
+        if path is None:
+            self._repository = InMemoryExternalWriteRepository()
+        else:
+            self._repository = SQLiteExternalWriteRepository(path)
 
     def prepare(
         self,
@@ -515,6 +499,8 @@ class ExternalWriteService:
         payload: dict[str, str],
         prepared_at: datetime,
     ) -> PreparedWrite:
+        from reckoning.external_write_store import payload_digest
+
         _validate_authority_scope(
             connector_id=connector_id,
             action_type=action_type,
@@ -527,9 +513,6 @@ class ExternalWriteService:
         if not payload:
             raise ValueError("An external write payload cannot be empty.")
         stable_payload = dict(sorted(payload.items()))
-        digest = hashlib.sha256(
-            json.dumps(stable_payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
         prepared = PreparedWrite(
             write_id,
             connector_id,
@@ -539,23 +522,23 @@ class ExternalWriteService:
             boundary,
             MappingProxyType(stable_payload),
             prepared_at,
-            digest,
+            payload_digest(stable_payload),
         )
-        self._writes[write_id] = prepared
-        self._flush()
-        return prepared
+        return self._repository.prepare(prepared)
 
     def approve_exact(
         self, write_id: str, *, approval_id: str, approved_at: datetime
     ) -> PreparedWrite:
-        del approved_at
         if not approval_id.strip():
             raise ValueError("An exact approval identifier is required.")
-        prepared = self._write(write_id)
-        approved = replace(prepared, exact_approval_id=approval_id)
-        self._writes[write_id] = approved
-        self._flush()
-        return approved
+        prepared = self._repository.get_prepared(write_id)
+        self._repository.approve_exact(
+            write_id,
+            prepared.payload_digest,
+            approval_id=approval_id,
+            approved_at=approved_at,
+        )
+        return self._repository.get_prepared(write_id)
 
     def grant_standing_permission(
         self,
@@ -586,27 +569,27 @@ class ExternalWriteService:
             boundary,
             granted_at,
         )
-        self._permissions[permission_id] = permission
-        self._flush()
-        return permission
+        return self._repository.grant_permission(permission)
 
     def revoke_standing_permission(
         self, permission_id: str, *, revoked_at: datetime
     ) -> StandingPermission:
-        permission = self._permissions[permission_id]
-        revoked = replace(permission, revoked_at=revoked_at)
-        self._permissions[permission_id] = revoked
-        self._flush()
-        return revoked
+        return self._repository.revoke_permission(
+            permission_id, revoked_at=revoked_at
+        )
 
     def pending_approval_ids(self) -> tuple[str, ...]:
         """Return prepared writes that still require an exact user approval."""
-        return tuple(
-            prepared.id
-            for prepared in self._writes.values()
-            if prepared.id not in self._receipts
-            and not self._is_authorized(prepared)
-        )
+        return self._repository.pending_approval_ids()
+
+    def list_prepared(self) -> tuple[PreparedWrite, ...]:
+        return self._repository.list_prepared()
+
+    def list_permissions(self) -> tuple[StandingPermission, ...]:
+        return self._repository.list_permissions()
+
+    def list_receipts(self) -> tuple[WriteReceipt, ...]:
+        return self._repository.list_receipts()
 
     def execute(
         self,
@@ -615,11 +598,18 @@ class ExternalWriteService:
         *,
         completed_at: datetime,
         max_retries: int = 1,
+        on_claimed: Callable[[str], None] | None = None,
     ) -> WriteReceipt | ApprovalRequest:
-        if write_id in self._receipts:
-            return self._receipts[write_id]
-        prepared = self._write(write_id)
-        authorization = self._authorization(prepared)
+        from reckoning.external_write_store import (
+            ExternalWriteAuthorityRevoked,
+            authorization_scope,
+        )
+
+        existing = self._repository.get_receipt(write_id)
+        if existing is not None:
+            return existing
+        prepared = self._repository.get_prepared(write_id)
+        authorization = self._repository.authorization(prepared)
         if authorization is None:
             return ApprovalRequest(
                 prepared.id,
@@ -629,16 +619,30 @@ class ExternalWriteService:
         if max_retries < 0:
             raise ValueError("A write retry limit cannot be negative.")
         idempotency_key = f"reckoning-write:{prepared.id}:{prepared.payload_digest}"
-        result = WriteResult("failed", None, "Write adapter was not called.")
-        attempts = 0
-        for attempts in range(1, max_retries + 2):
-            try:
-                result = adapter.execute(dict(prepared.payload), idempotency_key)
-                if result.status == "success":
-                    break
-            except Exception as error:  # adapter failures are recorded, not claimed away
-                result = WriteResult("failed", None, str(error))
-        authorization_kind, authorization_id = authorization
+        owner = _claim_owner()
+        self._repository.claim_execution(
+            prepared,
+            owner=owner,
+            idempotency_key=idempotency_key,
+            authorization=authorization,
+            claimed_at=completed_at,
+        )
+        if on_claimed is not None:
+            on_claimed(owner)
+        try:
+            self._repository.dispatch_execution(prepared.id, owner)
+        except ExternalWriteAuthorityRevoked:
+            self._repository.abort_execution(
+                prepared.id, owner, reason="authority revoked before dispatch"
+            )
+            return ApprovalRequest(
+                prepared.id,
+                dict(prepared.payload),
+                "No exact approval or matching standing permission.",
+            )
+        result, attempts = self._invoke_adapter(
+            adapter, prepared, idempotency_key, max_retries
+        )
         receipt = WriteReceipt(
             write_id=prepared.id,
             connector_id=prepared.connector_id,
@@ -648,74 +652,32 @@ class ExternalWriteService:
             attempts=attempts,
             idempotency_key=idempotency_key,
             completed_at=completed_at,
-            authorization_kind=authorization_kind,
-            authorization_id=authorization_id,
-            authorization_scope=self._authorization_scope(prepared),
+            authorization_kind=authorization.kind,
+            authorization_id=authorization.authorization_id,
+            authorization_scope=authorization_scope(prepared),
         )
-        self._receipts[write_id] = receipt
-        self._flush()
-        return receipt
-
-    def _is_authorized(self, prepared: PreparedWrite) -> bool:
-        return self._authorization(prepared) is not None
-
-    def _authorization(
-        self, prepared: PreparedWrite
-    ) -> tuple[Literal["exact_approval", "standing_permission"], str] | None:
-        if prepared.exact_approval_id is not None:
-            return "exact_approval", prepared.exact_approval_id
-        permission = next(
-            (
-                permission
-                for permission in self._permissions.values()
-                if permission.revoked_at is None
-                and permission.connector_id == prepared.connector_id
-                and permission.action_type == prepared.action_type
-                and permission.target == prepared.target
-                and permission.trigger == prepared.trigger
-                and permission.boundary == prepared.boundary
-            ),
-            None,
-        )
-        if permission is None:
-            return None
-        return "standing_permission", permission.id
+        return self._repository.finalize_execution(prepared.id, owner, receipt)
 
     @staticmethod
-    def _authorization_scope(prepared: PreparedWrite) -> str:
-        return "|".join(
-            (
-                prepared.connector_id,
-                prepared.action_type,
-                prepared.target,
-                prepared.trigger,
-                prepared.boundary,
-            )
-        )
-
-    def _write(self, write_id: str) -> PreparedWrite:
-        try:
-            return self._writes[write_id]
-        except KeyError as error:
-            raise KeyError(f"Unknown prepared write: {write_id}") from error
-
-    def _flush(self) -> None:
-        if self._path is None:
-            return
-        atomic_write_json(
-            self._path,
-            {
-                "schema_version": 1,
-                "writes": [_prepared_write_to_data(item) for item in self._writes.values()],
-                "permissions": [
-                    _standing_permission_to_data(item)
-                    for item in self._permissions.values()
-                ],
-                "receipts": [
-                    _write_receipt_to_data(item) for item in self._receipts.values()
-                ],
-            },
-        )
+    def _invoke_adapter(
+        adapter: WriteConnector,
+        prepared: PreparedWrite,
+        idempotency_key: str,
+        max_retries: int,
+    ) -> tuple[WriteResult, int]:
+        result = WriteResult("failed", None, "Write adapter was not called.")
+        attempts = 0
+        for attempts in range(1, max_retries + 2):
+            try:
+                result = adapter.execute(dict(prepared.payload), idempotency_key)
+            except Exception as error:  # an ambiguous outcome is never retried
+                return (
+                    WriteResult("unknown", None, f"Write outcome unknown: {error}"),
+                    attempts,
+                )
+            if result.status in ("success", "unknown"):
+                break
+        return result, attempts
 
 
 def _prepared_write_to_data(value: PreparedWrite) -> dict[str, object]:
@@ -796,6 +758,10 @@ def _write_receipt_from_data(data: dict[str, object]) -> WriteReceipt:
         authorization_id=str(data.get("authorization_id", "unknown")),
         authorization_scope=str(data.get("authorization_scope", "")),
     )
+
+
+def _claim_owner() -> str:
+    return f"{os.getpid()}-{uuid4().hex}"
 
 
 def _validate_authority_scope(

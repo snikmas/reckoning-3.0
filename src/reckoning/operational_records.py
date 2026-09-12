@@ -192,10 +192,51 @@ class LocalOperationalRecordSource:
         )
 
     def _automation_snapshot(self) -> OperationalSnapshot:
-        data = read_json(
-            self._data_dir / "automation.json",
-            default={"schema_version": 1, "proposals": [], "runs": [], "receipts": []},
-        )
+        from reckoning.store_migration import has_sqlite_authority
+
+        path = self._data_dir / "automation.json"
+        if has_sqlite_authority(path):
+            from reckoning.automation import (
+                _proposal_to_data,
+                _receipt_to_data,
+                _run_to_data,
+            )
+            from reckoning.automation_store import SQLiteAutomationRepository
+
+            repository = SQLiteAutomationRepository(path)
+            data = {
+                "schema_version": 1,
+                "proposals": [
+                    _proposal_to_data(item) for item in repository.list_proposals()
+                ],
+                "runs": [
+                    {
+                        **run_data,
+                        "steps": list(run_data.get("steps", ())),
+                        "results": list(run_data.get("results", ())),
+                    }
+                    for run_data in (
+                        _run_to_data(item) for item in repository.list_runs()
+                    )
+                ],
+                "receipts": [
+                    {
+                        **_receipt_to_data(item),
+                        "results": list(_receipt_to_data(item).get("results", ())),
+                    }
+                    for item in repository.list_receipts()
+                ],
+            }
+        else:
+            data = read_json(
+                path,
+                default={
+                    "schema_version": 1,
+                    "proposals": [],
+                    "runs": [],
+                    "receipts": [],
+                },
+            )
         if data.get("schema_version") != 1:
             raise RuntimeError("Unsupported automation storage schema.")
         proposals = {
@@ -398,15 +439,68 @@ class LocalOperationalRecordSource:
         return OperationalSnapshot(receipts=receipts)
 
     def _external_write_snapshot(self) -> OperationalSnapshot:
-        data = read_json(
-            self._data_dir / "external-writes.json",
-            default={
+        from reckoning.store_migration import has_sqlite_authority
+
+        path = self._data_dir / "external-writes.json"
+        if has_sqlite_authority(path):
+            from reckoning.external_write_store import SQLiteExternalWriteRepository
+
+            repository = SQLiteExternalWriteRepository(path)
+            data = {
                 "schema_version": 1,
-                "writes": [],
-                "permissions": [],
-                "receipts": [],
-            },
-        )
+                "writes": [
+                    {
+                        "id": item.id,
+                        "connector_id": item.connector_id,
+                        "action_type": item.action_type,
+                        "target": item.target,
+                        "trigger": item.trigger,
+                        "boundary": item.boundary,
+                        "exact_approval_id": item.exact_approval_id,
+                    }
+                    for item in repository.list_prepared()
+                ],
+                "permissions": [
+                    {
+                        "id": item.id,
+                        "connector_id": item.connector_id,
+                        "action_type": item.action_type,
+                        "target": item.target,
+                        "trigger": item.trigger,
+                        "boundary": item.boundary,
+                        "revoked_at": (
+                            item.revoked_at.isoformat()
+                            if item.revoked_at is not None
+                            else None
+                        ),
+                    }
+                    for item in repository.list_permissions()
+                ],
+                "receipts": [
+                    {
+                        "write_id": item.write_id,
+                        "connector_id": item.connector_id,
+                        "status": item.status,
+                        "external_id": item.external_id,
+                        "detail": item.detail,
+                        "completed_at": item.completed_at.isoformat(),
+                        "authorization_kind": item.authorization_kind,
+                        "authorization_id": item.authorization_id,
+                        "authorization_scope": item.authorization_scope,
+                    }
+                    for item in repository.list_receipts()
+                ],
+            }
+        else:
+            data = read_json(
+                path,
+                default={
+                    "schema_version": 1,
+                    "writes": [],
+                    "permissions": [],
+                    "receipts": [],
+                },
+            )
         if data.get("schema_version") != 1:
             raise RuntimeError("Unsupported external-write storage schema.")
         writes = _objects(data.get("writes", []))
