@@ -7,6 +7,7 @@ import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from getpass import getpass
 from hmac import compare_digest
 from pathlib import Path
@@ -29,6 +30,11 @@ from reckoning.interfaces import (
 from reckoning.json_store import atomic_write_json, read_json
 from reckoning.operations import OperationError, load_installation_runtime
 from reckoning.provider_adapters import AdapterConfig
+from reckoning.providers import ProviderFailure
+from reckoning.telegram_delivery import (
+    SQLiteTelegramDeliveryRepository,
+    TelegramUpdateRecord,
+)
 from reckoning.web import validate_bind_host
 
 DEFAULT_TELEGRAM_CONFIG = Path.home() / ".config" / "reckoning" / "telegram.json"
@@ -40,6 +46,10 @@ TelegramConnectorStatus = Literal[
 
 class TelegramBotApiError(RuntimeError):
     """A safe-to-display Telegram Bot API failure."""
+
+    def __init__(self, message: str, *, outcome_unknown: bool = False) -> None:
+        super().__init__(message)
+        self.outcome_unknown = outcome_unknown
 
 
 class TelegramBotClient(Protocol):
@@ -321,8 +331,16 @@ class TelegramBotApi:
 
     def send_message(self, chat_id: str, text: str) -> None:
         chunks = _telegram_text_chunks(text)
-        for chunk in chunks:
-            self._call("sendMessage", {"chat_id": chat_id, "text": chunk})
+        for index, chunk in enumerate(chunks):
+            try:
+                self._call("sendMessage", {"chat_id": chat_id, "text": chunk})
+            except TelegramBotApiError as error:
+                if index == 0 or error.outcome_unknown:
+                    raise
+                raise TelegramBotApiError(
+                    str(error),
+                    outcome_unknown=True,
+                ) from error
 
     def _call(
         self,
@@ -341,8 +359,19 @@ class TelegramBotApi:
         try:
             with urlopen(request, timeout=timeout) as response:
                 decoded = json.loads(response.read())
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-            raise TelegramBotApiError(f"Telegram {method} request failed.") from None
+        except HTTPError as error:
+            raise TelegramBotApiError(
+                f"Telegram {method} request failed.",
+                outcome_unknown=(
+                    method == "sendMessage"
+                    and (error.code == 408 or error.code >= 500)
+                ),
+            ) from None
+        except (URLError, TimeoutError, json.JSONDecodeError):
+            raise TelegramBotApiError(
+                f"Telegram {method} request failed.",
+                outcome_unknown=method == "sendMessage",
+            ) from None
         if not isinstance(decoded, dict) or decoded.get("ok") is not True:
             description = (
                 str(decoded.get("description", "")).strip()
@@ -632,29 +661,155 @@ class TelegramPollingApplication:
         adapter: TelegramUpdateAdapter,
         client: TelegramBotClient,
         *,
+        repository: SQLiteTelegramDeliveryRepository,
         poll_timeout: int = 30,
+        worker_id: str | None = None,
+        delivery_retry_limit: int = 3,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
+        if delivery_retry_limit < 1:
+            raise ValueError("Telegram delivery retry limit must be positive.")
         self._adapter = adapter
         self._client = client
+        self._repository = repository
         self._poll_timeout = poll_timeout
+        self._worker_id = worker_id or f"poller-{secrets.token_urlsafe(12)}"
+        self._delivery_retry_limit = delivery_retry_limit
+        self._clock = clock
 
     def run_once(self, offset: int | None = None) -> int | None:
+        self._repository.initialize_offset(offset)
+        attempted_processing = set(self._repository.processing_candidates())
+        self._process_updates(tuple(sorted(attempted_processing)))
+        self._deliver_updates(
+            self._repository.delivery_candidates(
+                maximum_attempts=self._delivery_retry_limit
+            )
+        )
         updates = self._client.get_updates(
-            offset=offset,
+            offset=self._repository.next_offset(),
             timeout=self._poll_timeout,
         )
-        next_offset = offset
-        for update in updates:
-            update_id = update.get("update_id")
-            if not isinstance(update_id, int):
+        accepted = self._repository.accept_updates(
+            updates,
+            accepted_at=self._clock(),
+        )
+        newly_processable = tuple(
+            update_id
+            for update_id in accepted
+            if update_id not in attempted_processing
+        )
+        self._process_updates(newly_processable)
+        self._deliver_updates(
+            self._repository.delivery_candidates(
+                maximum_attempts=self._delivery_retry_limit
+            )
+        )
+        return self._repository.next_offset()
+
+    def retry_unknown_delivery(
+        self,
+        update_id: int,
+        *,
+        acknowledge_possible_duplicate: bool,
+    ) -> TelegramUpdateRecord:
+        self._repository.prepare_unknown_retry(
+            update_id,
+            prepared_at=self._clock(),
+            acknowledge_possible_duplicate=acknowledge_possible_duplicate,
+        )
+        self._deliver_updates((update_id,))
+        return self._repository.get_update(update_id)
+
+    def _process_updates(self, update_ids: tuple[int, ...]) -> None:
+        for update_id in update_ids:
+            record = self._repository.claim_processing(
+                update_id,
+                self._worker_id,
+                claimed_at=self._clock(),
+            )
+            if record is None:
                 continue
-            next_offset = max(next_offset or 0, update_id + 1)
             try:
-                reply = self._adapter.handle_update(update)
-            except (KeyError, PermissionError, ValueError):
+                reply = self._adapter.handle_update(record.update)
+            except (KeyError, PermissionError, ValueError) as error:
+                self._repository.discard_processing(
+                    update_id,
+                    self._worker_id,
+                    reason=str(error) or type(error).__name__,
+                    discarded_at=self._clock(),
+                )
                 continue
-            self._client.send_message(reply.chat_id, reply.text)
-        return next_offset
+            except Exception as error:
+                provider_failure = _provider_failure(error)
+                self._repository.fail_processing(
+                    update_id,
+                    self._worker_id,
+                    failure=str(error) or type(error).__name__,
+                    failed_at=self._clock(),
+                    outcome_unknown=provider_failure is None,
+                )
+                if provider_failure is None:
+                    raise
+                continue
+            self._repository.complete_processing(
+                update_id,
+                self._worker_id,
+                reply_chat_id=reply.chat_id,
+                reply_text=reply.text,
+                completed_at=self._clock(),
+            )
+
+    def _deliver_updates(self, update_ids: tuple[int, ...]) -> None:
+        for update_id in update_ids:
+            while True:
+                record = self._repository.claim_delivery(
+                    update_id,
+                    self._worker_id,
+                    claimed_at=self._clock(),
+                    maximum_attempts=self._delivery_retry_limit,
+                )
+                if record is None:
+                    break
+                if record.reply_chat_id is None or record.reply_text is None:
+                    self._repository.fail_delivery(
+                        update_id,
+                        self._worker_id,
+                        failure="Completed Telegram processing has no saved reply.",
+                        failed_at=self._clock(),
+                        outcome_unknown=True,
+                    )
+                    raise RuntimeError(
+                        "Completed Telegram processing has no saved reply."
+                    )
+                try:
+                    self._client.send_message(record.reply_chat_id, record.reply_text)
+                except TelegramBotApiError as error:
+                    self._repository.fail_delivery(
+                        update_id,
+                        self._worker_id,
+                        failure=str(error),
+                        failed_at=self._clock(),
+                        outcome_unknown=error.outcome_unknown,
+                    )
+                    if error.outcome_unknown:
+                        break
+                    continue
+                except Exception as error:
+                    self._repository.fail_delivery(
+                        update_id,
+                        self._worker_id,
+                        failure=str(error) or type(error).__name__,
+                        failed_at=self._clock(),
+                        outcome_unknown=True,
+                    )
+                    raise
+                self._repository.complete_delivery(
+                    update_id,
+                    self._worker_id,
+                    delivered_at=self._clock(),
+                )
+                break
 
     def run_forever(
         self,
@@ -949,6 +1104,12 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "reckoning gateway") 
     polling = TelegramPollingApplication(
         TelegramUpdateAdapter(gateway, authentication_token=gateway_token),
         TelegramBotApi(polling_settings.bot_token),
+        repository=SQLiteTelegramDeliveryRepository(
+            load_installation_runtime(
+                arguments.data_dir,
+                server_data_dir=arguments.server_data_dir,
+            ).state_path("confirmed-state", "telegram-delivery.json")
+        ),
     )
     try:
         polling.run_forever(
@@ -958,6 +1119,15 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "reckoning gateway") 
     except KeyboardInterrupt:
         print("\nTelegram polling stopped.")
     return 0
+
+
+def _provider_failure(error: BaseException) -> ProviderFailure | None:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, ProviderFailure):
+            return current
+        current = current.__cause__
+    return None
 
 
 if __name__ == "__main__":

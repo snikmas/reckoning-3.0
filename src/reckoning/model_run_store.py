@@ -215,6 +215,7 @@ def snapshot_database(path: Path) -> bytes:
 def validate_database(path: Path) -> None:
     from reckoning.persistence import validate_continuity_schema
     from reckoning.personal_context import validate_personal_context_schema
+    from reckoning.telegram_delivery import validate_telegram_delivery_schema
     from reckoning.trials import validate_trial_schema
 
     try:
@@ -237,6 +238,7 @@ def validate_database(path: Path) -> None:
                 raise RuntimeError("Incomplete model-run storage schema.")
             validate_continuity_schema(connection)
             validate_personal_context_schema(connection)
+            validate_telegram_delivery_schema(connection)
             validate_trial_schema(connection)
         finally:
             connection.close()

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+from collections.abc import Iterable
 from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime
-import json
 from pathlib import Path
-import sqlite3
-from collections.abc import Iterable
 from typing import Any
 
 from reckoning.interfaces import (
@@ -34,6 +34,7 @@ class LocalOperationalRecordSource:
         return _merge_snapshots(
             self._continuity_snapshot(),
             self._model_run_snapshot(),
+            self._telegram_snapshot(),
             self._automation_snapshot(),
             self._connector_snapshot(),
             self._watch_snapshot(),
@@ -141,6 +142,54 @@ class LocalOperationalRecordSource:
                     )
                 )
         return OperationalSnapshot(tuple(receipts), tuple(failures))
+
+    def _telegram_snapshot(self) -> OperationalSnapshot:
+        from reckoning.telegram_delivery import inspect_telegram_updates
+
+        records = inspect_telegram_updates(
+            self._data_dir / "telegram-delivery.json"
+        )
+        receipts: list[RunReceipt] = []
+        failures: list[OperationalFailure] = []
+        connector_health: list[str] = []
+        for record in records:
+            problem = _telegram_problem(record)
+            if problem is None:
+                continue
+            status, summary = problem
+            run_id = f"telegram:update:{record.update_id}"
+            connector_health.append(
+                f"telegram update {record.update_id}: {status}"
+            )
+            receipts.append(
+                RunReceipt(
+                    id=run_id,
+                    occurred_at=record.updated_at,
+                    status=status,
+                    summary=summary,
+                    evidence=(
+                        f"processing state: {record.processing_state}",
+                        f"delivery state: {record.delivery_state}",
+                        f"delivery attempts: {record.delivery_attempts}",
+                    ),
+                    connector_health=(connector_health[-1],),
+                    tools=("telegram",),
+                    actions=("process and deliver Telegram update",),
+                )
+            )
+            failures.append(
+                OperationalFailure(
+                    id=f"telegram-failure:{record.update_id}",
+                    run_id=run_id,
+                    summary=summary,
+                    occurred_at=record.updated_at,
+                )
+            )
+        return OperationalSnapshot(
+            tuple(receipts),
+            tuple(failures),
+            connector_health=tuple(connector_health),
+        )
 
     def _automation_snapshot(self) -> OperationalSnapshot:
         data = read_json(
@@ -430,6 +479,31 @@ class LocalOperationalRecordSource:
             permissions=active_permissions,
             approvals=approvals,
         )
+
+
+def _telegram_problem(record: Any) -> tuple[str, str] | None:
+    if record.delivery_state == "unknown":
+        return (
+            "delivery-unknown",
+            record.delivery_failure
+            or "Telegram delivery outcome is unknown; automatic retry is disabled.",
+        )
+    if record.delivery_state == "failed":
+        return (
+            "delivery-failed",
+            record.delivery_failure or "Telegram delivery failed.",
+        )
+    if record.processing_state == "processing-unknown":
+        return (
+            "processing-unknown",
+            record.processing_failure or "Telegram processing outcome is unknown.",
+        )
+    if record.processing_state == "provider-failed":
+        return (
+            "provider-failed",
+            record.processing_failure or "Telegram model processing failed.",
+        )
+    return None
 
 
 def _objects(value: object) -> tuple[dict[str, Any], ...]:
