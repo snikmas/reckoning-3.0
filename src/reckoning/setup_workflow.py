@@ -2028,7 +2028,12 @@ class SetupWorkflow:
                 STATUS_PROMPT,
                 (
                     MenuOption("verify-all", STATUS_VERIFY_ALL),
-                    MenuOption("repair", STATUS_REPAIR, available=bool(failing)),
+                    MenuOption(
+                        "repair",
+                        STATUS_REPAIR,
+                        available=bool(failing),
+                        note="" if failing else STATUS_NOTHING_FAILING,
+                    ),
                     MenuOption("edit", STATUS_EDIT),
                     MenuOption("exit", STATUS_EXIT),
                 ),
