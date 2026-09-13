@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from io import BytesIO
 from typing import Callable, Iterable
@@ -13,6 +14,11 @@ from reckoning.interfaces import (
     InMemoryInterfaceRepository,
     PlacementPolicy,
     ReckoningInterfaceApplication,
+)
+from reckoning.continuity import (
+    Reckoning,
+    ReckoningDraft,
+    WhyView,
 )
 from reckoning.processing import ProcessingDestination, ProcessingScopeStatus
 from reckoning.web import ReckoningWebApplication, validate_allowed_origin
@@ -50,6 +56,26 @@ class RecordingCore:
         self.actions: list[tuple[str, str]] = []
         self.processing_version = 0
         self.processing_categories: tuple[str, ...] = ()
+        self._operations: dict[str, tuple[str, str]] = {}
+        self._reckoning = Reckoning(
+            id="decision-1",
+            version=1,
+            status="proposed",
+            created_at=datetime.now(timezone.utc),
+            source_input="test situation",
+            draft=ReckoningDraft(
+                conflict="test conflict",
+                questions=(),
+                matters_now=(),
+                maintained=(),
+                parked=(),
+                uncertainties=(),
+                known=(),
+                inferences=(),
+                evidence=(),
+                next_step="test next step",
+            ),
+        )
 
     def open_session(self) -> tuple[object, ...]:
         return ()
@@ -90,6 +116,54 @@ class RecordingCore:
         self.processing_categories = categories
         self.actions.append(("processing", ",".join(categories)))
         return self.processing_scope_status()
+
+    def start_reckoning(
+        self, text: str, *, operation_id: str | None = None
+    ) -> Reckoning:
+        if operation_id is not None:
+            payload = f"start:{text}"
+            previous = self._operations.get(operation_id)
+            if previous is not None:
+                if previous[0] != payload:
+                    from reckoning.continuity import ReckoningOperationConflict
+
+                    raise ReckoningOperationConflict(operation_id)
+                return self._reckoning
+            self._operations[operation_id] = (payload, self._reckoning.id)
+        self.actions.append(("start", f"{text}:{operation_id}"))
+        return self._reckoning
+
+    def correct_personal_record(
+        self,
+        reckoning_id: str,
+        record_id: str,
+        corrected_meaning: str,
+        *,
+        expected_revision: int | None = None,
+        operation_id: str | None = None,
+    ) -> Reckoning:
+        self.actions.append(
+            ("correct_record", f"{reckoning_id}:{record_id}:{corrected_meaning}")
+        )
+        return self._reckoning
+
+    def confirm_reckoning(
+        self,
+        reckoning_id: str,
+        *,
+        expected_revision: int | None = None,
+        operation_id: str | None = None,
+    ) -> Reckoning:
+        self.actions.append(("confirm", f"{reckoning_id}:{operation_id}"))
+        return self._reckoning
+
+    def inspect_reckoning(self, reckoning_id: str) -> Reckoning:
+        self.actions.append(("inspect", reckoning_id))
+        return self._reckoning
+
+    def explain_reckoning(self, reckoning_id: str) -> WhyView:
+        self.actions.append(("explain", reckoning_id))
+        return WhyView(reckoning_id=reckoning_id, evidence=(), record_versions=())
 
 
 def build_web(
@@ -392,3 +466,170 @@ def test_submission_failure_stays_in_simon_and_never_shows_a_success_reply() -> 
     assert b"Provider unavailable" in page
     assert b"Persisted Simon reply" not in page
     assert interface.channel_session("web") == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "form"),
+    (
+        ("/decisions", {"situation": "Conflict situation"}),
+        ("/decisions/decision-1/confirm", {"expected_revision": "1"}),
+        ("/decisions/decision-1/reopen", {}),
+        (
+            "/decisions/decision-1/records/record-1/correct",
+            {"expected_revision": "1", "meaning": "Corrected meaning"},
+        ),
+    ),
+    ids=("create", "confirm", "reopen", "correct"),
+)
+def test_every_decision_mutation_rejects_untrusted_browser_requests_before_dispatch(
+    path: str, form: dict[str, str]
+) -> None:
+    web, _, _, core = build_web()
+    browser = BrowserSession(web)
+    browser.get("/simon")
+
+    denied, _, _ = browser.post(path, form, environ_overrides={"HTTP_HOST": "foreign.invalid"})
+    assert denied == "403 Forbidden"
+    assert core.actions == []
+
+
+@pytest.mark.parametrize(
+    ("path", "form"),
+    (
+        ("/decisions", {"situation": "Conflict situation"}),
+        ("/decisions/decision-1/confirm", {"expected_revision": "1"}),
+        (
+            "/decisions/decision-1/records/record-1/correct",
+            {"expected_revision": "1", "meaning": "Corrected meaning"},
+        ),
+    ),
+    ids=("create", "confirm", "correct"),
+)
+def test_decision_mutation_accepts_valid_browser_authority(
+    path: str, form: dict[str, str]
+) -> None:
+    web, _, _, core = build_web()
+    browser = BrowserSession(web)
+    browser.get("/simon")
+
+    status, headers, _ = browser.post(path, form)
+    assert status == "303 See Other"
+    assert headers["Location"].startswith("/decisions/")
+    assert any(action[0] in {"start", "confirm", "correct_record"} for action in core.actions)
+
+
+def test_missing_processing_grant_preserves_input_and_never_calls_provider() -> None:
+    class BlockingCore(RecordingCore):
+        def start_reckoning(
+            self, text: str, *, operation_id: str | None = None
+        ) -> Reckoning:
+            raise RuntimeError(
+                "Model processing is blocked because the destination lacks a grant "
+                "for: raw-reckoning-input."
+            )
+
+    responder = RecordingResponder()
+    interface = ReckoningInterfaceApplication(
+        repository=InMemoryInterfaceRepository(),
+        responder=responder,
+        placement=PlacementPolicy(
+            profile="local",
+            categories=(),
+            local_node_available=True,
+            server_node_available=False,
+        ),
+    )
+    core = BlockingCore()
+    web = ReckoningWebApplication(
+        core,  # type: ignore[arg-type]
+        interface_application=interface,
+        allowed_origins=("http://127.0.0.1:8000",),
+    )
+    browser = BrowserSession(web)
+    browser.get("/simon")
+
+    status, _, page = browser.post("/decisions", {"situation": "Blocked situation"})
+
+    assert status == "400 Bad Request"
+    assert b"Blocked situation" in page
+    assert responder.requests == []
+
+
+def test_invalid_provider_output_preserves_input_and_does_not_create_decision() -> None:
+    class InvalidProviderCore(RecordingCore):
+        def start_reckoning(
+            self, text: str, *, operation_id: str | None = None
+        ) -> Reckoning:
+            from reckoning.continuity import ReckoningProviderError
+
+            raise ReckoningProviderError("The provider returned an invalid reckoning.")
+
+    responder = RecordingResponder()
+    interface = ReckoningInterfaceApplication(
+        repository=InMemoryInterfaceRepository(),
+        responder=responder,
+        placement=PlacementPolicy(
+            profile="local",
+            categories=(),
+            local_node_available=True,
+            server_node_available=False,
+        ),
+    )
+    core = InvalidProviderCore()
+    web = ReckoningWebApplication(
+        core,  # type: ignore[arg-type]
+        interface_application=interface,
+        allowed_origins=("http://127.0.0.1:8000",),
+    )
+    browser = BrowserSession(web)
+    browser.get("/simon")
+
+    status, _, page = browser.post(
+        "/decisions", {"situation": "Invalid provider input"}
+    )
+
+    assert status == "400 Bad Request"
+    assert b"Invalid provider input" in page
+    assert b'data-area="simon"' in page
+
+
+def test_replayed_operation_id_with_same_payload_succeeds_without_duplicate() -> None:
+    web, _, _, core = build_web()
+    browser = BrowserSession(web)
+    browser.get("/simon")
+
+    status, headers, _ = browser.post(
+        "/decisions",
+        {"situation": "Same payload", "operation_id": "op-1"},
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == "/decisions/decision-1"
+    assert core.actions == [("start", "Same payload:op-1")]
+
+    status, headers, _ = browser.post(
+        "/decisions",
+        {"situation": "Same payload", "operation_id": "op-1"},
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == "/decisions/decision-1"
+    assert core.actions == [("start", "Same payload:op-1")]
+
+
+def test_replayed_operation_id_with_different_payload_is_rejected() -> None:
+    web, _, _, core = build_web()
+    browser = BrowserSession(web)
+    browser.get("/simon")
+
+    status, _, _ = browser.post(
+        "/decisions",
+        {"situation": "First payload", "operation_id": "op-2"},
+    )
+    assert status == "303 See Other"
+
+    status, _, page = browser.post(
+        "/decisions",
+        {"situation": "Different payload", "operation_id": "op-2"},
+    )
+    assert status == "400 Bad Request"
+    assert b"already completed with a different payload" in page
+    assert len(core.actions) == 1
