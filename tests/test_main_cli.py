@@ -124,6 +124,7 @@ def test_every_subcommand_accepts_help() -> None:
         "restore",
         "export",
         "migrate",
+        "evaluate",
     ):
         returncode, stdout, _ = run_dispatcher(command, "--help")
 
