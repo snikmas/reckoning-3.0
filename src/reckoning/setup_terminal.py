@@ -17,8 +17,9 @@ Setup uses the normal terminal buffer and redraws only the active menu
 region, so scrollback is preserved. All user-facing copy lives in
 ``setup_copy`` for later localization. Behavior is identical on Linux, macOS,
 and WSL: any posix terminal with a TTY gets the interactive renderer, color
-degrades from 256-color to basic ANSI to none (``NO_COLOR``), and box symbols
-degrade to ASCII when the terminal encoding is not UTF-8.
+degrades from 256-color to basic ANSI to none (``NO_COLOR``), and the
+selection marker and scroll symbols degrade to ASCII when the terminal
+encoding is not UTF-8.
 """
 
 from __future__ import annotations
@@ -140,6 +141,14 @@ class SignalTheme:
             return text
         return f"\x1b[1m{text}\x1b[0m"
 
+    def paint_selected(self, text: str) -> str:
+        """Bold dark text on a cyan background: the focused menu row."""
+        if self.mode == "none" or not text:
+            return text
+        if self.mode == "extended":
+            return f"\x1b[1;38;5;16;48;5;45m{text}\x1b[0m"
+        return f"\x1b[1;30;46m{text}\x1b[0m"
+
     # --- symbols ------------------------------------------------------------
 
     @property
@@ -155,20 +164,10 @@ class SignalTheme:
         return "○" if self.unicode else "-"
 
     @property
-    def row_idle(self) -> str:
-        return "○" if self.unicode else "-"
-
-    @property
-    def row_open(self) -> str:
-        return "┌─" if self.unicode else ">"
-
-    @property
-    def row_detail(self) -> str:
-        return "│" if self.unicode else "|"
-
-    @property
-    def row_close(self) -> str | None:
-        return "└─" if self.unicode else None
+    def row_selected(self) -> str:
+        if self.mode == "none":
+            return ">"
+        return "›" if self.unicode else ">"
 
     @property
     def scroll_above(self) -> str:
@@ -335,19 +334,18 @@ class MenuSession:
             note = f"  {option.note}" if option.note else ""
             return [theme.paint("muted", f"    {option.label}{note}")]
         if option.id != self.selected_id:
-            return [f"  {theme.row_idle} {option.label}"]
-        header = theme.paint(
-            "navigation", f"  {theme.row_open} {option.label}", bold=True
-        )
-        rows = [header]
+            return [f"    {option.label}"]
+        # Highlight only the marker, label, and a little padding — never the
+        # full terminal width — so the row cannot wrap under the cursor.
+        rows = [
+            f"  {theme.paint_selected(f'{theme.row_selected} {option.label} ')}"
+        ]
         if option.note:
-            indent = f"  {theme.row_detail}  "
+            indent = "      "
             for wrapped in textwrap.wrap(
                 option.note, width=max(28, width - len(indent))
             ):
                 rows.append(theme.paint("current", f"{indent}{wrapped}"))
-        if theme.row_close is not None:
-            rows.append(theme.paint("navigation", f"  {theme.row_close}"))
         return rows
 
 
@@ -485,7 +483,7 @@ class InteractiveUI(PlainTextUI):
 
     Falls back to numbered prompts when stdin is not a TTY or the platform
     is not posix. ``NO_COLOR`` keeps the interactive menus but removes all
-    color; a non-UTF-8 terminal encoding replaces box symbols with ASCII.
+    color; a non-UTF-8 terminal encoding replaces Unicode markers with ASCII.
     """
 
     def __init__(

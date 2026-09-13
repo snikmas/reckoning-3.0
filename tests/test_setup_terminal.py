@@ -27,6 +27,7 @@ from reckoning.setup_workflow import (
 
 NO_COLOR_UNICODE = SignalTheme(mode="none", unicode=True)
 NO_COLOR_ASCII = SignalTheme(mode="none", unicode=False)
+COLOR_UNICODE = SignalTheme(mode="extended", unicode=True)
 
 
 def make_plain(lines: list[str]):
@@ -176,8 +177,10 @@ def test_non_interactive_ui_uses_confirm_defaults() -> None:
 # --- Signal menu session (pure rendering and transitions) --------------------
 
 
-def render(session: MenuSession, theme: SignalTheme = NO_COLOR_UNICODE) -> str:
-    return "\n".join(session.lines(theme, width=72, max_rows=8))
+def render(
+    session: MenuSession, theme: SignalTheme = NO_COLOR_UNICODE, width: int = 72
+) -> str:
+    return "\n".join(session.lines(theme, width=width, max_rows=8))
 
 
 def test_selected_row_is_dominant_and_shows_its_explanation_nearby() -> None:
@@ -187,13 +190,99 @@ def test_selected_row_is_dominant_and_shows_its_explanation_nearby() -> None:
     )
     session = MenuSession("Pick:", options, allow_back=True, help_available=True)
 
+    text = render(session, theme=COLOR_UNICODE)
+
+    assert "› Alpha" in text
+    assert "      The first explanation." in text
+    assert "    Beta" in text
+    assert "The second explanation." not in text
+    assert "┌" not in text and "└" not in text and "│" not in text
+    assert "○" not in text
+
+
+def test_selected_row_uses_a_cyan_highlight_that_moves_with_the_selection() -> None:
+    options = (MenuOption("a", "Alpha"), MenuOption("b", "Beta"))
+    session = MenuSession("Pick:", options, allow_back=True, help_available=False)
+
+    first = render(session, theme=COLOR_UNICODE)
+
+    assert "\x1b[1;38;5;16;48;5;45m› Alpha \x1b[0m" in first
+    assert "› Beta" not in first
+
+    session.move(1)
+    moved = render(session, theme=COLOR_UNICODE)
+
+    assert "\x1b[1;38;5;16;48;5;45m› Beta \x1b[0m" in moved
+    assert "› Alpha" not in moved
+    assert "┌" not in moved and "└" not in moved and "│" not in moved
+
+
+def test_selected_highlight_has_readable_foreground_in_both_color_modes() -> None:
+    extended = SignalTheme(mode="extended", unicode=True)
+    basic = SignalTheme(mode="basic", unicode=True)
+    none = SignalTheme(mode="none", unicode=True)
+
+    assert extended.paint_selected("x") == "\x1b[1;38;5;16;48;5;45mx\x1b[0m"
+    assert basic.paint_selected("x") == "\x1b[1;30;46mx\x1b[0m"
+    assert none.paint_selected("x") == "x"
+
+
+def test_selected_marker_degrades_to_ascii_without_color_or_unicode() -> None:
+    options = (MenuOption("a", "Selected option"), MenuOption("b", "Other"))
+    session = MenuSession("Pick:", options, allow_back=True, help_available=False)
+
+    no_color = render(session, theme=NO_COLOR_UNICODE)
+    assert "> Selected option" in no_color
+    assert "›" not in no_color
+
+    ascii_color = render(session, theme=SignalTheme(mode="basic", unicode=False))
+    assert "> Selected option" in strip_ansi(ascii_color)
+    assert "›" not in ascii_color
+
+
+def test_disabled_rows_stay_muted_aligned_and_explain_why() -> None:
+    options = (
+        MenuOption("verify", "Verify all (makes live checks)"),
+        MenuOption(
+            "repair",
+            "Repair a failing section",
+            available=False,
+            note="Nothing is failing.",
+        ),
+        MenuOption("edit", "Edit one section"),
+    )
+    session = MenuSession("What next?", options, allow_back=False, help_available=False)
+
     text = render(session)
 
-    assert "┌─ Alpha" in text
-    assert "│  The first explanation." in text
-    assert "└─" in text
-    assert "○ Beta" in text
-    assert "The second explanation." not in text
+    assert "    Repair a failing section  Nothing is failing." in text
+    assert session.selected_id == "verify"
+    session.move(1)
+    assert session.selected_id == "edit"  # the disabled row is skipped
+
+
+def test_narrow_terminals_wrap_the_note_and_keep_the_highlight_short() -> None:
+    options = (
+        MenuOption(
+            "a",
+            "Alpha",
+            note="A longer explanation that must wrap onto several short rows.",
+        ),
+        MenuOption("b", "Beta"),
+    )
+    session = MenuSession("Pick:", options, allow_back=True, help_available=False)
+
+    text = render(session, theme=COLOR_UNICODE, width=40)
+
+    # The highlight covers only the marker, the label, and small padding.
+    assert "\x1b[1;38;5;16;48;5;45m› Alpha \x1b[0m" in text
+    note_lines = [
+        line
+        for line in (strip_ansi(line) for line in text.splitlines())
+        if line.startswith("      ")
+    ]
+    assert len(note_lines) > 1
+    assert all(len(line) <= 40 for line in note_lines)
 
 
 def test_small_menus_are_arrow_only_and_the_footer_names_supported_controls() -> None:
@@ -282,7 +371,7 @@ def test_long_lists_scroll_and_report_choices_above_and_below() -> None:
     last_page = render(session)
     assert "12 more above" in last_page
     assert "more below" not in last_page
-    assert "┌─ model-20" in last_page
+    assert "> model-20" in last_page
     assert "model-01" not in last_page
 
 
@@ -313,16 +402,17 @@ def test_no_color_rendering_preserves_every_label_explanation_and_control() -> N
     assert "Ctrl+C save & exit" in text
 
 
-def test_ascii_fallback_replaces_box_symbols_but_keeps_the_structure() -> None:
+def test_ascii_fallback_drops_the_unicode_marker_but_keeps_the_structure() -> None:
     options = (MenuOption("a", "Alpha", note="Detail."), MenuOption("b", "Beta"))
     session = MenuSession("Pick:", options, allow_back=True, help_available=False)
 
     text = render(session, theme=NO_COLOR_ASCII)
 
     assert "> Alpha" in text
-    assert "|  Detail." in text
-    assert "- Beta" in text
+    assert "      Detail." in text
+    assert "    Beta" in text
     assert "┌" not in text and "└" not in text and "│" not in text
+    assert "○" not in text and "›" not in text
     assert "Up/Down move" in text
 
 
@@ -429,7 +519,10 @@ except SetupExit:
         initial = read_until(master, b"Esc back")
         collected.extend(initial)
         assert b"Choose an AI provider" in initial
-        assert "┌─ OrcaRouter".encode() in initial
+        # The selected row carries the cyan highlight and the › marker.
+        assert b"\x1b[1;38;5;16;48;5;45m" in initial
+        assert "› OrcaRouter".encode() in initial
+        assert "┌".encode() not in initial and "└".encode() not in initial
         # The selected row's explanation renders nearby.
         assert b"One key, many models." in initial
         # The footer names only controls this screen supports.
@@ -440,7 +533,11 @@ except SetupExit:
         redraw = read_until(master, b"Esc back")
         collected.extend(redraw)
         assert b"\x1b[J" in redraw
-        assert "┌─ DeepSeek".encode() in redraw
+        frame = redraw.rsplit(b"\x1b[J", 1)[-1]
+        # The highlight moved with the selection; nothing stays highlighted.
+        assert "› DeepSeek".encode() in frame
+        assert "› OrcaRouter".encode() not in frame
+        assert "┌".encode() not in frame and "│".encode() not in frame
 
         os.write(master, b"\x03")
         collected.extend(read_until(master, b"EXIT"))

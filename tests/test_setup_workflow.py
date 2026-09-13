@@ -78,7 +78,8 @@ class ScriptedUI:
         self.lines.append(prompt)
         for option in options:
             marker = "" if option.available and not option.dim else " (dim)"
-            self.lines.append(f"  option: {option.id} {option.label}{marker}")
+            note = f" — {option.note}" if option.note else ""
+            self.lines.append(f"  option: {option.id} {option.label}{marker}{note}")
         value = self._next("choose", key)
         if value == "__back__":
             from reckoning.setup_workflow import SetupBack
@@ -1105,6 +1106,8 @@ def test_the_status_view_loads_without_network_and_offers_actions(
     assert "Setup draft: none" in displayed
     assert "Installation format: current" in displayed
     assert "Verify all" in displayed
+    # Repair is disabled, and the row explains why.
+    assert "option: repair Repair a failing section (dim) — Nothing is failing." in displayed
 
 
 def test_status_repairs_an_invalid_draft_only_after_confirmation(
