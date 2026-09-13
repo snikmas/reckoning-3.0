@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -14,7 +15,9 @@ from reckoning.continuity import (
     InMemoryReckoningRepository,
     PersonalRecordVersion,
     Reckoning,
+    ReckoningOperationConflict,
     ReckoningProvider,
+    ReckoningProviderError,
     ReckoningProviderResult,
     ReckoningRevisionConflict,
     ReckoningRepository,
@@ -163,6 +166,45 @@ class ModelRunRepository(Protocol):
 
 
 @dataclass(frozen=True)
+class CompletedOperation:
+    operation_id: str
+    payload_digest: str
+    result_id: str
+    completed_at: datetime
+
+
+class OperationLog(Protocol):
+    def lookup(self, operation_id: str) -> CompletedOperation | None: ...
+
+    def record(
+        self,
+        operation_id: str,
+        payload_digest: str,
+        result_id: str,
+        completed_at: datetime,
+    ) -> None: ...
+
+
+class InMemoryOperationLog:
+    def __init__(self) -> None:
+        self._operations: dict[str, CompletedOperation] = {}
+
+    def lookup(self, operation_id: str) -> CompletedOperation | None:
+        return self._operations.get(operation_id)
+
+    def record(
+        self,
+        operation_id: str,
+        payload_digest: str,
+        result_id: str,
+        completed_at: datetime,
+    ) -> None:
+        self._operations[operation_id] = CompletedOperation(
+            operation_id, payload_digest, result_id, completed_at
+        )
+
+
+@dataclass(frozen=True)
 class ApplicationDependencies:
     clock: Clock
     model: ModelProvider
@@ -188,6 +230,7 @@ class ApplicationDependencies:
     processing_scope: ProcessingScope | UnrestrictedProcessingScope = field(
         default_factory=UnrestrictedProcessingScope
     )
+    operation_log: OperationLog = field(default_factory=InMemoryOperationLog)
 
 
 class ProtectedResponsePolicy:
@@ -585,10 +628,48 @@ class ReckoningApplication:
         )
         return self.processing_scope_status()
 
-    def start_reckoning(self, text: str) -> Reckoning:
+    def _operation_payload_digest(self, *parts: object) -> str:
+        text = "|".join(str(part) for part in parts)
+        return sha256(text.encode("utf-8")).hexdigest()
+
+    def _check_operation_id(
+        self, operation_id: str | None, payload_digest: str
+    ) -> str | None:
+        if operation_id is None:
+            return None
+        completed = self._dependencies.operation_log.lookup(operation_id)
+        if completed is not None:
+            if completed.payload_digest != payload_digest:
+                raise ReckoningOperationConflict(operation_id)
+            return completed.result_id
+        return None
+
+    def _record_operation(
+        self,
+        operation_id: str | None,
+        payload_digest: str,
+        result_id: str,
+    ) -> None:
+        if operation_id is None:
+            return
+        self._dependencies.operation_log.record(
+            operation_id,
+            payload_digest,
+            result_id,
+            self._dependencies.clock.now(),
+        )
+
+    def start_reckoning(
+        self, text: str, *, operation_id: str | None = None
+    ) -> Reckoning:
         source_input = text.strip()
         if not source_input:
             raise ValueError("A situation cannot be empty.")
+
+        payload_digest = self._operation_payload_digest(source_input)
+        previous_result = self._check_operation_id(operation_id, payload_digest)
+        if previous_result is not None:
+            return self._dependencies.reckoning_repository.get(previous_result)
 
         processing = self._dependencies.processing_scope.evaluate(
             ("raw-reckoning-input",),
@@ -620,7 +701,7 @@ class ReckoningApplication:
             draft = provider_result
         try:
             draft.validate()
-        except RuntimeError:
+        except RuntimeError as error:
             if observed_result is not None:
                 self._dependencies.model_runs.save_run(
                     self._reckoning_run_record(
@@ -630,7 +711,7 @@ class ReckoningApplication:
                         failure="The provider returned an invalid reckoning.",
                     )
                 )
-            raise
+            raise ReckoningProviderError(str(error)) from error
         if observed_result is not None:
             rendered_draft = repr(draft)
             if self._dependencies.response_policy.apply(rendered_draft) != rendered_draft:
@@ -676,6 +757,7 @@ class ReckoningApplication:
             record_versions=record_versions,
         )
         self._dependencies.reckoning_repository.save(reckoning, expected_version=0)
+        self._record_operation(operation_id, payload_digest, reckoning.id)
         return reckoning
 
     def correct_personal_record(
@@ -685,10 +767,18 @@ class ReckoningApplication:
         corrected_meaning: str,
         *,
         expected_revision: int | None = None,
+        operation_id: str | None = None,
     ) -> Reckoning:
         meaning = corrected_meaning.strip()
         if not meaning:
             raise ValueError("A correction cannot be empty.")
+
+        payload_digest = self._operation_payload_digest(
+            reckoning_id, record_id, meaning, expected_revision
+        )
+        previous_result = self._check_operation_id(operation_id, payload_digest)
+        if previous_result is not None:
+            return self._dependencies.reckoning_repository.get(previous_result)
 
         reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
         if expected_revision is not None and reckoning.version != expected_revision:
@@ -735,17 +825,30 @@ class ReckoningApplication:
         self._dependencies.reckoning_repository.save(
             corrected, expected_version=reckoning.version
         )
+        self._record_operation(operation_id, payload_digest, reckoning_id)
         return corrected
 
     def confirm_reckoning(
-        self, reckoning_id: str, *, expected_revision: int | None = None
+        self,
+        reckoning_id: str,
+        *,
+        expected_revision: int | None = None,
+        operation_id: str | None = None,
     ) -> Reckoning:
+        payload_digest = self._operation_payload_digest(
+            reckoning_id, expected_revision
+        )
+        previous_result = self._check_operation_id(operation_id, payload_digest)
+        if previous_result is not None:
+            return self._dependencies.reckoning_repository.get(previous_result)
+
         reckoning = self._dependencies.reckoning_repository.get(reckoning_id)
         if expected_revision is not None and reckoning.version != expected_revision:
             raise ReckoningRevisionConflict(
                 reckoning_id, expected_revision, reckoning.version
             )
         if reckoning.status == "confirmed":
+            self._record_operation(operation_id, payload_digest, reckoning_id)
             return reckoning
 
         confirmed_at = self._dependencies.clock.now()
@@ -768,6 +871,7 @@ class ReckoningApplication:
         self._dependencies.reckoning_repository.save(
             confirmed, expected_version=reckoning.version
         )
+        self._record_operation(operation_id, payload_digest, reckoning_id)
         return confirmed
 
     def explain_reckoning(self, reckoning_id: str) -> WhyView:

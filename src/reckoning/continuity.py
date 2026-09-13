@@ -171,6 +171,20 @@ class ReckoningRevisionConflict(RuntimeError):
         self.actual = actual
 
 
+class ReckoningOperationConflict(RuntimeError):
+    """Raised when an operation id is reused with a different payload."""
+
+    def __init__(self, operation_id: str) -> None:
+        super().__init__(
+            f"Operation {operation_id} was already completed with a different payload."
+        )
+        self.operation_id = operation_id
+
+
+class ReckoningProviderError(RuntimeError):
+    """Raised when the reckoning provider returns an invalid typed result."""
+
+
 class ReckoningProvider(Protocol):
     def reckon(
         self, unstructured_input: str
@@ -265,4 +279,11 @@ class DeterministicFakeReckoningProvider:
             ),
             evidence=(evidence,),
             next_step="Name the nearest irreversible consequence among the concerns.",
+            proposed_records=(
+                PersonalRecordProposal(
+                    record_type="current_state",
+                    meaning="The user has chosen one primary concern to protect.",
+                    evidence_ids=(evidence.id,),
+                ),
+            ),
         )

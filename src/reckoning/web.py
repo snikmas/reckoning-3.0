@@ -13,11 +13,22 @@ from urllib.parse import parse_qs, urlsplit
 from wsgiref.simple_server import make_server
 from wsgiref.types import StartResponse, WSGIEnvironment
 
-from reckoning.application import Message, ReckoningApplication, create_local_application
+from reckoning.application import (
+    Message,
+    ReckoningApplication,
+    create_local_application,
+)
 from reckoning.config import (
     CREDENTIAL_PROVIDER_NAMES,
     DEFAULT_PROVIDER_CREDENTIALS,
     RuntimeProviderSettings,
+)
+from reckoning.continuity import (
+    Reckoning,
+    ReckoningOperationConflict,
+    ReckoningProviderError,
+    ReckoningRevisionConflict,
+    WhyView,
 )
 from reckoning.interfaces import (
     ControlView,
@@ -304,7 +315,175 @@ class ReckoningWebApplication:
                 [("Location", "/simon"), ("Content-Length", "0")],
             )
             return [b""]
+        decision_action = self._decision_action(method, path)
+        if decision_action is not None:
+            return self._handle_decision_request(
+                decision_action,
+                environ,
+                start_response,
+                csrf_token=csrf_token,
+                response_headers=response_headers,
+            )
         return None
+
+    def _handle_decision_request(
+        self,
+        action: tuple[str, str, str],
+        environ: WSGIEnvironment,
+        start_response: StartResponse,
+        *,
+        csrf_token: str,
+        response_headers: tuple[tuple[str, str], ...],
+    ) -> list[bytes]:
+        action_name, reckoning_id, record_id = action
+        if action_name == "view":
+            try:
+                reckoning = self._application.inspect_reckoning(reckoning_id)
+                why = self._application.explain_reckoning(reckoning_id)
+            except (KeyError, RuntimeError) as error:
+                return self._html_response(
+                    start_response,
+                    "404 Not Found",
+                    self._render_interface_area(
+                        "simon", error=str(error), csrf_token=csrf_token
+                    ),
+                    extra_headers=response_headers,
+                )
+            return self._html_response(
+                start_response,
+                "200 OK",
+                self._render_interface_area(
+                    "decision",
+                    csrf_token=csrf_token,
+                    decision=reckoning,
+                    why=why,
+                ),
+                extra_headers=response_headers,
+            )
+        if action_name == "reopen":
+            start_response(
+                "303 See Other",
+                [
+                    ("Location", f"/decisions/{escape(reckoning_id, quote=True)}"),
+                    ("Content-Length", "0"),
+                ],
+            )
+            return [b""]
+        fields = self._read_form(environ)
+        operation_id = fields.get("operation_id", [""])[0]
+        pending_text = ""
+        try:
+            if action_name == "create":
+                pending_text = fields.get("situation", fields.get("message", [""]))[0]
+                reckoning = self._application.start_reckoning(
+                    pending_text, operation_id=operation_id or None
+                )
+                start_response(
+                    "303 See Other",
+                    [
+                        (
+                            "Location",
+                            f"/decisions/{escape(reckoning.id, quote=True)}",
+                        ),
+                        ("Content-Length", "0"),
+                    ],
+                )
+                return [b""]
+            expected_revision = int(fields.get("expected_revision", [""])[0])
+            if action_name == "correct_record":
+                pending_text = fields.get("meaning", [""])[0]
+                corrected = self._application.correct_personal_record(
+                    reckoning_id,
+                    record_id,
+                    pending_text,
+                    expected_revision=expected_revision,
+                    operation_id=operation_id or None,
+                )
+                start_response(
+                    "303 See Other",
+                    [
+                        (
+                            "Location",
+                            f"/decisions/{escape(corrected.id, quote=True)}",
+                        ),
+                        ("Content-Length", "0"),
+                    ],
+                )
+                return [b""]
+            if action_name == "confirm":
+                confirmed = self._application.confirm_reckoning(
+                    reckoning_id,
+                    expected_revision=expected_revision,
+                    operation_id=operation_id or None,
+                )
+                start_response(
+                    "303 See Other",
+                    [
+                        (
+                            "Location",
+                            f"/decisions/{escape(confirmed.id, quote=True)}",
+                        ),
+                        ("Content-Length", "0"),
+                    ],
+                )
+                return [b""]
+        except ReckoningRevisionConflict as error:
+            return self._html_response(
+                start_response,
+                "409 Conflict",
+                self._render_interface_area(
+                    "decision",
+                    error=str(error),
+                    csrf_token=csrf_token,
+                    pending_text=pending_text,
+                    decision=self._safe_decision(reckoning_id),
+                ),
+                extra_headers=response_headers,
+            )
+        except (ReckoningOperationConflict, ReckoningProviderError) as error:
+            error_area = "simon" if action_name == "create" else "decision"
+            return self._html_response(
+                start_response,
+                "400 Bad Request",
+                self._render_interface_area(
+                    error_area,
+                    error=str(error),
+                    csrf_token=csrf_token,
+                    pending_text=pending_text,
+                    decision=self._safe_decision(reckoning_id),
+                ),
+                extra_headers=response_headers,
+            )
+        except (KeyError, ValueError, RuntimeError) as error:
+            error_area = "simon" if action_name == "create" else "decision"
+            return self._html_response(
+                start_response,
+                "400 Bad Request",
+                self._render_interface_area(
+                    error_area,
+                    error=str(error),
+                    csrf_token=csrf_token,
+                    pending_text=pending_text,
+                    decision=self._safe_decision(reckoning_id),
+                ),
+                extra_headers=response_headers,
+            )
+        return self._html_response(
+            start_response,
+            "404 Not Found",
+            self._render_interface_area(
+                "simon", error="Unknown decision action.", csrf_token=csrf_token
+            ),
+            extra_headers=response_headers,
+        )
+
+    def _safe_decision(self, reckoning_id: str) -> Reckoning | None:
+        if not reckoning_id:
+            return None
+        try:
+            return self._application.inspect_reckoning(reckoning_id)
+        except (KeyError, RuntimeError):
+            return None
 
     def _browser_session(
         self, environ: WSGIEnvironment, *, create: bool
@@ -375,6 +554,28 @@ class ReckoningWebApplication:
         if not record_id or action not in {"correct", "confirm", "reject"}:
             return None
         return record_id, action
+
+    @staticmethod
+    def _decision_action(method: str, path: str) -> tuple[str, str, str] | None:
+        parts = path.strip("/").split("/")
+        if len(parts) == 1 and parts[0] == "decisions" and method == "POST":
+            return ("create", "", "")
+        if len(parts) == 2 and parts[0] == "decisions" and method == "GET":
+            return ("view", parts[1], "")
+        if len(parts) == 3 and parts[0] == "decisions" and method == "POST":
+            reckoning_id, action = parts[1], parts[2]
+            if action == "confirm":
+                return ("confirm", reckoning_id, "")
+            if action == "reopen":
+                return ("reopen", reckoning_id, "")
+        if (
+            len(parts) == 5
+            and parts[0] == "decisions"
+            and parts[2] == "records"
+            and method == "POST"
+        ):
+            return ("correct_record", parts[1], parts[3])
+        return None
 
     @staticmethod
     def _read_message(environ: WSGIEnvironment) -> str:
@@ -483,68 +684,65 @@ class ReckoningWebApplication:
 </html>"""
 
     def _render_interface_area(
-        self, area: str, error: str | None = None, *, csrf_token: str = ""
+        self,
+        area: str,
+        error: str | None = None,
+        *,
+        csrf_token: str = "",
+        pending_text: str = "",
+        decision: Reckoning | None = None,
+        why: WhyView | None = None,
     ) -> str:
         assert self._interfaces is not None
         visual_state = self._interfaces.visual_state()
+        status_label, status_modifier = self._status_pair(visual_state)
         if area == "home":
             home = self._interfaces.home()
-            content = f"""
-              <header><p class="eyebrow">Command center</p><h1>Home</h1></header>
-              <section class="priority" aria-labelledby="matters-now">
-                <h2 id="matters-now">What matters now</h2>{self._list(home.matters_now)}
-              </section>
-              <div class="disclosures">
-                <details><summary>What changed</summary>{self._list(home.changes)}</details>
-                <details><summary>Needs your decision</summary>
-                  {self._list(home.decisions)}</details>
-                <details><summary>System health</summary><p>{escape(home.health)}</p>
-                  <p>{escape(home.placement.notice)}</p></details>
-              </div>
-            """
+            content = self._render_home(home)
+            inspector = self._render_inspector(
+                status_label, status_modifier, visual_state=visual_state
+            )
         elif area == "control":
-            error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
-            content = (
-                self._render_control(self._interfaces.control())
-                + error_markup
-                + self._render_processing_scope(csrf_token)
+            content = self._render_control_area(
+                self._interfaces.control(), csrf_token, error=error
+            )
+            inspector = self._render_inspector(
+                status_label, status_modifier, visual_state=visual_state
             )
         elif area == "simon":
-            messages = self._interfaces.channel_session("web")
-            conversation = "".join(
-                '<article class="message">'
-                f'<strong>{"You" if message.role == "user" else "Simon"}</strong>'
-                f"<p>{escape(message.content)}</p></article>"
-                for message in messages
-            ) or '<p class="empty">Send Simon the first message.</p>'
-            error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
-            profile_review = (
-                self._render_profile_review(csrf_token)
-                if any(message.role == "assistant" for message in messages)
-                else ""
+            content = self._render_simon(
+                csrf_token, error=error, pending_text=pending_text
             )
-            content = f"""
-              <header><p class="eyebrow">Conversation</p><h1>Simon</h1></header>
-              <div aria-live="polite">{conversation}</div>{error_markup}
-              <form action="/messages" method="post">
-                <input type="hidden" name="_csrf_token"
-                  value="{escape(csrf_token, quote=True)}">
-                <label for="message">Your message</label>
-                <textarea id="message" name="message" required></textarea>
-                <button type="submit">Send</button>
-              </form>
-              {profile_review}
-            """
+            inspector = self._render_inspector(
+                status_label, status_modifier, visual_state=visual_state
+            )
+        elif area == "decision":
+            content = self._render_decision(
+                decision, why, csrf_token, error=error, pending_text=pending_text
+            )
+            inspector = self._render_inspector(
+                status_label,
+                status_modifier,
+                visual_state=visual_state,
+                decision=decision,
+                why=why,
+            )
         elif area == "plan":
             content = (
                 '<header><p class="eyebrow">Choose the work</p><h1>Plan</h1>'
                 "</header><p>Shape direction, goals, and feasible commitments.</p>"
+            )
+            inspector = self._render_inspector(
+                status_label, status_modifier, visual_state=visual_state
             )
         else:
             content = (
                 '<header><p class="eyebrow">Learn from outcomes</p><h1>Review</h1>'
                 "</header><p>Compare intentions with what happened and decide what "
                 "changes.</p>"
+            )
+            inspector = self._render_inspector(
+                status_label, status_modifier, visual_state=visual_state
             )
 
         task_areas = (
@@ -561,6 +759,25 @@ class ReckoningWebApplication:
             f'<span>{description}</span></a>'
             for slug, label, description in task_areas
         )
+        return self._render_shell(
+            area=area,
+            navigation=navigation,
+            content=content,
+            inspector=inspector,
+            visual_state=visual_state,
+            status_label=status_label,
+        )
+
+    def _render_shell(
+        self,
+        *,
+        area: str,
+        navigation: str,
+        content: str,
+        inspector: str,
+        visual_state: str,
+        status_label: str,
+    ) -> str:
         return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -568,76 +785,576 @@ class ReckoningWebApplication:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(area.title())} | Reckoning</title>
   <style>
-    :root {{ color-scheme: dark; font-family: ui-monospace, monospace; }}
+    :root {{
+      color-scheme: dark;
+      --bg: #050605;
+      --panel: #0a110a;
+      --panel-2: #111811;
+      --border: #1f2e1f;
+      --text: #e9f0e9;
+      --text-2: #9fb39f;
+      --green: #a6ff4d;
+      --green-dim: #6bbd1e;
+      --amber: #ffcc4d;
+      --gray: #8a9a8a;
+      --red: #ff7a7a;
+      --focus: #a6ff4d;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }}
     * {{ box-sizing: border-box; }}
-    body {{ background: #0b0e14; color: #e8edf6; margin: 0; min-height: 100vh; }}
-    .shell {{ display: grid; grid-template-columns: 15rem minmax(0, 1fr) 17rem;
-      min-height: 100vh; }}
-    nav {{ border-right: 1px solid #303846; display: flex; flex-direction: column;
-      gap: .4rem; padding: 1.5rem 1rem; }}
-    nav a {{ color: #b8c0cf; display: flex; flex-direction: column; justify-content: center;
-      min-height: 44px; padding: .65rem .8rem; text-decoration: none; }}
-    nav a span {{ font-size: .72rem; line-height: 1.3; margin-top: .2rem; }}
-    nav a[aria-current] {{ background: #1a2130; border-left: 3px solid #d6ff5f;
-      color: #fff; }}
-    main {{ max-width: 58rem; padding: 3rem clamp(1rem, 4vw, 4rem); width: 100%; }}
-    aside {{ border-left: 1px solid #303846; padding: 1.5rem; }}
-    .eyebrow {{ color: #9aa6bb; letter-spacing: .12em; text-transform: uppercase; }}
-    h1 {{ font-size: clamp(2rem, 5vw, 4rem); margin: 0 0 2rem; }}
-    h2 {{ font-size: 1rem; text-transform: uppercase; }}
-    .priority, details, .control-section {{ background: #141923; border: 1px solid #303846;
-      margin-bottom: .8rem; padding: 1.1rem; }}
-    .disclosures {{ display: grid; gap: .8rem;
-      grid-template-columns: repeat(3, minmax(0, 1fr)); }}
-    .disclosures details {{ margin-bottom: 0; min-width: 0; }}
-    summary {{ cursor: pointer; font-weight: 700; }}
-    .message {{ border-top: 1px solid #303846; padding-top: 1rem; }}
-    label, textarea {{ display: block; width: 100%; }}
-    textarea {{ background: #0b0e14; border: 1px solid #4d596d; color: inherit;
-      font: inherit; margin: .5rem 0 1rem; min-height: 7rem; padding: .75rem; }}
-    button {{ background: #d6ff5f; border: 0; color: #111; font: inherit;
-      font-weight: 700; padding: .7rem 1rem; }}
-    .error {{ color: #ff9d9d; }}
-    .simon-core {{ align-items: center; display: grid; gap: 1rem; justify-items: center; }}
-    .core-glyph {{ background: #171d29; border: 4px double #8f9db2; border-radius: 38%;
-      box-shadow: inset 0 0 0 6px #0b0e14; display: grid; height: 7rem; place-items: center;
-      position: relative; width: 7rem; }}
-    .core-glyph::before {{ border: 2px solid #d6ff5f; border-radius: 50%; content: "";
-      height: 2.2rem; width: 2.2rem; }}
-    [data-simon-state="warning"] .core-glyph, [data-simon-state="degraded"] .core-glyph
-      {{ border-color: #ff9d9d; }}
-    [data-simon-state="approval"] .core-glyph {{ border-color: #ffd166; }}
+    html, body {{
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      min-height: 100vh;
+    }}
+    body {{
+      font-size: 1rem;
+      line-height: 1.55;
+    }}
+    .shell {{
+      display: grid;
+      grid-template-columns: 14rem minmax(0, 1fr) 18rem;
+      min-height: 100vh;
+    }}
+    nav {{
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: .35rem;
+      padding: 1.25rem .875rem;
+    }}
+    nav a {{
+      border-radius: .35rem;
+      color: var(--text-2);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      min-height: 44px;
+      padding: .55rem .75rem;
+      text-decoration: none;
+    }}
+    nav a span {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .65rem;
+      letter-spacing: .08em;
+      line-height: 1.25;
+      text-transform: uppercase;
+    }}
+    nav a[aria-current] {{
+      background: var(--panel-2);
+      border-left: 3px solid var(--green);
+      color: var(--text);
+    }}
+    nav a:focus-visible {{
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }}
+    main {{
+      display: flex;
+      flex-direction: column;
+      max-width: 64rem;
+      padding: 2.5rem clamp(1rem, 4vw, 4rem) 6rem;
+      width: 100%;
+    }}
+    aside {{
+      background: var(--panel);
+      border-left: 1px solid var(--border);
+      padding: 1.25rem;
+    }}
+    .eyebrow {{
+      color: var(--text-2);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .7rem;
+      letter-spacing: .12em;
+      margin: 0 0 .4rem;
+      text-transform: uppercase;
+    }}
+    h1 {{
+      font-size: clamp(1.8rem, 4.5vw, 3.2rem);
+      font-weight: 700;
+      line-height: 1.1;
+      margin: 0 0 1.5rem;
+    }}
+    h2 {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .75rem;
+      font-weight: 700;
+      letter-spacing: .1em;
+      margin: 0 0 .75rem;
+      text-transform: uppercase;
+    }}
+    .card, .panel, details, .control-section {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: .4rem;
+      margin-bottom: .75rem;
+      padding: 1rem;
+    }}
+    .card:focus-within, .panel:focus-within {{
+      border-color: var(--green-dim);
+    }}
+    summary {{
+      cursor: pointer;
+      font-weight: 600;
+    }}
+    .composer {{
+      background: var(--panel);
+      border-top: 1px solid var(--border);
+      bottom: 0;
+      left: 14rem;
+      padding: .75rem clamp(1rem, 4vw, 4rem);
+      position: fixed;
+      right: 18rem;
+    }}
+    .composer form {{
+      display: flex;
+      gap: .5rem;
+    }}
+    .composer label {{
+      position: absolute;
+      left: -9999px;
+    }}
+    .composer textarea {{
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: .35rem;
+      color: inherit;
+      flex: 1 1 auto;
+      font: inherit;
+      min-height: 3.2rem;
+      padding: .65rem .85rem;
+      resize: vertical;
+    }}
+    .composer .actions {{
+      display: flex;
+      flex-direction: column;
+      gap: .4rem;
+    }}
+    button, .button {{
+      background: var(--green);
+      border: 0;
+      border-radius: .35rem;
+      color: #081008;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+      min-height: 44px;
+      padding: .55rem 1rem;
+    }}
+    button.secondary {{
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-2);
+    }}
+    button:focus-visible, .button:focus-visible, textarea:focus-visible {{
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }}
+    .error {{
+      background: rgba(255, 122, 122, .1);
+      border: 1px solid var(--red);
+      border-radius: .35rem;
+      color: var(--red);
+      padding: .75rem 1rem;
+    }}
+    .empty {{ color: var(--text-2); }}
+    .message {{
+      border-top: 1px solid var(--border);
+      padding: .9rem 0;
+    }}
+    .message strong {{
+      color: var(--green);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .75rem;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }}
+    .message p {{
+      margin: .35rem 0 0;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }}
+    .status {{
+      align-items: center;
+      display: flex;
+      gap: .5rem;
+    }}
+    .status::before {{
+      border-radius: 50%;
+      content: "";
+      display: inline-block;
+      height: .55rem;
+      width: .55rem;
+    }}
+    .status-ready::before {{ background: var(--green); }}
+    .status-reasoning::before {{ background: var(--amber); }}
+    .status-limited::before {{ background: var(--amber); }}
+    .status-failed::before {{ background: var(--red); }}
+    .status-proposed::before {{ background: var(--amber); }}
+    .status-corrected::before {{ background: var(--amber); }}
+    .status-confirmed::before {{ background: var(--green); }}
+    .status-unknown::before {{ background: var(--gray); }}
+    .inspector-toggle {{ display: none; }}
+    .inspector-panel details {{ margin-bottom: .5rem; }}
+    .inspector-panel ul {{
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }}
+    .inspector-panel li {{
+      border-top: 1px solid var(--border);
+      padding: .5rem 0;
+    }}
+    .inspector-panel li:first-child {{ border-top: 0; }}
+    .simon-core {{
+      align-items: center;
+      display: grid;
+      gap: .75rem;
+      justify-items: center;
+    }}
+    .core-glyph {{
+      background: var(--panel-2);
+      border: 4px double var(--text-2);
+      border-radius: 38%;
+      box-shadow: inset 0 0 0 6px var(--bg);
+      display: grid;
+      height: 6rem;
+      place-items: center;
+      position: relative;
+      width: 6rem;
+    }}
+    .core-glyph::before {{
+      border: 2px solid var(--green);
+      border-radius: 50%;
+      content: "";
+      height: 1.8rem;
+      width: 1.8rem;
+    }}
+    [data-simon-state="warning"] .core-glyph,
+    [data-simon-state="degraded"] .core-glyph {{ border-color: var(--red); }}
+    [data-simon-state="approval"] .core-glyph {{ border-color: var(--amber); }}
     [data-simon-state="execution"] .core-glyph {{ border-color: #70d6ff; }}
     [data-simon-state="listening"] .core-glyph {{ border-color: #7bdcb5; }}
     [data-simon-state="reasoning"] .core-glyph {{ border-color: #c4a7ff; }}
+    .proposal-card .record {{
+      border-top: 1px solid var(--border);
+      padding: 1rem 0;
+    }}
+    .proposal-card form {{
+      margin-top: .75rem;
+    }}
+    .next-action {{
+      color: var(--text-2);
+      font-size: .9rem;
+      margin-top: .5rem;
+    }}
     @media (max-width: 720px) {{
-      .shell {{ display: block; }}
-      nav {{ border-bottom: 1px solid #303846; border-right: 0; flex-direction: row;
-        overflow-x: auto; padding: .75rem; }}
+      .shell {{ grid-template-columns: 1fr; }}
+      nav {{
+        border-bottom: 1px solid var(--border);
+        border-right: 0;
+        flex-direction: row;
+        overflow-x: auto;
+        padding: .65rem;
+      }}
       nav a {{ flex: 0 0 auto; min-height: 44px; white-space: nowrap; }}
       nav a span {{ display: none; }}
-      main {{ padding: 1.5rem 1rem; }}
-      .disclosures {{ grid-template-columns: 1fr; }}
-      aside {{ border-left: 0; border-top: 1px solid #303846; padding: 1rem; }}
-      .simon-core {{ grid-template-columns: auto 1fr; justify-items: start; margin: 0; }}
-      .core-glyph {{ height: 4rem; width: 4rem; }}
+      main {{ padding: 1.25rem 1rem 7rem; }}
+      aside {{
+        border-left: 0;
+        border-top: 1px solid var(--border);
+        padding: 1rem;
+      }}
+      .composer {{
+        left: 0;
+        right: 0;
+      }}
+      .simon-core {{
+        grid-template-columns: auto 1fr;
+        justify-items: start;
+      }}
+      .core-glyph {{ height: 3.5rem; width: 3.5rem; }}
+      .inspector-panel {{ display: none; }}
+      .inspector-toggle {{ display: block; margin-bottom: .75rem; }}
+      .inspector-toggle[aria-expanded="true"] + .inspector-panel {{ display: block; }}
+    }}
+    @media (prefers-reduced-motion: reduce) {{
+      * {{ animation: none !important; transition: none !important; }}
     }}
   </style>
 </head>
-<body data-area="{escape(area)}">
+<body data-area="{escape(area)}" data-simon-state="{escape(visual_state)}">
   <div class="shell">
     <nav aria-label="Task areas">{navigation}</nav>
     <main>{content}</main>
     <aside>
-      <figure class="simon-core" role="img" aria-label="Simon, original mechanical core"
-        data-simon-state="{visual_state}">
+      <figure class="simon-core" role="img" aria-label="Simon, original mechanical core">
         <span class="core-glyph" aria-hidden="true"></span>
-        <figcaption>Simon · {visual_state}</figcaption>
+        <figcaption>Simon · {escape(status_label)}</figcaption>
       </figure>
+      {inspector}
     </aside>
   </div>
 </body>
 </html>"""
+
+    @staticmethod
+    def _status_pair(visual_state: str) -> tuple[str, str]:
+        mapping = {
+            "idle": ("ready", "status-ready"),
+            "listening": ("reasoning", "status-reasoning"),
+            "reasoning": ("reasoning", "status-reasoning"),
+            "approval": ("proposed", "status-proposed"),
+            "execution": ("reasoning", "status-reasoning"),
+            "warning": ("failed", "status-failed"),
+            "degraded": ("limited", "status-limited"),
+        }
+        return mapping.get(visual_state, ("ready", "status-ready"))
+
+    def _render_home(self, home) -> str:
+        return f"""
+          <header><p class="eyebrow">Command center</p><h1>Home</h1></header>
+          <section class="card" aria-labelledby="matters-now">
+            <h2 id="matters-now">What matters now</h2>{self._list(home.matters_now)}
+          </section>
+          <section class="card" aria-labelledby="what-changed">
+            <h2 id="what-changed">What changed</h2>{self._list(home.changes)}
+          </section>
+          <section class="card" aria-labelledby="needs-decision">
+            <h2 id="needs-decision">Needs your decision</h2>{self._list(home.decisions)}
+          </section>
+          <section class="card" aria-labelledby="system-health">
+            <h2 id="system-health">System health</h2>
+            <p>{escape(home.health)}</p>
+            <p>{escape(home.placement.notice)}</p>
+          </section>
+        """
+
+    def _render_control_area(
+        self, control: ControlView, csrf_token: str, *, error: str | None
+    ) -> str:
+        error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
+        return (
+            self._render_control(control)
+            + error_markup
+            + self._render_processing_scope(csrf_token)
+        )
+
+    def _render_simon(
+        self, csrf_token: str, *, error: str | None, pending_text: str
+    ) -> str:
+        assert self._interfaces is not None
+        messages = self._interfaces.channel_session("web")
+        conversation = "".join(
+            '<article class="message">'
+            f'<strong>{"You" if message.role == "user" else "Simon"}</strong>'
+            f"<p>{escape(message.content)}</p></article>"
+            for message in messages
+        ) or '<p class="empty">Send Simon the first message.</p>'
+        error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
+        profile_review = (
+            self._render_profile_review(csrf_token)
+            if any(message.role == "assistant" for message in messages)
+            else ""
+        )
+        return f"""
+          <header><p class="eyebrow">Conversation</p><h1>Simon</h1></header>
+          <div aria-live="polite">{conversation}</div>{error_markup}
+          {profile_review}
+          <div class="composer">
+            <form action="/messages" method="post">
+              <input type="hidden" name="_csrf_token"
+                value="{escape(csrf_token, quote=True)}">
+              <label for="message">Your message</label>
+              <textarea id="message" name="message" required
+                >{escape(pending_text)}</textarea>
+              <div class="actions">
+                <button type="submit">Send</button>
+                <button type="submit" formaction="/decisions" formmethod="post"
+                  class="secondary">Propose</button>
+              </div>
+            </form>
+          </div>
+        """
+
+    def _render_decision(
+        self,
+        decision: Reckoning | None,
+        why: WhyView | None,
+        csrf_token: str,
+        *,
+        error: str | None,
+        pending_text: str,
+    ) -> str:
+        if decision is None:
+            return (
+                '<header><p class="eyebrow">Decision</p><h1>Not found</h1></header>'
+                '<p class="empty">No decision is selected.</p>'
+            )
+        error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
+        status = "confirmed" if decision.status == "confirmed" else "proposed"
+        current_records = decision.current_records
+        records_html = "".join(
+            self._render_record_card(
+                decision.id, record, csrf_token, decision.version, status
+            )
+            for record in current_records
+        )
+        can_correct = status == "proposed"
+        correct_section = ""
+        confirm_form = ""
+        if can_correct and pending_text:
+            correct_section = f"""
+              <form action="/decisions/{escape(decision.id)}/records/{escape(current_records[0].record_id if current_records else '')}/correct" method="post">
+                <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
+                <input type="hidden" name="expected_revision" value="{decision.version}">
+                <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
+                <label for="pending-correction">Correction</label>
+                <textarea id="pending-correction" name="meaning" required>{escape(pending_text)}</textarea>
+                <button type="submit">Save correction</button>
+              </form>
+            """
+        composer = ""
+        if can_correct:
+            composer = f"""
+              <div class="composer">
+                <form action="/decisions/{escape(decision.id)}/records/{escape(current_records[0].record_id if current_records else '')}/correct" method="post">
+                  <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
+                  <input type="hidden" name="expected_revision" value="{decision.version}">
+                  <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
+                  <label for="decision-correction">Correction</label>
+                  <textarea id="decision-correction" name="meaning" required
+                    placeholder="Correct the meaning before confirming">{escape(pending_text)}</textarea>
+                  <div class="actions">
+                    <button type="submit">Save correction</button>
+                  </div>
+                </form>
+              </div>
+            """
+        elif status == "proposed" and current_records:
+            confirm_form = f"""
+              <form action="/decisions/{escape(decision.id)}/confirm" method="post">
+                <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
+                <input type="hidden" name="expected_revision" value="{decision.version}">
+                <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
+                <button type="submit">Confirm this version</button>
+              </form>
+            """
+        return f"""
+          <header>
+            <p class="eyebrow">Decision</p>
+            <h1>{escape(decision.draft.conflict)}</h1>
+          </header>
+          <div class="status {self._status_pair(status)[1]}" aria-live="polite">
+            {escape(self._status_pair(status)[0])}
+          </div>
+          {error_markup}
+          <section class="card proposal-card" aria-labelledby="proposal-heading">
+            <h2 id="proposal-heading">Proposal</h2>
+            <p><strong>Conflict:</strong> {escape(decision.draft.conflict)}</p>
+            <p><strong>Matters now:</strong> {escape(" ".join(decision.draft.matters_now))}</p>
+            <p><strong>Maintained:</strong> {escape(" ".join(decision.draft.maintained))}</p>
+            <p><strong>Parked:</strong> {escape(" ".join(decision.draft.parked))}</p>
+            <p class="next-action"><strong>Next step:</strong> {escape(decision.draft.next_step)}</p>
+            {records_html}
+            {confirm_form}
+          </section>
+          {correct_section}
+          {composer}
+        """
+
+    def _render_record_card(
+        self,
+        reckoning_id: str,
+        record,
+        csrf_token: str,
+        expected_revision: int,
+        decision_status: str,
+    ) -> str:
+        if decision_status == "confirmed":
+            return (
+                f'<article class="record" data-record-id="{escape(record.record_id)}">'
+                f'<p><strong>{escape(record.record_type)}</strong> · '
+                f'<span class="status status-confirmed">confirmed</span></p>'
+                f'<p>{escape(record.meaning)}</p></article>'
+            )
+        return f"""
+          <article class="record" data-record-id="{escape(record.record_id)}">
+            <p><strong>{escape(record.record_type)}</strong> · <span class="status status-proposed">proposed</span></p>
+            <p>{escape(record.meaning)}</p>
+            <form action="/decisions/{escape(reckoning_id)}/records/{escape(record.record_id)}/correct" method="post">
+              <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
+              <input type="hidden" name="expected_revision" value="{expected_revision}">
+              <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
+              <label for="meaning-{escape(record.record_id)}">Edit meaning</label>
+              <textarea id="meaning-{escape(record.record_id)}" name="meaning" required>{escape(record.meaning)}</textarea>
+              <button type="submit">Save correction</button>
+            </form>
+            <form action="/decisions/{escape(reckoning_id)}/confirm" method="post">
+              <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
+              <input type="hidden" name="expected_revision" value="{expected_revision}">
+              <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
+              <button type="submit">Confirm this version</button>
+            </form>
+          </article>
+        """
+
+    def _render_inspector(
+        self,
+        status_label: str,
+        status_modifier: str,
+        *,
+        visual_state: str,
+        decision: Reckoning | None = None,
+        why: WhyView | None = None,
+    ) -> str:
+        state_block = (
+            f'<p class="status {escape(status_modifier)}">'
+            f'{escape(status_label)}</p>'
+        )
+        decision_block = ""
+        if decision is not None and why is not None:
+            evidence_items = "".join(
+                f"<li><strong>{escape(item.source)}</strong> · {escape(item.content)}</li>"
+                for item in why.evidence
+            ) or '<li class="empty">No evidence recorded.</li>'
+            version_items = "".join(
+                f"<li>{escape(record.record_type)} v{record.version} · "
+                f"<span class=\"status status-{record.status}\">{escape(record.status)}</span> · "
+                f"{escape(record.meaning)}</li>"
+                for record in decision.record_versions
+            ) or '<li class="empty">No versions recorded.</li>'
+            decision_block = f"""
+              <details open>
+                <summary>Evidence</summary>
+                <ul>{evidence_items}</ul>
+              </details>
+              <details open>
+                <summary>Versions</summary>
+                <ul>{version_items}</ul>
+              </details>
+              <details open>
+                <summary>Status</summary>
+                <p class="status status-{escape(decision.status)}">{escape(decision.status)}</p>
+                <p>Revision {decision.version}</p>
+              </details>
+            """
+        return f"""
+          <button type="button" class="inspector-toggle secondary" aria-expanded="false"
+            aria-controls="inspector-panel" onclick="var p=document.getElementById('inspector-panel');var t=this;var shown=window.getComputedStyle(p).display!=='none';p.style.display=shown?'none':'block';t.setAttribute('aria-expanded',String(!shown));t.focus();">
+            Inspector
+          </button>
+          <div class="inspector-panel" id="inspector-panel">
+            <h2 class="eyebrow">Inspector</h2>
+            {state_block}
+            {decision_block}
+          </div>
+        """
+
+    def _fresh_operation_id(self) -> str:
+        return token_urlsafe(16)
 
     def _render_profile_review(self, csrf_token: str) -> str:
         profile_proposals = getattr(self._application, "profile_proposals", None)
