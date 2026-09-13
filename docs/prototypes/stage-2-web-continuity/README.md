@@ -4,7 +4,7 @@ Status: simulated review artifact for [#123](https://github.com/snikmas/reckonin
 
 ## What this is
 
-A single self-contained HTML file that adapts the selected Reckoning 2.0 system-panel visual language to the Stage 2 ordinary conversation journey. It exists so Mary can judge typography, information density, Inspector behavior, composer placement, and Simon's character treatment before any production visual work.
+A self-contained simulated prototype of the Stage 2 ordinary web continuity journey, restyled to match the **Reckoning 2.0 system-panel-v2** design language documented in `reckoning-2-0/docs/design/system-panel-v2/`.
 
 It is explicitly simulated:
 
@@ -12,6 +12,14 @@ It is explicitly simulated:
 - It saves no data; reloading the page discards every change.
 - Every person, message, decision, and outcome is fictional.
 - Status labels shown here are simulated; production must derive them from real application state.
+
+## Design source
+
+- Visual direction: `reckoning-2-0/docs/design/system-panel-v2/` (dark shared shell, connected-state center, Inspector, command bar).
+- Simon character: `source-assets/simon-core.png` downscaled to `assets/simon-orb.png`.
+- User avatar: `source-assets/avatar-02.png` downscaled to `assets/user-avatar.png`.
+
+The prototype files are `index.html` plus a small `assets/` folder. No build step and no external network are required.
 
 ## Run it
 
@@ -21,11 +29,11 @@ python -m http.server 8765 --directory docs/prototypes/stage-2-web-continuity
 
 Then open <http://localhost:8765/>.
 
-No build step and no new dependency are required.
+You can also deep-link a scene, e.g. <http://localhost:8765/?scene=proposal>.
 
 ## Scenes
 
-Open **Scenes** in the top bar to load any required scene. Each scene is deterministic and keyboard reachable.
+Open **Scenes** in the top bar to load any required state. Each scene is deterministic and keyboard reachable.
 
 | Scene | Demonstrates |
 | --- | --- |
@@ -45,9 +53,9 @@ The composer also works for free text. Typing an ambiguous assent such as `yes`,
 
 ## Layout
 
-- Home, Simon, Plan, Review, and Control remain the navigation contract.
-- Simon is a spacious conversation workspace with a persistent composer.
-- The Inspector opens for the selected reply, proposal, decision, or check-in.
+- Home, Simon, Plan, Review, and Control remain the Stage 2 navigation contract, rendered in the system-panel-v2 rail language.
+- Simon is a spacious conversation workspace with a persistent composer at the bottom.
+- The right Inspector explains the selected item, its provenance, and available actions.
 - On wide screens the Inspector sits beside the workspace. On narrow screens it becomes an accessible detail view and returns focus to the opener when closed.
 
 ## Accessibility and resilience notes
@@ -62,13 +70,15 @@ The composer also works for free text. Typing an ambiguous assent such as `yes`,
 
 Mary's visual review settles these questions. They are not approved by this artifact.
 
-1. Is the typography right?
+1. Does the typography (mono micro-labels, uppercase page titles, plain body) feel right for the system-panel-v2 direction?
 2. Is the information density comfortable for a long conversation?
 3. Is the Inspector behavior right on desktop and phone?
-4. Is the composer placement right?
-5. Is Simon's character treatment too weak, right, or distracting?
+4. Is the composer placement and send-button treatment right?
+5. Is Simon's pixel-orb character treatment too weak, right, or distracting?
 
 ## Files
 
 - `index.html` — the prototype.
+- `assets/simon-orb.png` — downscaled pixel-art Simon orb.
+- `assets/user-avatar.png` — downscaled pixel-art user avatar.
 - `README.md` — this file.
