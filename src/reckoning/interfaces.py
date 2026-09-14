@@ -845,6 +845,23 @@ class ReckoningInterfaceApplication:
     ) -> tuple[ChannelMessage, ...]:
         return self._session(self._repository.load(), channel, session_id).messages
 
+    def record_channel_exchange(
+        self,
+        channel: ChannelName,
+        user_text: str,
+        assistant_text: str,
+        *,
+        session_id: str = "",
+    ) -> None:
+        """Persist one channel exchange that needed no model call."""
+        self._repository.append_completed_turn(
+            channel,
+            session_id,
+            user_text,
+            assistant_text,
+            expected_revision=self._repository.session_revision(channel, session_id),
+        )
+
     def status(self, channel: ChannelName) -> ChannelStatus:
         del channel  # Placement and operational truth are shared across channels.
         state = self._repository.load()

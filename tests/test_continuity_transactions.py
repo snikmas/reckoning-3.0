@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
@@ -18,14 +19,18 @@ from reckoning.continuity import (
     CheckIn,
     Evidence,
     Inference,
+    InMemoryReckoningRepository,
+    OperationRecord,
     PersonalRecordProposal,
     Reckoning,
     ReckoningDraft,
+    ReckoningOperationConflict,
     ReckoningRevisionConflict,
     SourcedFact,
 )
 from reckoning.operations import create_transfer, restore_transfer
 from reckoning.persistence import JsonFileReckoningRepository
+from reckoning.root_database import connect_database
 
 
 NOW = datetime(2026, 9, 10, 8, 0, tzinfo=timezone.utc)
@@ -161,6 +166,125 @@ def test_two_instances_preserve_decisions_and_reject_stale_mutations(
         "current user message",
         "direct user correction",
     }
+
+
+def _operation(
+    operation_id: str,
+    *,
+    status: str = "completed",
+    result_id: str = "decision-1",
+    pending_input: str = "",
+    digest: str = "digest-a",
+) -> OperationRecord:
+    return OperationRecord(
+        operation_id=operation_id,
+        payload_digest=digest,
+        status=status,  # type: ignore[arg-type]
+        result_id=result_id,
+        pending_input=pending_input,
+        occurred_at=NOW,
+    )
+
+
+def _proposal(application: ReckoningApplication, text: str) -> Reckoning:
+    return application.start_reckoning(text)
+
+
+@pytest.mark.parametrize(
+    "repository_factory",
+    (
+        lambda path: InMemoryReckoningRepository(),
+        lambda path: JsonFileReckoningRepository(path / "continuity.json"),
+    ),
+    ids=("memory", "sqlite"),
+)
+def test_repository_keeps_operation_identity_with_the_saved_decision(
+    tmp_path: Path, repository_factory: object
+) -> None:
+    repository = repository_factory(tmp_path)  # type: ignore[operator]
+    application = build_application(tmp_path / "seed" / "continuity.json", "seed")
+    reckoning = _proposal(application, "atomic save")
+
+    operation = _operation("op-1", result_id=reckoning.id)
+    repository.save(reckoning, expected_version=0, operation=operation)
+
+    assert repository.lookup_operation("op-1") == operation
+    assert repository.lookup_operation("missing") is None
+    assert repository.list_reckonings() == (reckoning,)
+    with pytest.raises(ReckoningOperationConflict):
+        repository.record_operation(_operation("op-1", digest="digest-b"))
+
+
+@pytest.mark.parametrize(
+    "repository_factory",
+    (
+        lambda path: InMemoryReckoningRepository(),
+        lambda path: JsonFileReckoningRepository(path / "continuity.json"),
+    ),
+    ids=("memory", "sqlite"),
+)
+def test_failed_operation_survives_until_the_retry_completes(
+    tmp_path: Path, repository_factory: object
+) -> None:
+    repository = repository_factory(tmp_path)  # type: ignore[operator]
+    failed = _operation(
+        "op-2", status="failed", result_id="", pending_input="Competing commitments."
+    )
+    repository.record_operation(failed)
+
+    assert repository.lookup_operation("op-2") == failed
+    assert repository.list_pending_operations() == (failed,)
+
+    application = build_application(tmp_path / "seed" / "continuity.json", "seed")
+    reckoning = _proposal(application, "Competing commitments.")
+    completed = _operation("op-2", result_id=reckoning.id)
+    repository.save(reckoning, expected_version=0, operation=completed)
+
+    assert repository.lookup_operation("op-2") == completed
+    assert repository.list_pending_operations() == ()
+
+
+def test_operation_identity_survives_sqlite_restart(tmp_path: Path) -> None:
+    state_path = tmp_path / "confirmed-state" / "continuity.json"
+    repository = JsonFileReckoningRepository(state_path)
+    application = build_application(tmp_path / "seed" / "continuity.json", "seed")
+    reckoning = _proposal(application, "restart replay")
+    repository.save(
+        reckoning,
+        expected_version=0,
+        operation=_operation("op-3", result_id=reckoning.id),
+    )
+
+    reopened = JsonFileReckoningRepository(state_path)
+
+    assert reopened.lookup_operation("op-3") == _operation(
+        "op-3", result_id=reckoning.id
+    )
+    assert reopened.list_reckonings() == (reckoning,)
+
+
+def test_additive_upgrade_adds_operation_storage_to_a_pre_change_installation(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "confirmed-state" / "continuity.json"
+    repository = JsonFileReckoningRepository(state_path)
+    with closing(connect_database(repository.database_path)) as connection:
+        connection.execute("DROP TABLE continuity_operations")
+        connection.commit()
+
+    upgraded = JsonFileReckoningRepository(state_path)
+    application = build_application(tmp_path / "seed" / "continuity.json", "seed")
+    reckoning = _proposal(application, "additive upgrade")
+    upgraded.save(
+        reckoning,
+        expected_version=0,
+        operation=_operation("op-4", result_id=reckoning.id),
+    )
+
+    assert upgraded.lookup_operation("op-4") == _operation(
+        "op-4", result_id=reckoning.id
+    )
+    assert upgraded.get(reckoning.id) == reckoning
 
 
 def test_legacy_continuity_migrates_without_confirming_proposals(
