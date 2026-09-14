@@ -14,10 +14,12 @@ from reckoning.continuity import (
     Evidence,
     Inference,
     MaterialQuestion,
+    OperationRecord,
     PersonalRecordProposal,
     PersonalRecordVersion,
     Reckoning,
     ReckoningDraft,
+    ReckoningOperationConflict,
     ReckoningRevisionConflict,
     SourcedFact,
 )
@@ -140,12 +142,19 @@ class JsonFileReckoningRepository:
         self._root = logical_root_for(path)
         self._path = self._root / ROOT_DATABASE_FILENAME
         self._initialize_or_migrate()
+        self._ensure_operation_storage()
 
     @property
     def database_path(self) -> Path:
         return self._path
 
-    def save(self, reckoning: Reckoning, *, expected_version: int) -> None:
+    def save(
+        self,
+        reckoning: Reckoning,
+        *,
+        expected_version: int,
+        operation: OperationRecord | None = None,
+    ) -> None:
         if reckoning.version != expected_version + 1:
             raise ValueError("Reckoning versions must increase by one.")
         with closing(connect_database(self._path)) as connection:
@@ -178,6 +187,8 @@ class JsonFileReckoningRepository:
                         raise ReckoningRevisionConflict(
                             reckoning.id, expected_version, current
                         )
+                if operation is not None:
+                    _upsert_operation(connection, operation)
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -197,6 +208,61 @@ class JsonFileReckoningRepository:
                 raise TypeError("payload is not an object")
             return _reckoning_from_data(data)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError("Continuity storage is invalid.") from error
+
+    def list_reckonings(self) -> tuple[Reckoning, ...]:
+        with closing(connect_database(self._path)) as connection:
+            rows = connection.execute(
+                "SELECT payload FROM continuity_reckonings ORDER BY sequence"
+            ).fetchall()
+        try:
+            return tuple(
+                _reckoning_from_data(json.loads(str(row[0]))) for row in rows
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeError("Continuity storage is invalid.") from error
+
+    def lookup_operation(self, operation_id: str) -> OperationRecord | None:
+        with closing(connect_database(self._path)) as connection:
+            row = connection.execute(
+                """
+                SELECT operation_id, payload_digest, status, result_id,
+                       pending_input, occurred_at
+                FROM continuity_operations WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return _operation_from_row(row)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("Continuity storage is invalid.") from error
+
+    def record_operation(self, operation: OperationRecord) -> None:
+        with closing(connect_database(self._path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                _upsert_operation(connection, operation)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def list_pending_operations(self) -> tuple[OperationRecord, ...]:
+        with closing(connect_database(self._path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT operation_id, payload_digest, status, result_id,
+                       pending_input, occurred_at
+                FROM continuity_operations
+                WHERE status = 'failed'
+                ORDER BY rowid
+                """
+            ).fetchall()
+        try:
+            return tuple(_operation_from_row(row) for row in rows)
+        except (TypeError, ValueError) as error:
             raise RuntimeError("Continuity storage is invalid.") from error
 
     def save_check_in(self, check_in: CheckIn) -> None:
@@ -319,6 +385,17 @@ class JsonFileReckoningRepository:
                 raise
         _write_legacy_authority(self._legacy_path, state="sqlite-authoritative")
 
+    def _ensure_operation_storage(self) -> None:
+        """Add operation-identity storage to pre-change installations."""
+        with closing(connect_database(self._path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                _create_operations_table(connection)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
 
 def _create_schema(connection: sqlite3.Connection) -> None:
     ensure_root_schema(connection)
@@ -345,6 +422,60 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (decision_id) REFERENCES continuity_reckonings(id)
         )
         """
+    )
+    _create_operations_table(connection)
+
+
+def _create_operations_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS continuity_operations (
+            operation_id TEXT PRIMARY KEY,
+            payload_digest TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+            result_id TEXT NOT NULL,
+            pending_input TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _upsert_operation(
+    connection: sqlite3.Connection, operation: OperationRecord
+) -> None:
+    row = connection.execute(
+        "SELECT status FROM continuity_operations WHERE operation_id = ?",
+        (operation.operation_id,),
+    ).fetchone()
+    if row is not None and row[0] == "completed":
+        raise ReckoningOperationConflict(operation.operation_id)
+    connection.execute(
+        """
+        INSERT OR REPLACE INTO continuity_operations (
+            operation_id, payload_digest, status, result_id,
+            pending_input, occurred_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            operation.operation_id,
+            operation.payload_digest,
+            operation.status,
+            operation.result_id,
+            operation.pending_input,
+            operation.occurred_at.isoformat(),
+        ),
+    )
+
+
+def _operation_from_row(row: tuple[object, ...]) -> OperationRecord:
+    return OperationRecord(
+        operation_id=str(row[0]),
+        payload_digest=str(row[1]),
+        status=str(row[2]),  # type: ignore[arg-type]
+        result_id=str(row[3]),
+        pending_input=str(row[4]),
+        occurred_at=datetime.fromisoformat(str(row[5])),
     )
 
 

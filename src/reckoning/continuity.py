@@ -151,6 +151,21 @@ class CheckIn:
     supporting_evidence_ids: tuple[str, ...]
 
 
+OperationStatus = Literal["completed", "failed"]
+
+
+@dataclass(frozen=True)
+class OperationRecord:
+    """Durable identity of one decision mutation, stored with the decision."""
+
+    operation_id: str
+    payload_digest: str
+    status: OperationStatus
+    result_id: str
+    pending_input: str
+    occurred_at: datetime
+
+
 @dataclass(frozen=True)
 class DecisionResume:
     decision: Reckoning
@@ -192,9 +207,23 @@ class ReckoningProvider(Protocol):
 
 
 class ReckoningRepository(Protocol):
-    def save(self, reckoning: Reckoning, *, expected_version: int) -> None: ...
+    def save(
+        self,
+        reckoning: Reckoning,
+        *,
+        expected_version: int,
+        operation: OperationRecord | None = None,
+    ) -> None: ...
 
     def get(self, reckoning_id: str) -> Reckoning: ...
+
+    def list_reckonings(self) -> tuple[Reckoning, ...]: ...
+
+    def lookup_operation(self, operation_id: str) -> OperationRecord | None: ...
+
+    def record_operation(self, operation: OperationRecord) -> None: ...
+
+    def list_pending_operations(self) -> tuple[OperationRecord, ...]: ...
 
     def save_check_in(self, check_in: CheckIn) -> None: ...
 
@@ -214,8 +243,15 @@ class InMemoryReckoningRepository:
     def __init__(self) -> None:
         self._reckonings: dict[str, Reckoning] = {}
         self._check_ins: dict[str, CheckIn] = {}
+        self._operations: dict[str, OperationRecord] = {}
 
-    def save(self, reckoning: Reckoning, *, expected_version: int) -> None:
+    def save(
+        self,
+        reckoning: Reckoning,
+        *,
+        expected_version: int,
+        operation: OperationRecord | None = None,
+    ) -> None:
         actual = self._reckonings.get(reckoning.id)
         actual_version = actual.version if actual is not None else 0
         if actual_version != expected_version:
@@ -224,6 +260,8 @@ class InMemoryReckoningRepository:
             )
         if reckoning.version != expected_version + 1:
             raise ValueError("Reckoning versions must increase by one.")
+        if operation is not None:
+            self._store_operation(operation)
         self._reckonings[reckoning.id] = reckoning
 
     def get(self, reckoning_id: str) -> Reckoning:
@@ -231,6 +269,28 @@ class InMemoryReckoningRepository:
             return self._reckonings[reckoning_id]
         except KeyError as error:
             raise KeyError(f"Unknown reckoning: {reckoning_id}") from error
+
+    def list_reckonings(self) -> tuple[Reckoning, ...]:
+        return tuple(self._reckonings.values())
+
+    def lookup_operation(self, operation_id: str) -> OperationRecord | None:
+        return self._operations.get(operation_id)
+
+    def record_operation(self, operation: OperationRecord) -> None:
+        self._store_operation(operation)
+
+    def list_pending_operations(self) -> tuple[OperationRecord, ...]:
+        return tuple(
+            operation
+            for operation in self._operations.values()
+            if operation.status == "failed"
+        )
+
+    def _store_operation(self, operation: OperationRecord) -> None:
+        existing = self._operations.get(operation.operation_id)
+        if existing is not None and existing.status == "completed":
+            raise ReckoningOperationConflict(operation.operation_id)
+        self._operations[operation.operation_id] = operation
 
     def save_check_in(self, check_in: CheckIn) -> None:
         self._check_ins[check_in.id] = check_in

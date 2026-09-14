@@ -1,6 +1,12 @@
+"""Acceptance: the #124 web decision journey driven through rendered controls.
+
+Every mutation submits values parsed from the rendered page (operation ids,
+expected revisions, CSRF tokens); no intermediate domain mutation is seeded.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
@@ -20,6 +26,10 @@ from reckoning.continuity import (
 )
 from reckoning.providers import ProviderFailure
 from reckoning.web import ReckoningWebApplication, local_browser_origins
+
+
+SITUATION = "Exams, project, and job search all compete."
+CORRECTED_MEANING = "Mary intends to protect exam preparation."
 
 
 class ScriptedReckoningProvider:
@@ -55,26 +65,78 @@ class ScriptedReckoningProvider:
         )
 
 
-class RecordParser(HTMLParser):
+class FailingReckoningProvider:
+    def reckon(self, unstructured_input: str) -> object:
+        raise ProviderFailure(
+            provider="fake",
+            model="deterministic-fake",
+            model_calls=1,
+            latency_ms=0,
+            retries=0,
+            message="Simulated provider failure.",
+        )
+
+
+@dataclass
+class ParsedForm:
+    action: str = ""
+    fields: dict[str, str] = field(default_factory=dict)
+    textareas: dict[str, str] = field(default_factory=dict)
+
+    def submission(self, **overrides: str) -> dict[str, str]:
+        fields = {
+            name: value
+            for name, value in self.fields.items()
+            if name != "_csrf_token"
+        }
+        return {**fields, **self.textareas, **overrides}
+
+
+class PageParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
-        self.record_id = ""
+        self.forms: list[ParsedForm] = []
+        self.decision_links: list[str] = []
+        self.csrf_token = ""
+        self._current_form: ParsedForm | None = None
+        self._textarea_name = ""
+        self._textarea_chunks: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
-        if tag == "article" and values.get("data-record-id"):
-            self.record_id = values["data-record-id"] or ""
+        if tag == "form":
+            self._current_form = ParsedForm(action=values.get("action") or "")
+        elif tag == "input":
+            name = values.get("name")
+            if name == "_csrf_token":
+                self.csrf_token = values.get("value") or ""
+            if self._current_form is not None and name:
+                self._current_form.fields[name] = values.get("value") or ""
+        elif tag == "textarea" and self._current_form is not None:
+            self._textarea_name = values.get("name") or ""
+            self._textarea_chunks = []
+        elif tag == "a" and (values.get("href") or "").startswith("/decisions/"):
+            self.decision_links.append(values["href"] or "")
 
+    def handle_data(self, data: str) -> None:
+        if self._current_form is not None and self._textarea_name:
+            self._textarea_chunks.append(data)
 
-class TokenParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.token = ""
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "textarea" and self._current_form is not None:
+            self._current_form.textareas[self._textarea_name] = "".join(
+                self._textarea_chunks
+            )
+            self._textarea_name = ""
+        elif tag == "form" and self._current_form is not None:
+            self.forms.append(self._current_form)
+            self._current_form = None
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        values = dict(attrs)
-        if tag == "input" and values.get("name") == "_csrf_token":
-            self.token = values.get("value") or ""
+    def form_by_action(self, action: str) -> ParsedForm:
+        return next(form for form in self.forms if form.action == action)
+
+    def forms_ending(self, suffix: str) -> list[ParsedForm]:
+        return [form for form in self.forms if form.action.endswith(suffix)]
 
 
 @dataclass
@@ -89,11 +151,16 @@ class BrowserSession:
         headers = dict(header_pairs)
         if "Set-Cookie" in headers:
             self.cookie = headers["Set-Cookie"].split(";", 1)[0]
-        parser = TokenParser()
+        parser = PageParser()
         parser.feed(body.decode("utf-8"))
-        if parser.token:
-            self.csrf_token = parser.token
+        if parser.csrf_token:
+            self.csrf_token = parser.csrf_token
         return status, headers, body
+
+    def parse(self, body: bytes) -> PageParser:
+        parser = PageParser()
+        parser.feed(body.decode("utf-8"))
+        return parser
 
     def post(
         self,
@@ -201,18 +268,40 @@ def build_web_app(
     )
 
 
-def test_full_web_decision_journey(tmp_path: Path) -> None:
-    data_dir = tmp_path / "data"
+def install(data_dir: Path, *, first_conversation: tuple[str, str] | None = None) -> None:
     setup_instance(
         data_dir,
         "local",
-        first_conversation=("Hello, Simon.", "Hello. What is on your mind?"),
+        first_conversation=first_conversation,
         activation={
             "status": "activated",
             "provider": "fake",
             "model": "deterministic-fake",
             "demo": True,
         },
+    )
+
+
+def propose_via_composer(
+    browser: BrowserSession, situation: str
+) -> tuple[str, str]:
+    """Submit the rendered Simon composer as Propose; return the decision URL."""
+    status, _, page = browser.get("/simon")
+    assert status == "200 OK"
+    composer = browser.parse(page).form_by_action("/messages")
+    status, headers, _ = browser.post(
+        "/decisions",
+        composer.submission(message=situation),
+    )
+    assert status == "303 See Other"
+    return headers["Location"]
+
+
+def test_full_web_decision_journey(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    install(
+        data_dir,
+        first_conversation=("Hello, Simon.", "Hello. What is on your mind?"),
     )
     web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
     browser = BrowserSession(web)
@@ -221,116 +310,210 @@ def test_full_web_decision_journey(tmp_path: Path) -> None:
     assert status == "200 OK"
     assert b"Hello, Simon." in page
 
-    status, _, page = browser.post("/messages", {"message": "Just thinking out loud."})
-    assert status == "303 See Other"
-
-    status, headers, _ = browser.post(
-        "/decisions",
-        {"situation": "Exams, project, and job search all compete."},
+    # Casual conversation succeeds without creating a decision.
+    composer = browser.parse(page).form_by_action("/messages")
+    status, _, _ = browser.post(
+        "/messages", composer.submission(message="Just thinking out loud.")
     )
     assert status == "303 See Other"
-    decision_location = headers["Location"]
+    status, _, page = browser.get("/")
+    assert status == "200 OK"
+    assert b'href="/decisions/' not in page
+
+    # A scripted fictional conflict produces a visible proposal.
+    decision_location = propose_via_composer(browser, SITUATION)
     decision_id = decision_location.rsplit("/", 1)[-1]
 
     status, _, page = browser.get(decision_location)
     assert status == "200 OK"
-    assert b"Exams, project, and job search all compete." in page
+    assert SITUATION.encode() in page
     assert b"proposed" in page
-    record_parser = RecordParser()
-    record_parser.feed(page.decode("utf-8"))
-    record_id = record_parser.record_id
-    assert record_id
+    # Reasons, uncertainty, and next action are visible.
+    assert b"Protect the nearest exam." in page
+    assert b"The exact exam date is missing." in page
+    assert b"Confirm what protecting university means this week." in page
 
-    status, _, page = browser.post(
-        f"/decisions/{decision_id}/records/{record_id}/correct",
-        {
-            "expected_revision": "1",
-            "meaning": "Mary intends to protect exam preparation.",
-        },
+    proposal_page = browser.parse(page)
+    # One compact confirmation control, bound to the rendered revision.
+    confirm_forms = proposal_page.forms_ending("/confirm")
+    assert len(confirm_forms) == 1
+    correction_forms = proposal_page.forms_ending("/correct")
+    assert len(correction_forms) == 1
+    stale_correction = correction_forms[0].submission(meaning="Stale edit.")
+    assert stale_correction["expected_revision"] == "1"
+
+    # A second render of the same page carries its own operation identity.
+    status, _, fresh_page = browser.get(decision_location)
+    fresh_correction = browser.parse(fresh_page).forms_ending("/correct")[0]
+
+    # Direct editing through the rendered control produces an unconfirmed revision.
+    status, _, _ = browser.post(
+        fresh_correction.action,
+        fresh_correction.submission(meaning=CORRECTED_MEANING),
     )
     assert status == "303 See Other"
 
     status, _, page = browser.get(decision_location)
     assert status == "200 OK"
-    assert b"Mary intends to protect exam preparation." in page
+    assert CORRECTED_MEANING.encode() in page
+    assert b"Revision 2" in page
+    assert b'class="status status-proposed"' in page
 
-    status, _, page = browser.post(
+    # An old control cannot confirm or correct the new revision.
+    status, _, page = browser.post(correction_forms[0].action, stale_correction)
+    assert status == "409 Conflict"
+    assert b"changed from revision 1 to 2" in page
+    refreshed = browser.parse(page)
+    assert refreshed.forms_ending("/confirm")[0].fields["expected_revision"] == "2"
+
+    # The explicit control binds to the displayed record and version.
+    status, _, _ = browser.post(
         f"/decisions/{decision_id}/confirm",
-        {"expected_revision": "2"},
+        refreshed.forms_ending("/confirm")[0].submission(),
     )
     assert status == "303 See Other"
 
     status, _, page = browser.get(decision_location)
     assert status == "200 OK"
-    assert b"confirmed" in page
+    assert b'class="status status-confirmed"' in page
 
+    # After a restart, ordinary navigation reopens the saved decision.
     restarted = build_web_app(data_dir)
     browser.web = restarted
-    status, _, page = browser.get(decision_location)
+    status, _, page = browser.get("/")
     assert status == "200 OK"
-    assert b"Mary intends to protect exam preparation." in page
-    assert b"confirmed" in page
+    home = browser.parse(page)
+    assert f"/decisions/{decision_id}" in home.decision_links
+    assert b"Protect the degree baseline or maximize project momentum." in page
+
+    status, _, page = browser.get(f"/decisions/{decision_id}")
+    assert status == "200 OK"
+    assert CORRECTED_MEANING.encode() in page
+    assert b'class="status status-confirmed"' in page
+    # The actual evidence is shown: the original message and the correction.
+    assert SITUATION.encode() in page
+    assert b"direct user correction" in page
 
 
-def test_provider_failure_and_retry_does_not_duplicate_decision(tmp_path: Path) -> None:
+def test_replay_after_a_saved_mutation_returns_the_same_decision(
+    tmp_path: Path,
+) -> None:
     data_dir = tmp_path / "data"
-    setup_instance(
-        data_dir,
-        "local",
-        activation={
-            "status": "activated",
-            "provider": "fake",
-            "model": "deterministic-fake",
-            "demo": True,
-        },
-    )
-    web = build_web_app(data_dir)
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
     browser = BrowserSession(web)
-    browser.get("/simon")
 
-    failing_provider = FailingReckoningProvider()
-    web._application._dependencies = (
-        web._application._dependencies
-    )  # keep reference reachable
-    original = web._application._dependencies.reckoning_provider
-    web._application._dependencies = web._application._dependencies.__class__(
-        **{
-            **web._application._dependencies.__dict__,
-            "reckoning_provider": failing_provider,
-        }
-    )
+    status, _, page = browser.get("/simon")
+    composer = browser.parse(page).form_by_action("/messages")
+    submission = composer.submission(message=SITUATION)
+
+    status, headers, _ = browser.post("/decisions", submission)
+    assert status == "303 See Other"
+    decision_location = headers["Location"]
+
+    # The browser retries the identical submission after a lost response.
+    status, headers, _ = browser.post("/decisions", submission)
+    assert status == "303 See Other"
+    assert headers["Location"] == decision_location
+
+    # The retry stays replay-safe after a full application restart.
+    browser.web = build_web_app(data_dir)
+    browser.get("/")  # A restarted server issues a fresh browser session.
+    status, headers, _ = browser.post("/decisions", submission)
+    assert status == "303 See Other"
+    assert headers["Location"] == decision_location
+
+    status, _, page = browser.get("/")
+    assert len(browser.parse(page).decision_links) == 1
+
+
+def test_failed_proposal_input_survives_restart_and_retries_once(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=FailingReckoningProvider())
+    browser = BrowserSession(web)
+
+    status, _, page = browser.get("/simon")
+    composer = browser.parse(page).form_by_action("/messages")
+    operation_id = composer.fields["operation_id"]
 
     status, _, page = browser.post(
-        "/decisions", {"situation": "Competing commitments."}
+        "/decisions", composer.submission(message=SITUATION)
     )
     assert status == "400 Bad Request"
-    assert b"Competing commitments." in page
+    assert SITUATION.encode() in page
 
-    web._application._dependencies = web._application._dependencies.__class__(
-        **{
-            **web._application._dependencies.__dict__,
-            "reckoning_provider": original,
-        }
-    )
+    # The received input and the failed operation survive a restart.
+    browser.web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    status, _, page = browser.get("/simon")
+    assert status == "200 OK"
+    assert SITUATION.encode() in page
+    recovery = browser.parse(page).form_by_action("/decisions")
+    assert recovery.fields["operation_id"] == operation_id
 
+    # Retrying the rendered recovery control completes the same operation once.
+    status, headers, _ = browser.post("/decisions", recovery.submission())
+    assert status == "303 See Other"
+    decision_location = headers["Location"]
+
+    status, _, page = browser.get("/")
+    assert len(browser.parse(page).decision_links) == 1
+
+    status, _, page = browser.get(decision_location)
+    assert status == "200 OK"
+    assert b'class="status status-proposed"' in page
+
+    browser.web = build_web_app(data_dir)
+    status, _, page = browser.get("/simon")
+    assert b"data-pending-operation" not in page
+
+
+def test_conversational_correction_and_confirmation(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    # Ambiguous assent asks for clarification instead of confirming.
+    first_location = propose_via_composer(browser, SITUATION)
+    status, headers, _ = browser.post("/messages", {"message": "yes"})
+    assert status == "303 See Other"
+    assert headers["Location"] == "/simon"
+    status, _, page = browser.get("/simon")
+    assert b"Do you want to confirm" in page
+    status, _, page = browser.get(first_location)
+    assert b'class="status status-proposed"' in page
+
+    # Conversational correction produces an unconfirmed, visible revision.
     status, headers, _ = browser.post(
-        "/decisions", {"situation": "Competing commitments."}
+        "/messages", {"message": f"No, correct it: {CORRECTED_MEANING}"}
     )
     assert status == "303 See Other"
-    decision_id = headers["Location"].rsplit("/", 1)[-1]
+    assert headers["Location"] == first_location
+    status, _, page = browser.get(first_location)
+    assert CORRECTED_MEANING.encode() in page
+    assert b"Revision 2" in page
+    assert b'class="status status-proposed"' in page
 
-    status, _, page = browser.get(headers["Location"])
-    assert status == "200 OK"
-    assert decision_id.encode() in page
+    # An unambiguous conversational confirmation binds to the shown version.
+    status, headers, _ = browser.post(
+        "/messages", {"message": "Yes, confirm that exact version"}
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == first_location
+    status, _, page = browser.get(first_location)
+    assert b'class="status status-confirmed"' in page
 
+    status, _, page = browser.get("/simon")
+    assert b"exactly as shown (revision 2)" in page
 
-class FailingReckoningProvider:
-    def reckon(self, unstructured_input: str) -> object:
-        raise ProviderFailure(
-            provider="fake",
-            model="deterministic-fake",
-            model_calls=1,
-            latency_ms=0,
-            retries=0,
-            message="Simulated provider failure.",
-        )
+    # Casual conversation still works and never creates a decision.
+    status, headers, _ = browser.post(
+        "/messages", {"message": "What should I focus on this week?"}
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == "/simon"
+    status, _, page = browser.get("/")
+    assert len(browser.parse(page).decision_links) == 1

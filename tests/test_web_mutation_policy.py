@@ -473,13 +473,12 @@ def test_submission_failure_stays_in_simon_and_never_shows_a_success_reply() -> 
     (
         ("/decisions", {"situation": "Conflict situation"}),
         ("/decisions/decision-1/confirm", {"expected_revision": "1"}),
-        ("/decisions/decision-1/reopen", {}),
         (
             "/decisions/decision-1/records/record-1/correct",
             {"expected_revision": "1", "meaning": "Corrected meaning"},
         ),
     ),
-    ids=("create", "confirm", "reopen", "correct"),
+    ids=("create", "confirm", "correct"),
 )
 def test_every_decision_mutation_rejects_untrusted_browser_requests_before_dispatch(
     path: str, form: dict[str, str]

@@ -24,11 +24,21 @@ from reckoning.config import (
     RuntimeProviderSettings,
 )
 from reckoning.continuity import (
+    OperationRecord,
     Reckoning,
     ReckoningOperationConflict,
     ReckoningProviderError,
     ReckoningRevisionConflict,
     WhyView,
+)
+from reckoning.decision_conversation import (
+    ClarifyDecision,
+    ConfirmDecision,
+    CorrectDecision,
+    DecisionReply,
+    DecisionTarget,
+    NotDecisionRelated,
+    interpret_decision_message,
 )
 from reckoning.interfaces import (
     ControlView,
@@ -38,6 +48,12 @@ from reckoning.interfaces import (
 from reckoning.operations import OperationError, load_installation_runtime
 from reckoning.processing import PROCESSING_CATEGORIES
 from reckoning.provider_adapters import AdapterConfig
+from reckoning.web_decisions import (
+    fresh_operation_id,
+    render_decision_content,
+    render_list,
+    render_pending_input_card,
+)
 
 
 def validate_bind_host(host: str) -> str:
@@ -248,10 +264,18 @@ class ReckoningWebApplication:
                 extra_headers=response_headers,
             )
         if method == "POST" and path == "/messages":
-            try:
-                self._interfaces.send_channel_message(
-                    "web", self._read_message(environ)
+            message = self._read_message(environ)
+            decision_reply = self._interpret_decision_reply(message)
+            if decision_reply is not None:
+                return self._apply_decision_reply(
+                    decision_reply,
+                    message,
+                    start_response,
+                    csrf_token=csrf_token,
+                    response_headers=response_headers,
                 )
+            try:
+                self._interfaces.send_channel_message("web", message)
             except (ValueError, RuntimeError) as error:
                 return self._html_response(
                     start_response,
@@ -326,6 +350,111 @@ class ReckoningWebApplication:
             )
         return None
 
+    def _interpret_decision_reply(self, message: str) -> DecisionReply | None:
+        """Resolve a conversation reply against the one active proposal."""
+        list_reckonings = getattr(self._application, "list_reckonings", None)
+        if not callable(list_reckonings):
+            return None
+        proposed = tuple(
+            reckoning
+            for reckoning in list_reckonings()
+            if reckoning.status == "proposed"
+        )
+        if not proposed:
+            return None
+        if len(proposed) > 1:
+            return ClarifyDecision(
+                "Several proposals are open. Open the decision you mean from "
+                "Home, then confirm or correct it there."
+            )
+        reckoning = proposed[0]
+        target = DecisionTarget(
+            reckoning_id=reckoning.id,
+            version=reckoning.version,
+            conflict=reckoning.draft.conflict,
+            record_ids=tuple(
+                record.record_id for record in reckoning.current_records
+            ),
+        )
+        reply = interpret_decision_message(message, target)
+        if isinstance(reply, NotDecisionRelated):
+            return None
+        return reply
+
+    def _apply_decision_reply(
+        self,
+        reply: DecisionReply,
+        message: str,
+        start_response: StartResponse,
+        *,
+        csrf_token: str,
+        response_headers: tuple[tuple[str, str], ...],
+    ) -> list[bytes]:
+        assert self._interfaces is not None
+        if isinstance(reply, ClarifyDecision):
+            self._interfaces.record_channel_exchange("web", message, reply.prompt)
+            start_response(
+                "303 See Other",
+                [("Location", "/simon"), ("Content-Length", "0")],
+            )
+            return [b""]
+        assert isinstance(reply, (ConfirmDecision, CorrectDecision))
+        target = reply.target
+        try:
+            if isinstance(reply, ConfirmDecision):
+                outcome = self._application.confirm_reckoning(
+                    target.reckoning_id,
+                    expected_revision=target.version,
+                )
+                note = (
+                    f'Confirmed "{target.conflict}" exactly as shown '
+                    f"(revision {target.version})."
+                )
+            else:
+                outcome = self._application.correct_personal_record(
+                    target.reckoning_id,
+                    reply.record_id,
+                    reply.meaning,
+                    expected_revision=target.version,
+                )
+                note = (
+                    "Corrected the proposal. Revision "
+                    f"{outcome.version} is ready for review."
+                )
+        except (ReckoningRevisionConflict, ReckoningOperationConflict) as error:
+            return self._html_response(
+                start_response,
+                "409 Conflict",
+                self._render_interface_area(
+                    "decision",
+                    error=str(error),
+                    csrf_token=csrf_token,
+                    decision=self._safe_decision(target.reckoning_id),
+                ),
+                extra_headers=response_headers,
+            )
+        except (KeyError, ValueError, RuntimeError) as error:
+            return self._html_response(
+                start_response,
+                "400 Bad Request",
+                self._render_interface_area(
+                    "decision",
+                    error=str(error),
+                    csrf_token=csrf_token,
+                    decision=self._safe_decision(target.reckoning_id),
+                ),
+                extra_headers=response_headers,
+            )
+        self._interfaces.record_channel_exchange("web", message, note)
+        start_response(
+            "303 See Other",
+            [
+                ("Location", f"/decisions/{escape(outcome.id, quote=True)}"),
+                ("Content-Length", "0"),
+            ],
+        )
+        return [b""]
+
     def _handle_decision_request(
         self,
         action: tuple[str, str, str],
@@ -360,15 +489,6 @@ class ReckoningWebApplication:
                 ),
                 extra_headers=response_headers,
             )
-        if action_name == "reopen":
-            start_response(
-                "303 See Other",
-                [
-                    ("Location", f"/decisions/{escape(reckoning_id, quote=True)}"),
-                    ("Content-Length", "0"),
-                ],
-            )
-            return [b""]
         fields = self._read_form(environ)
         operation_id = fields.get("operation_id", [""])[0]
         pending_text = ""
@@ -436,11 +556,18 @@ class ReckoningWebApplication:
                     error=str(error),
                     csrf_token=csrf_token,
                     pending_text=pending_text,
+                    pending_record_id=record_id,
                     decision=self._safe_decision(reckoning_id),
                 ),
                 extra_headers=response_headers,
             )
-        except (ReckoningOperationConflict, ReckoningProviderError) as error:
+        except (
+            ReckoningOperationConflict,
+            ReckoningProviderError,
+            KeyError,
+            ValueError,
+            RuntimeError,
+        ) as error:
             error_area = "simon" if action_name == "create" else "decision"
             return self._html_response(
                 start_response,
@@ -450,20 +577,7 @@ class ReckoningWebApplication:
                     error=str(error),
                     csrf_token=csrf_token,
                     pending_text=pending_text,
-                    decision=self._safe_decision(reckoning_id),
-                ),
-                extra_headers=response_headers,
-            )
-        except (KeyError, ValueError, RuntimeError) as error:
-            error_area = "simon" if action_name == "create" else "decision"
-            return self._html_response(
-                start_response,
-                "400 Bad Request",
-                self._render_interface_area(
-                    error_area,
-                    error=str(error),
-                    csrf_token=csrf_token,
-                    pending_text=pending_text,
+                    pending_record_id=record_id,
                     decision=self._safe_decision(reckoning_id),
                 ),
                 extra_headers=response_headers,
@@ -566,8 +680,6 @@ class ReckoningWebApplication:
             reckoning_id, action = parts[1], parts[2]
             if action == "confirm":
                 return ("confirm", reckoning_id, "")
-            if action == "reopen":
-                return ("reopen", reckoning_id, "")
         if (
             len(parts) == 5
             and parts[0] == "decisions"
@@ -690,6 +802,7 @@ class ReckoningWebApplication:
         *,
         csrf_token: str = "",
         pending_text: str = "",
+        pending_record_id: str = "",
         decision: Reckoning | None = None,
         why: WhyView | None = None,
     ) -> str:
@@ -717,8 +830,13 @@ class ReckoningWebApplication:
                 status_label, status_modifier, visual_state=visual_state
             )
         elif area == "decision":
-            content = self._render_decision(
-                decision, why, csrf_token, error=error, pending_text=pending_text
+            content = render_decision_content(
+                decision,
+                csrf_token,
+                error=error,
+                pending_meanings=(
+                    {pending_record_id: pending_text} if pending_record_id else None
+                ),
             )
             inspector = self._render_inspector(
                 status_label,
@@ -1117,13 +1235,16 @@ class ReckoningWebApplication:
         return f"""
           <header><p class="eyebrow">Command center</p><h1>Home</h1></header>
           <section class="card" aria-labelledby="matters-now">
-            <h2 id="matters-now">What matters now</h2>{self._list(home.matters_now)}
+            <h2 id="matters-now">What matters now</h2>{render_list(home.matters_now)}
           </section>
           <section class="card" aria-labelledby="what-changed">
-            <h2 id="what-changed">What changed</h2>{self._list(home.changes)}
+            <h2 id="what-changed">What changed</h2>{render_list(home.changes)}
           </section>
           <section class="card" aria-labelledby="needs-decision">
-            <h2 id="needs-decision">Needs your decision</h2>{self._list(home.decisions)}
+            <h2 id="needs-decision">Needs your decision</h2>{render_list(home.decisions)}
+          </section>
+          <section class="card" aria-labelledby="saved-decisions">
+            <h2 id="saved-decisions">Decisions</h2>{self._decision_links()}
           </section>
           <section class="card" aria-labelledby="system-health">
             <h2 id="system-health">System health</h2>
@@ -1131,6 +1252,22 @@ class ReckoningWebApplication:
             <p>{escape(home.placement.notice)}</p>
           </section>
         """
+
+    def _decision_links(self) -> str:
+        list_reckonings = getattr(self._application, "list_reckonings", None)
+        if not callable(list_reckonings):
+            return '<p class="empty">None recorded.</p>'
+        reckonings = list_reckonings()
+        if not reckonings:
+            return '<p class="empty">None recorded.</p>'
+        return "<ul>" + "".join(
+            '<li><a href="/decisions/'
+            f'{escape(reckoning.id, quote=True)}">'
+            f"{escape(reckoning.draft.conflict)}</a> · "
+            f'<span class="status status-{escape(reckoning.status)}">'
+            f"{escape(reckoning.status)}</span></li>"
+            for reckoning in reckonings
+        ) + "</ul>"
 
     def _render_control_area(
         self, control: ControlView, csrf_token: str, *, error: str | None
@@ -1159,14 +1296,23 @@ class ReckoningWebApplication:
             if any(message.role == "assistant" for message in messages)
             else ""
         )
+        pending_cards = "".join(
+            render_pending_input_card(operation, csrf_token)
+            for operation in self._pending_decision_inputs()
+        )
+        active_proposal = self._active_proposal_link()
         return f"""
           <header><p class="eyebrow">Conversation</p><h1>Simon</h1></header>
           <div aria-live="polite">{conversation}</div>{error_markup}
+          {active_proposal}
+          {pending_cards}
           {profile_review}
           <div class="composer">
             <form action="/messages" method="post">
               <input type="hidden" name="_csrf_token"
                 value="{escape(csrf_token, quote=True)}">
+              <input type="hidden" name="operation_id"
+                value="{escape(fresh_operation_id(), quote=True)}">
               <label for="message">Your message</label>
               <textarea id="message" name="message" required
                 >{escape(pending_text)}</textarea>
@@ -1179,127 +1325,37 @@ class ReckoningWebApplication:
           </div>
         """
 
-    def _render_decision(
-        self,
-        decision: Reckoning | None,
-        why: WhyView | None,
-        csrf_token: str,
-        *,
-        error: str | None,
-        pending_text: str,
-    ) -> str:
-        if decision is None:
-            return (
-                '<header><p class="eyebrow">Decision</p><h1>Not found</h1></header>'
-                '<p class="empty">No decision is selected.</p>'
-            )
-        error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
-        status = "confirmed" if decision.status == "confirmed" else "proposed"
-        current_records = decision.current_records
-        records_html = "".join(
-            self._render_record_card(
-                decision.id, record, csrf_token, decision.version, status
-            )
-            for record in current_records
-        )
-        can_correct = status == "proposed"
-        correct_section = ""
-        confirm_form = ""
-        if can_correct and pending_text:
-            correct_section = f"""
-              <form action="/decisions/{escape(decision.id)}/records/{escape(current_records[0].record_id if current_records else '')}/correct" method="post">
-                <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
-                <input type="hidden" name="expected_revision" value="{decision.version}">
-                <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
-                <label for="pending-correction">Correction</label>
-                <textarea id="pending-correction" name="meaning" required>{escape(pending_text)}</textarea>
-                <button type="submit">Save correction</button>
-              </form>
-            """
-        composer = ""
-        if can_correct:
-            composer = f"""
-              <div class="composer">
-                <form action="/decisions/{escape(decision.id)}/records/{escape(current_records[0].record_id if current_records else '')}/correct" method="post">
-                  <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
-                  <input type="hidden" name="expected_revision" value="{decision.version}">
-                  <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
-                  <label for="decision-correction">Correction</label>
-                  <textarea id="decision-correction" name="meaning" required
-                    placeholder="Correct the meaning before confirming">{escape(pending_text)}</textarea>
-                  <div class="actions">
-                    <button type="submit">Save correction</button>
-                  </div>
-                </form>
-              </div>
-            """
-        elif status == "proposed" and current_records:
-            confirm_form = f"""
-              <form action="/decisions/{escape(decision.id)}/confirm" method="post">
-                <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
-                <input type="hidden" name="expected_revision" value="{decision.version}">
-                <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
-                <button type="submit">Confirm this version</button>
-              </form>
-            """
-        return f"""
-          <header>
-            <p class="eyebrow">Decision</p>
-            <h1>{escape(decision.draft.conflict)}</h1>
-          </header>
-          <div class="status {self._status_pair(status)[1]}" aria-live="polite">
-            {escape(self._status_pair(status)[0])}
-          </div>
-          {error_markup}
-          <section class="card proposal-card" aria-labelledby="proposal-heading">
-            <h2 id="proposal-heading">Proposal</h2>
-            <p><strong>Conflict:</strong> {escape(decision.draft.conflict)}</p>
-            <p><strong>Matters now:</strong> {escape(" ".join(decision.draft.matters_now))}</p>
-            <p><strong>Maintained:</strong> {escape(" ".join(decision.draft.maintained))}</p>
-            <p><strong>Parked:</strong> {escape(" ".join(decision.draft.parked))}</p>
-            <p class="next-action"><strong>Next step:</strong> {escape(decision.draft.next_step)}</p>
-            {records_html}
-            {confirm_form}
-          </section>
-          {correct_section}
-          {composer}
-        """
+    def _pending_decision_inputs(self) -> tuple[OperationRecord, ...]:
+        pending = getattr(self._application, "pending_decision_inputs", None)
+        if not callable(pending):
+            return ()
+        return pending()
 
-    def _render_record_card(
-        self,
-        reckoning_id: str,
-        record,
-        csrf_token: str,
-        expected_revision: int,
-        decision_status: str,
-    ) -> str:
-        if decision_status == "confirmed":
-            return (
-                f'<article class="record" data-record-id="{escape(record.record_id)}">'
-                f'<p><strong>{escape(record.record_type)}</strong> · '
-                f'<span class="status status-confirmed">confirmed</span></p>'
-                f'<p>{escape(record.meaning)}</p></article>'
-            )
-        return f"""
-          <article class="record" data-record-id="{escape(record.record_id)}">
-            <p><strong>{escape(record.record_type)}</strong> · <span class="status status-proposed">proposed</span></p>
-            <p>{escape(record.meaning)}</p>
-            <form action="/decisions/{escape(reckoning_id)}/records/{escape(record.record_id)}/correct" method="post">
-              <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
-              <input type="hidden" name="expected_revision" value="{expected_revision}">
-              <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
-              <label for="meaning-{escape(record.record_id)}">Edit meaning</label>
-              <textarea id="meaning-{escape(record.record_id)}" name="meaning" required>{escape(record.meaning)}</textarea>
-              <button type="submit">Save correction</button>
-            </form>
-            <form action="/decisions/{escape(reckoning_id)}/confirm" method="post">
-              <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
-              <input type="hidden" name="expected_revision" value="{expected_revision}">
-              <input type="hidden" name="operation_id" value="{escape(self._fresh_operation_id())}">
-              <button type="submit">Confirm this version</button>
-            </form>
-          </article>
-        """
+    def _active_proposal_link(self) -> str:
+        list_reckonings = getattr(self._application, "list_reckonings", None)
+        if not callable(list_reckonings):
+            return ""
+        proposed = tuple(
+            reckoning
+            for reckoning in list_reckonings()
+            if reckoning.status == "proposed"
+        )
+        if not proposed:
+            return ""
+        links = "".join(
+            f'<li><a href="/decisions/{escape(reckoning.id, quote=True)}">'
+            f"{escape(reckoning.draft.conflict)}</a> · revision "
+            f"{reckoning.version}</li>"
+            for reckoning in proposed
+        )
+        return (
+            '<section class="card" aria-labelledby="active-proposal">'
+            '<h2 id="active-proposal">Waiting for your review</h2>'
+            "<p>Reply 'confirm' to confirm the proposal exactly as shown, or "
+            "tell me the correction. You can also open it and edit directly.</p>"
+            f"<ul>{links}</ul></section>"
+        )
+
 
     def _render_inspector(
         self,
@@ -1352,9 +1408,6 @@ class ReckoningWebApplication:
             {decision_block}
           </div>
         """
-
-    def _fresh_operation_id(self) -> str:
-        return token_urlsafe(16)
 
     def _render_profile_review(self, csrf_token: str) -> str:
         profile_proposals = getattr(self._application, "profile_proposals", None)
@@ -1419,10 +1472,10 @@ class ReckoningWebApplication:
             ("Actions", control.actions),
         )
         details = "".join(
-            f'<section class="control-section"><h2>{escape(title)}</h2>{cls._list(items)}</section>'
+            f'<section class="control-section"><h2>{escape(title)}</h2>{render_list(items)}</section>'
             for title, items in sections
         )
-        failures = cls._list(tuple(item.summary for item in control.failures))
+        failures = render_list(tuple(item.summary for item in control.failures))
         return f"""
           <header><p class="eyebrow">Operational truth</p><h1>Control</h1></header>
           <section class="control-section"><h2>Costs</h2>
@@ -1462,11 +1515,6 @@ class ReckoningWebApplication:
           </section>
         """
 
-    @staticmethod
-    def _list(items: tuple[str, ...]) -> str:
-        if not items:
-            return '<p class="empty">None recorded.</p>'
-        return "<ul>" + "".join(f"<li>{escape(item)}</li>" for item in items) + "</ul>"
 
 
 def build_parser() -> argparse.ArgumentParser:

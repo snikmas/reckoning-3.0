@@ -13,6 +13,7 @@ from reckoning.continuity import (
     Evidence,
     IdentifierFactory,
     InMemoryReckoningRepository,
+    OperationRecord,
     PersonalRecordVersion,
     Reckoning,
     ReckoningOperationConflict,
@@ -166,45 +167,6 @@ class ModelRunRepository(Protocol):
 
 
 @dataclass(frozen=True)
-class CompletedOperation:
-    operation_id: str
-    payload_digest: str
-    result_id: str
-    completed_at: datetime
-
-
-class OperationLog(Protocol):
-    def lookup(self, operation_id: str) -> CompletedOperation | None: ...
-
-    def record(
-        self,
-        operation_id: str,
-        payload_digest: str,
-        result_id: str,
-        completed_at: datetime,
-    ) -> None: ...
-
-
-class InMemoryOperationLog:
-    def __init__(self) -> None:
-        self._operations: dict[str, CompletedOperation] = {}
-
-    def lookup(self, operation_id: str) -> CompletedOperation | None:
-        return self._operations.get(operation_id)
-
-    def record(
-        self,
-        operation_id: str,
-        payload_digest: str,
-        result_id: str,
-        completed_at: datetime,
-    ) -> None:
-        self._operations[operation_id] = CompletedOperation(
-            operation_id, payload_digest, result_id, completed_at
-        )
-
-
-@dataclass(frozen=True)
 class ApplicationDependencies:
     clock: Clock
     model: ModelProvider
@@ -230,7 +192,6 @@ class ApplicationDependencies:
     processing_scope: ProcessingScope | UnrestrictedProcessingScope = field(
         default_factory=UnrestrictedProcessingScope
     )
-    operation_log: OperationLog = field(default_factory=InMemoryOperationLog)
 
 
 class ProtectedResponsePolicy:
@@ -632,32 +593,50 @@ class ReckoningApplication:
         text = "|".join(str(part) for part in parts)
         return sha256(text.encode("utf-8")).hexdigest()
 
-    def _check_operation_id(
+    def _replay_result(
         self, operation_id: str | None, payload_digest: str
     ) -> str | None:
+        """Return the stored result for a completed replay, else None.
+
+        A failed operation may be retried with the same payload; any payload
+        change under a used operation id is a conflict.
+        """
         if operation_id is None:
             return None
-        completed = self._dependencies.operation_log.lookup(operation_id)
-        if completed is not None:
-            if completed.payload_digest != payload_digest:
-                raise ReckoningOperationConflict(operation_id)
-            return completed.result_id
-        return None
+        record = self._dependencies.reckoning_repository.lookup_operation(
+            operation_id
+        )
+        if record is None:
+            return None
+        if record.payload_digest != payload_digest:
+            raise ReckoningOperationConflict(operation_id)
+        if record.status == "failed":
+            return None
+        return record.result_id
 
-    def _record_operation(
+    def _completed_operation(
         self,
         operation_id: str | None,
         payload_digest: str,
         result_id: str,
-    ) -> None:
+    ) -> OperationRecord | None:
         if operation_id is None:
-            return
-        self._dependencies.operation_log.record(
-            operation_id,
-            payload_digest,
-            result_id,
-            self._dependencies.clock.now(),
+            return None
+        return OperationRecord(
+            operation_id=operation_id,
+            payload_digest=payload_digest,
+            status="completed",
+            result_id=result_id,
+            pending_input="",
+            occurred_at=self._dependencies.clock.now(),
         )
+
+    def list_reckonings(self) -> tuple[Reckoning, ...]:
+        return self._dependencies.reckoning_repository.list_reckonings()
+
+    def pending_decision_inputs(self) -> tuple[OperationRecord, ...]:
+        """Failed proposal operations whose received input is still outstanding."""
+        return self._dependencies.reckoning_repository.list_pending_operations()
 
     def start_reckoning(
         self, text: str, *, operation_id: str | None = None
@@ -667,7 +646,7 @@ class ReckoningApplication:
             raise ValueError("A situation cannot be empty.")
 
         payload_digest = self._operation_payload_digest(source_input)
-        previous_result = self._check_operation_id(operation_id, payload_digest)
+        previous_result = self._replay_result(operation_id, payload_digest)
         if previous_result is not None:
             return self._dependencies.reckoning_repository.get(previous_result)
 
@@ -690,6 +669,17 @@ class ReckoningApplication:
             self._dependencies.model_runs.save_run(
                 self._failed_run_record(error, requested_at=requested_at)
             )
+            if operation_id is not None:
+                self._dependencies.reckoning_repository.record_operation(
+                    OperationRecord(
+                        operation_id=operation_id,
+                        payload_digest=payload_digest,
+                        status="failed",
+                        result_id="",
+                        pending_input=source_input,
+                        occurred_at=requested_at,
+                    )
+                )
             raise RuntimeError(
                 f"The {error.provider} reckoning run failed. {error}"
             ) from error
@@ -756,8 +746,13 @@ class ReckoningApplication:
             draft=draft,
             record_versions=record_versions,
         )
-        self._dependencies.reckoning_repository.save(reckoning, expected_version=0)
-        self._record_operation(operation_id, payload_digest, reckoning.id)
+        self._dependencies.reckoning_repository.save(
+            reckoning,
+            expected_version=0,
+            operation=self._completed_operation(
+                operation_id, payload_digest, reckoning.id
+            ),
+        )
         return reckoning
 
     def correct_personal_record(
@@ -776,7 +771,7 @@ class ReckoningApplication:
         payload_digest = self._operation_payload_digest(
             reckoning_id, record_id, meaning, expected_revision
         )
-        previous_result = self._check_operation_id(operation_id, payload_digest)
+        previous_result = self._replay_result(operation_id, payload_digest)
         if previous_result is not None:
             return self._dependencies.reckoning_repository.get(previous_result)
 
@@ -823,9 +818,12 @@ class ReckoningApplication:
             record_versions=reckoning.record_versions + (corrected_record,),
         )
         self._dependencies.reckoning_repository.save(
-            corrected, expected_version=reckoning.version
+            corrected,
+            expected_version=reckoning.version,
+            operation=self._completed_operation(
+                operation_id, payload_digest, reckoning_id
+            ),
         )
-        self._record_operation(operation_id, payload_digest, reckoning_id)
         return corrected
 
     def confirm_reckoning(
@@ -838,7 +836,7 @@ class ReckoningApplication:
         payload_digest = self._operation_payload_digest(
             reckoning_id, expected_revision
         )
-        previous_result = self._check_operation_id(operation_id, payload_digest)
+        previous_result = self._replay_result(operation_id, payload_digest)
         if previous_result is not None:
             return self._dependencies.reckoning_repository.get(previous_result)
 
@@ -848,7 +846,11 @@ class ReckoningApplication:
                 reckoning_id, expected_revision, reckoning.version
             )
         if reckoning.status == "confirmed":
-            self._record_operation(operation_id, payload_digest, reckoning_id)
+            completed = self._completed_operation(
+                operation_id, payload_digest, reckoning_id
+            )
+            if completed is not None:
+                self._dependencies.reckoning_repository.record_operation(completed)
             return reckoning
 
         confirmed_at = self._dependencies.clock.now()
@@ -869,9 +871,12 @@ class ReckoningApplication:
             record_versions=reckoning.record_versions + confirmed_records,
         )
         self._dependencies.reckoning_repository.save(
-            confirmed, expected_version=reckoning.version
+            confirmed,
+            expected_version=reckoning.version,
+            operation=self._completed_operation(
+                operation_id, payload_digest, reckoning_id
+            ),
         )
-        self._record_operation(operation_id, payload_digest, reckoning_id)
         return confirmed
 
     def explain_reckoning(self, reckoning_id: str) -> WhyView:
