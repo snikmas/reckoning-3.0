@@ -34,11 +34,75 @@ class ScenarioSetError(ValueError):
 
 
 @dataclass(frozen=True)
+class MessageStep:
+    text: str
+
+
+@dataclass(frozen=True)
+class ReckonStep:
+    text: str
+
+
+@dataclass(frozen=True)
+class CorrectStep:
+    text: str
+
+
+@dataclass(frozen=True)
+class ConfirmStep:
+    expected_revision: int | None
+
+
+@dataclass(frozen=True)
+class ExplainStep:
+    pass
+
+
+@dataclass(frozen=True)
+class CheckInStep:
+    outcome: str
+
+
+@dataclass(frozen=True)
+class ResumeStep:
+    pass
+
+
+@dataclass(frozen=True)
+class ProfileRejectStep:
+    pass
+
+
+@dataclass(frozen=True)
+class FeedbackStep:
+    pass
+
+
+@dataclass(frozen=True)
+class MissingJourneyStep:
+    journey: str
+
+
+ScenarioStep = (
+    MessageStep
+    | ReckonStep
+    | CorrectStep
+    | ConfirmStep
+    | ExplainStep
+    | CheckInStep
+    | ResumeStep
+    | ProfileRejectStep
+    | FeedbackStep
+    | MissingJourneyStep
+)
+
+
+@dataclass(frozen=True)
 class Scenario:
     id: str
     language: str
     mandatory: bool
-    steps: tuple[dict[str, Any], ...]
+    steps: tuple[ScenarioStep, ...]
     rubric: dict[str, str]
     scripted_model_outputs: tuple[str, ...]
     scripted_reckoning: dict[str, Any] | None
@@ -65,6 +129,8 @@ class LiveConfig:
     route: str | None
     max_calls: int | None
     max_cost: float | None
+    processing_permitted: bool = False
+    unknown_cost_acknowledged: bool = False
 
     @property
     def authorized(self) -> bool:
@@ -72,7 +138,15 @@ class LiveConfig:
             return False
         if not self.provider and not self.route:
             return False
+        if not self.model or not self.model.strip():
+            return False
+        if not self.processing_permitted:
+            return False
         if self.max_calls is None or self.max_calls <= 0:
+            return False
+        # A call-limited run does not enforce a monetary ceiling. That must be
+        # acknowledged explicitly; naming a provider never implies it.
+        if self.max_cost is None and not self.unknown_cost_acknowledged:
             return False
         return True
 
@@ -139,6 +213,7 @@ class LiveBudget:
         self.output_tokens = 0
         self.total_cost = 0.0
         self.exhausted = False
+        self._outstanding: list[float] = []
         self.price_basis = PRICE_BASIS.get(self._provider)
         if max_cost is not None and (
             self.price_basis is None or not self.price_basis.supports_pricing
@@ -156,6 +231,11 @@ class LiveBudget:
             + self._reserved_output * self.price_basis.output_price_per_1m
         ) / 1_000_000
 
+    @property
+    def outstanding_cost(self) -> float:
+        """Reserved cost for attempts that have not been reconciled yet."""
+        return sum(self._outstanding)
+
     def check_call(self) -> None:
         if self.exhausted:
             raise BudgetExhausted("Budget already exhausted.")
@@ -164,18 +244,22 @@ class LiveBudget:
             raise BudgetExhausted(
                 f"Call budget exhausted ({self.calls_used}/{self._max_calls})."
             )
+        reserved = self._reserved_cost()
         if self._max_cost is not None and self.price_basis is not None:
-            reserved = self.total_cost + self._reserved_cost()
-            if reserved > self._max_cost:
+            committed = self.total_cost + self.outstanding_cost + reserved
+            if committed > self._max_cost:
                 self.exhausted = True
                 raise BudgetExhausted(
                     "Cost budget cannot cover the reserved cost of the next request."
                 )
         self.calls_used += 1
+        self._outstanding.append(reserved)
         if self._max_calls is not None and self.calls_used >= self._max_calls:
             self.exhausted = True
 
     def record_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Reconcile every outstanding reservation with measured usage."""
+        self._outstanding.clear()
         self.input_tokens += max(0, input_tokens)
         self.output_tokens += max(0, output_tokens)
         if self.price_basis is not None and self.price_basis.supports_pricing:
@@ -183,6 +267,19 @@ class LiveBudget:
                 input_tokens * self.price_basis.input_price_per_1m
                 + output_tokens * self.price_basis.output_price_per_1m
             ) / 1_000_000
+        if self._max_cost is not None and self.total_cost >= self._max_cost:
+            self.exhausted = True
+
+    def record_unknown_usage(self) -> None:
+        """Consume outstanding reservations when an attempt's usage is unknown.
+
+        A timeout, transport error, or malformed response still consumed its
+        call and reserved budget, so the reservation becomes spent rather than
+        being refunded for another attempt.
+        """
+        spent = self.outstanding_cost
+        self._outstanding.clear()
+        self.total_cost += spent
         if self._max_cost is not None and self.total_cost >= self._max_cost:
             self.exhausted = True
 
@@ -257,11 +354,10 @@ def _validate_scenario(raw: dict[str, Any], index: int) -> Scenario:
     steps = raw.get("steps")
     if not isinstance(steps, list) or not steps:
         raise ScenarioSetError(f"{prefix}.steps must be a non-empty list.")
-    for step_index, step in enumerate(steps):
-        if not isinstance(step, dict) or "action" not in step:
-            raise ScenarioSetError(
-                f"{prefix}.steps[{step_index}] must be an object with an action field."
-            )
+    parsed_steps = tuple(
+        _parse_step(step, prefix, step_index)
+        for step_index, step in enumerate(steps)
+    )
 
     rubric = raw.get("rubric")
     if not isinstance(rubric, dict):
@@ -302,7 +398,7 @@ def _validate_scenario(raw: dict[str, Any], index: int) -> Scenario:
         id=scenario_id,
         language=language,
         mandatory=mandatory,
-        steps=tuple(steps),
+        steps=parsed_steps,
         rubric=valid_rubric,
         scripted_model_outputs=scripted_model_outputs,
         scripted_reckoning=scripted_reckoning,
@@ -321,6 +417,42 @@ def _require_string(raw: dict[str, Any], key: str, prefix: str) -> str:
     return value
 
 
+def _parse_step(raw: object, prefix: str, index: int) -> ScenarioStep:
+    """Parse one raw step object into the typed step union."""
+    step_prefix = f"{prefix}.steps[{index}]"
+    if not isinstance(raw, dict) or "action" not in raw:
+        raise ScenarioSetError(
+            f"{step_prefix} must be an object with an action field."
+        )
+    action = raw["action"]
+    if action == "message":
+        return MessageStep(_require_string(raw, "text", step_prefix))
+    if action == "reckon":
+        return ReckonStep(_require_string(raw, "text", step_prefix))
+    if action == "correct":
+        return CorrectStep(_require_string(raw, "text", step_prefix))
+    if action == "confirm":
+        expected = raw.get("expected_revision")
+        if expected is not None and not isinstance(expected, int):
+            raise ScenarioSetError(
+                f"{step_prefix}.expected_revision must be an integer or omitted."
+            )
+        return ConfirmStep(expected)
+    if action == "explain":
+        return ExplainStep()
+    if action == "check_in":
+        return CheckInStep(_require_string(raw, "outcome", step_prefix))
+    if action == "resume":
+        return ResumeStep()
+    if action == "profile_reject":
+        return ProfileRejectStep()
+    if action == "feedback":
+        return FeedbackStep()
+    if action == "missing_journey":
+        return MissingJourneyStep(_require_string(raw, "journey", step_prefix))
+    raise ScenarioSetError(f"{step_prefix} has unknown action: {action!r}.")
+
+
 def _profile_applies(profile: str, tags: tuple[str, ...]) -> bool:
     if profile == "full-stage-2":
         return True
@@ -337,27 +469,28 @@ def _run_scenario_steps(
     with tempfile.TemporaryDirectory(prefix="reckoning-eval-") as tmp:
         driver = WebEvaluationDriver(Path(tmp), **driver_kwargs)
         for step in scenario.steps:
-            action = step["action"]
-            if action == "message":
-                driver.send_message(str(step["text"]))
-            elif action == "reckon":
-                driver.start_reckoning(str(step["text"]))
-            elif action == "correct":
-                driver.correct_record(str(step["text"]))
-            elif action == "confirm":
-                driver.confirm_reckoning(step.get("expected_revision"))
-            elif action == "explain":
+            if isinstance(step, MessageStep):
+                driver.send_message(step.text)
+            elif isinstance(step, ReckonStep):
+                driver.start_reckoning(step.text)
+            elif isinstance(step, CorrectStep):
+                driver.correct_record(step.text)
+            elif isinstance(step, ConfirmStep):
+                driver.confirm_reckoning(step.expected_revision)
+            elif isinstance(step, ExplainStep):
                 driver.explain_reckoning()
-            elif action == "check_in":
-                driver.record_check_in(str(step["outcome"]))
-            elif action == "resume":
+            elif isinstance(step, CheckInStep):
+                driver.record_check_in(step.outcome)
+            elif isinstance(step, ResumeStep):
                 driver.resume_decision()
-            elif action == "profile_reject":
+            elif isinstance(step, ProfileRejectStep):
                 driver.profile_reject()
-            elif action == "feedback":
+            elif isinstance(step, FeedbackStep):
                 driver.feedback()
-            else:
-                raise ScenarioSetError(f"Unknown step action: {action}")
+            elif isinstance(step, MissingJourneyStep):
+                driver.missing_journey(step.journey)
+            else:  # pragma: no cover - the union is exhaustive
+                raise ScenarioSetError(f"Unknown step: {step!r}")
         return driver.finish()
 
 
@@ -596,7 +729,12 @@ def evaluate_scenario(
             model=live_config.model or "unknown",
             route=live_config.route or "unknown",
             profile=profile,
-            reason="Live execution requires --provider or --route and a positive --max-calls limit.",
+            reason=(
+                "Live execution requires explicit mode, a supported provider "
+                "and concrete model, processing permission, a positive "
+                "--max-calls limit, and an acknowledged unknown cost when no "
+                "enforceable --max-cost is given."
+            ),
             limitations=limitations,
         )
 
@@ -673,9 +811,11 @@ def evaluate_scenario(
             evidence = {}
             missing = True
             cost_status = "unavailable"
+            budget.record_unknown_usage()
         except (ValueError, RuntimeError) as error:
             # Configuration or credential problems surface as unrun records so
             # the run preserves evidence without silently falling back to fake.
+            budget.record_unknown_usage()
             return _unrun_record(
                 run_id=run_id,
                 scenario_set=scenario_set,
@@ -918,6 +1058,8 @@ def run_evaluation(
     live_route: str | None = None,
     max_calls: int | None = None,
     max_cost: float | None = None,
+    live_processing_permitted: bool = False,
+    acknowledge_unknown_cost: bool = False,
     credentials_path: str | Path | None = None,
     transport: Callable[[Request, float], bytes] | None = None,
     repo_root: str | Path | None = None,
@@ -940,6 +1082,8 @@ def run_evaluation(
         route=live_route,
         max_calls=max_calls,
         max_cost=max_cost,
+        processing_permitted=live_processing_permitted,
+        unknown_cost_acknowledged=acknowledge_unknown_cost,
     )
 
     if live_config.enabled and live_config.authorized:
@@ -976,6 +1120,11 @@ def run_evaluation(
     if not selected_scenarios:
         raise ValueError(
             f"Profile {profile!r} does not include any scenarios from this set."
+        )
+    if not any(scenario.mandatory for scenario in selected_scenarios):
+        raise ValueError(
+            f"Profile {profile!r} selects no mandatory scenarios; "
+            "refusing to report a checkpoint with nothing to enforce."
         )
 
     credentials = Path(credentials_path) if credentials_path is not None else None

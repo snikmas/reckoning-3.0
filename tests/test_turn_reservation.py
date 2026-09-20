@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,14 @@ from reckoning.interfaces import (
     SourcePlacement,
 )
 from reckoning.interface_store import SQLiteInterfaceRepository
+
+
+class _FixedTurnClock:
+    def __init__(self, value: datetime) -> None:
+        self._value = value
+
+    def now(self) -> datetime:
+        return self._value
 
 
 def _local_policy() -> PlacementPolicy:
@@ -111,6 +120,75 @@ def test_legacy_notice_prefix_split() -> None:
     assert notices == ("Limited context: no user profile is available.",)
 
 
+def test_unknown_limited_context_prose_is_preserved_as_speech() -> None:
+    text = "Limited context: I was explaining an unrelated limitation of the tool."
+    speech, notices = split_legacy_notice_prefix(text)
+    assert speech == text
+    assert notices == ()
+
+
+def test_known_generated_limited_context_notices_split() -> None:
+    for notice in (
+        "Limited context: no user profile is available.",
+        "Limited context: unavailable processing categories: personal-context.",
+        "Limited context: 1 earlier turn was omitted to fit the model context window.",
+        "Limited context: 3 earlier turns were omitted to fit the model context window.",
+    ):
+        speech, notices = split_legacy_notice_prefix(f"{notice} Hello.")
+        assert notices == (notice,), notice
+        assert speech == "Hello."
+
+
+def test_turn_repositories_honor_one_injected_clock(tmp_path: Path) -> None:
+    fixed = datetime(2026, 9, 20, 10, 0, 0, tzinfo=timezone.utc)
+    clock = _FixedTurnClock(fixed)
+    memory = InMemoryInterfaceRepository(clock=clock)
+    sqlite = SQLiteInterfaceRepository(tmp_path / "interfaces.json", clock=clock)
+
+    results = []
+    for repository in (memory, sqlite):
+        session = repository.create_session("web", None, "user-created", clock.now())
+        repository.reserve_turn(
+            "web", session.session_id, "exact input", "turn-1", expected_revision=1
+        )
+        results.append(
+            repository.complete_turn("web", session.session_id, "turn-1", "reply")
+        )
+
+    def fields(turn: object) -> tuple[object, ...]:
+        return (
+            turn.user_speech,  # type: ignore[attr-defined]
+            turn.assistant_speech,  # type: ignore[attr-defined]
+            turn.state,  # type: ignore[attr-defined]
+            turn.created_at,  # type: ignore[attr-defined]
+            turn.completed_at,  # type: ignore[attr-defined]
+        )
+
+    assert fields(results[0]) == fields(results[1])
+    assert results[0].user_speech == "exact input"
+    assert results[0].created_at == fixed
+    assert results[0].completed_at == fixed
+
+
+def test_sqlite_failed_turn_is_hydrated_from_persisted_values(
+    tmp_path: Path,
+) -> None:
+    fixed = datetime(2026, 9, 20, 10, 0, 0, tzinfo=timezone.utc)
+    clock = _FixedTurnClock(fixed)
+    repository = SQLiteInterfaceRepository(tmp_path / "interfaces.json", clock=clock)
+    session = repository.create_session("web", None, "user-created", clock.now())
+    repository.reserve_turn(
+        "web", session.session_id, "kept input", "turn-1", expected_revision=1
+    )
+
+    failed = repository.fail_turn("web", session.session_id, "turn-1")
+
+    assert failed.user_speech == "kept input"
+    assert failed.created_at == fixed
+    assert failed.completed_at == fixed
+    assert failed.state == "failed"
+
+
 def test_unknown_historical_text_preserved() -> None:
     speech, notices = split_legacy_notice_prefix("Limited edition watch.")
     assert speech == "Limited edition watch."
@@ -170,7 +248,7 @@ def test_sqlite_migration_splits_legacy_notice_prefix(tmp_path: Path) -> None:
         INSERT INTO interface_session_messages (channel, session_id, position, role, content)
         VALUES (?, ?, ?, ?, ?)
         """,
-        ("web", "", 1, "assistant", "Limited context: unavailable. reply"),
+        ("web", "", 1, "assistant", "Limited context: no user profile is available. reply"),
     )
     connection.commit()
     connection.close()
@@ -180,7 +258,9 @@ def test_sqlite_migration_splits_legacy_notice_prefix(tmp_path: Path) -> None:
     assert len(turns) == 1
     assert turns[0].user_speech == "user text"
     assert turns[0].assistant_speech == "reply"
-    assert turns[0].notices == ("Limited context: unavailable.",)
+    assert turns[0].notices == (
+        "Limited context: no user profile is available.",
+    )
     messages = reopened.load().sessions[0].messages
     assert messages[0] == ChannelMessage("user", "user text")
     assert messages[1] == ChannelMessage("assistant", "reply")

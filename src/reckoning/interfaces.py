@@ -17,6 +17,15 @@ from reckoning.conversation import (
 
 
 
+class InterfaceClock(Protocol):
+    def now(self) -> datetime: ...
+
+
+class SystemInterfaceClock:
+    def now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+
 ChannelName = Literal["terminal", "web", "telegram"]
 ActivityState = Literal["idle", "listening", "reasoning", "executing"]
 VisualState = Literal[
@@ -188,6 +197,43 @@ class ChannelTurn:
     model_run_id: str | None = None
 
 
+def apply_turn_completion(
+    turn: ChannelTurn,
+    assistant_speech: str,
+    *,
+    notices: tuple[str, ...] = (),
+    context_status: ContextStatus | None = None,
+    model_run_id: str | None = None,
+    completed_at: datetime,
+) -> ChannelTurn:
+    """Apply the one valid completion transition to a reserved turn.
+
+    Storage adapters share this rule so in-memory and SQLite behavior cannot
+    drift: only a pending turn can complete, and the completed turn is derived
+    from the persisted reservation rather than a freshly invented one.
+    """
+    if turn.state != "pending":
+        raise ValueError(f"Turn {turn.turn_id} is not pending.")
+    return replace(
+        turn,
+        assistant_speech=assistant_speech,
+        state="completed",
+        completed_at=completed_at,
+        notices=notices,
+        context_status=context_status,
+        model_run_id=model_run_id,
+    )
+
+
+def apply_turn_failure(
+    turn: ChannelTurn, *, completed_at: datetime
+) -> ChannelTurn:
+    """Apply the one valid failure transition to a reserved turn."""
+    if turn.state != "pending":
+        raise ValueError(f"Turn {turn.turn_id} is not pending.")
+    return replace(turn, state="failed", completed_at=completed_at)
+
+
 @dataclass(frozen=True)
 class RunReceipt:
     id: str
@@ -298,6 +344,16 @@ class InterfaceRepository(Protocol):
         display_name: str | None = None,
     ) -> ChannelSession: ...
 
+    def create_and_select_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None,
+        origin: SessionOrigin,
+        created_at: datetime,
+        *,
+        expected_selection_revision: int | None = None,
+    ) -> tuple[ChannelSession, ChannelSelection]: ...
+
     def session_revision(self, channel: ChannelName, session_id: str) -> int: ...
 
     def projection_revision(self, projection: str) -> int: ...
@@ -310,6 +366,7 @@ class InterfaceRepository(Protocol):
         assistant_text: str,
         *,
         expected_revision: int,
+        now: datetime | None = None,
     ) -> ChannelSession: ...
 
     def append_messages(
@@ -320,6 +377,7 @@ class InterfaceRepository(Protocol):
         *,
         expected_revision: int,
         returning_user: bool = False,
+        now: datetime | None = None,
     ) -> ChannelSession: ...
 
     def reserve_turn(
@@ -330,6 +388,7 @@ class InterfaceRepository(Protocol):
         turn_id: str,
         *,
         expected_revision: int,
+        now: datetime | None = None,
     ) -> ChannelTurn: ...
 
     def complete_turn(
@@ -342,6 +401,7 @@ class InterfaceRepository(Protocol):
         notices: tuple[str, ...] = (),
         context_status: ContextStatus | None = None,
         model_run_id: str | None = None,
+        now: datetime | None = None,
     ) -> ChannelTurn: ...
 
     def fail_turn(
@@ -349,6 +409,8 @@ class InterfaceRepository(Protocol):
         channel: ChannelName,
         session_id: str,
         turn_id: str,
+        *,
+        now: datetime | None = None,
     ) -> ChannelTurn: ...
 
     def list_turns(
@@ -387,8 +449,14 @@ class InterfaceRepository(Protocol):
 
 
 class InMemoryInterfaceRepository:
-    def __init__(self, state: InterfaceState | None = None) -> None:
+    def __init__(
+        self,
+        state: InterfaceState | None = None,
+        *,
+        clock: InterfaceClock | None = None,
+    ) -> None:
         self._state = state or InterfaceState()
+        self._clock = clock or SystemInterfaceClock()
         self._session_revisions: dict[tuple[str, str], int] = {
             (session.channel, session.session_id): session.revision or 1
             for session in self._state.sessions
@@ -492,8 +560,30 @@ class InMemoryInterfaceRepository:
             channel,
             display_name or "First conversation",
             "first-use",
-            datetime.now(timezone.utc),
+            self._clock.now(),
         )
+
+    def create_and_select_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None,
+        origin: SessionOrigin,
+        created_at: datetime,
+        *,
+        expected_selection_revision: int | None = None,
+    ) -> tuple[ChannelSession, ChannelSelection]:
+        actual = self._selection_revisions.get(channel, 0)
+        if (
+            expected_selection_revision is not None
+            and actual != expected_selection_revision
+        ):
+            raise InterfaceSessionConflict(
+                channel, "", expected_selection_revision, actual
+            )
+        session = self.create_session(channel, display_name, origin, created_at)
+        self._selections[channel] = session.session_id
+        self._selection_revisions[channel] = actual + 1
+        return session, ChannelSelection(channel, session.session_id, actual + 1)
 
     def session_revision(self, channel: ChannelName, session_id: str) -> int:
         return self._session_revisions.get((channel, session_id), 0)
@@ -509,6 +599,7 @@ class InMemoryInterfaceRepository:
         assistant_text: str,
         *,
         expected_revision: int,
+        now: datetime | None = None,
     ) -> ChannelSession:
         return self.append_messages(
             channel,
@@ -519,6 +610,7 @@ class InMemoryInterfaceRepository:
             ),
             expected_revision=expected_revision,
             returning_user=True,
+            now=now,
         )
 
     def append_messages(
@@ -529,6 +621,7 @@ class InMemoryInterfaceRepository:
         *,
         expected_revision: int,
         returning_user: bool = False,
+        now: datetime | None = None,
     ) -> ChannelSession:
         actual = self.session_revision(channel, session_id)
         if actual != expected_revision:
@@ -540,7 +633,7 @@ class InMemoryInterfaceRepository:
         session = replace(
             existing,
             messages=combined,
-            last_activity_at=datetime.now(timezone.utc),
+            last_activity_at=now or self._clock.now(),
             revision=actual + 1,
         )
         sessions = tuple(
@@ -566,6 +659,7 @@ class InMemoryInterfaceRepository:
         turn_id: str,
         *,
         expected_revision: int,
+        now: datetime | None = None,
     ) -> ChannelTurn:
         actual = self.session_revision(channel, session_id)
         if actual != expected_revision:
@@ -579,7 +673,7 @@ class InMemoryInterfaceRepository:
             user_speech=user_speech,
             assistant_speech=None,
             state="pending",
-            created_at=datetime.now(timezone.utc),
+            created_at=now or self._clock.now(),
             completed_at=None,
         )
         self._turns.append(turn)
@@ -596,21 +690,25 @@ class InMemoryInterfaceRepository:
         notices: tuple[str, ...] = (),
         context_status: ContextStatus | None = None,
         model_run_id: str | None = None,
+        now: datetime | None = None,
     ) -> ChannelTurn:
         for index, turn in enumerate(self._turns):
             if turn.turn_id == turn_id:
-                completed = replace(
+                completed = apply_turn_completion(
                     turn,
-                    assistant_speech=assistant_speech,
-                    state="completed",
-                    completed_at=datetime.now(timezone.utc),
+                    assistant_speech,
                     notices=notices,
                     context_status=context_status,
                     model_run_id=model_run_id,
+                    completed_at=now or self._clock.now(),
                 )
                 self._turns[index] = completed
                 self._append_speech_to_session(
-                    channel, session_id, turn.user_speech, assistant_speech
+                    channel,
+                    session_id,
+                    turn.user_speech,
+                    assistant_speech,
+                    now=completed.completed_at,
                 )
                 return completed
         raise KeyError(f"Unknown turn: {turn_id}")
@@ -621,6 +719,8 @@ class InMemoryInterfaceRepository:
         session_id: str,
         user_speech: str,
         assistant_speech: str,
+        *,
+        now: datetime | None = None,
     ) -> None:
         existing = _find_session(self._state, channel, session_id)
         combined = existing.messages + (
@@ -630,7 +730,7 @@ class InMemoryInterfaceRepository:
         session = replace(
             existing,
             messages=combined,
-            last_activity_at=datetime.now(timezone.utc),
+            last_activity_at=now or self._clock.now(),
             revision=self._session_revisions.get((channel, session_id), 0) + 1,
         )
         sessions = tuple(
@@ -654,14 +754,14 @@ class InMemoryInterfaceRepository:
         channel: ChannelName,
         session_id: str,
         turn_id: str,
+        *,
+        now: datetime | None = None,
     ) -> ChannelTurn:
         del channel, session_id
         for index, turn in enumerate(self._turns):
             if turn.turn_id == turn_id:
-                failed = replace(
-                    turn,
-                    state="failed",
-                    completed_at=datetime.now(timezone.utc),
+                failed = apply_turn_failure(
+                    turn, completed_at=now or self._clock.now()
                 )
                 self._turns[index] = failed
                 return failed
@@ -763,10 +863,12 @@ class InMemoryInterfaceRepository:
 class JsonFileInterfaceRepository:
     """Compatibility entry point backed by per-root SQLite transactions."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self, path: Path, *, clock: InterfaceClock | None = None
+    ) -> None:
         from reckoning.interface_store import SQLiteInterfaceRepository
 
-        self._delegate = SQLiteInterfaceRepository(path)
+        self._delegate = SQLiteInterfaceRepository(path, clock=clock)
 
     @property
     def database_path(self) -> Path:
@@ -813,6 +915,23 @@ class JsonFileInterfaceRepository:
     ) -> ChannelSession:
         return self._delegate.start_first_session(channel, display_name)
 
+    def create_and_select_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None,
+        origin: SessionOrigin,
+        created_at: datetime,
+        *,
+        expected_selection_revision: int | None = None,
+    ) -> tuple[ChannelSession, ChannelSelection]:
+        return self._delegate.create_and_select_session(
+            channel,
+            display_name,
+            origin,
+            created_at,
+            expected_selection_revision=expected_selection_revision,
+        )
+
     def session_revision(self, channel: ChannelName, session_id: str) -> int:
         return self._delegate.session_revision(channel, session_id)
 
@@ -827,6 +946,7 @@ class JsonFileInterfaceRepository:
         assistant_text: str,
         *,
         expected_revision: int,
+        now: datetime | None = None,
     ) -> ChannelSession:
         return self._delegate.append_completed_turn(
             channel,
@@ -834,6 +954,7 @@ class JsonFileInterfaceRepository:
             user_text,
             assistant_text,
             expected_revision=expected_revision,
+            now=now,
         )
 
     def append_messages(
@@ -844,6 +965,7 @@ class JsonFileInterfaceRepository:
         *,
         expected_revision: int,
         returning_user: bool = False,
+        now: datetime | None = None,
     ) -> ChannelSession:
         return self._delegate.append_messages(
             channel,
@@ -851,6 +973,7 @@ class JsonFileInterfaceRepository:
             messages,
             expected_revision=expected_revision,
             returning_user=returning_user,
+            now=now,
         )
 
     def reserve_turn(
@@ -861,6 +984,7 @@ class JsonFileInterfaceRepository:
         turn_id: str,
         *,
         expected_revision: int,
+        now: datetime | None = None,
     ) -> ChannelTurn:
         return self._delegate.reserve_turn(
             channel,
@@ -868,6 +992,7 @@ class JsonFileInterfaceRepository:
             user_speech,
             turn_id,
             expected_revision=expected_revision,
+            now=now,
         )
 
     def complete_turn(
@@ -880,6 +1005,7 @@ class JsonFileInterfaceRepository:
         notices: tuple[str, ...] = (),
         context_status: ContextStatus | None = None,
         model_run_id: str | None = None,
+        now: datetime | None = None,
     ) -> ChannelTurn:
         return self._delegate.complete_turn(
             channel,
@@ -889,6 +1015,7 @@ class JsonFileInterfaceRepository:
             notices=notices,
             context_status=context_status,
             model_run_id=model_run_id,
+            now=now,
         )
 
     def fail_turn(
@@ -896,8 +1023,10 @@ class JsonFileInterfaceRepository:
         channel: ChannelName,
         session_id: str,
         turn_id: str,
+        *,
+        now: datetime | None = None,
     ) -> ChannelTurn:
-        return self._delegate.fail_turn(channel, session_id, turn_id)
+        return self._delegate.fail_turn(channel, session_id, turn_id, now=now)
 
     def list_turns(
         self,
@@ -1118,12 +1247,14 @@ class ReckoningInterfaceApplication:
         placement: PlacementPolicy,
         operational_records: OperationalRecordSource | None = None,
         confirmations: ConfirmationHandler | None = None,
+        clock: InterfaceClock | None = None,
     ) -> None:
         self._repository = repository
         self._responder = responder
         self._placement = placement
         self._operational_records = operational_records or EmptyOperationalRecordSource()
         self._confirmations = confirmations or NoDurableConfirmations()
+        self._clock = clock or SystemInterfaceClock()
 
     def landing_area(self) -> Literal["home", "simon"]:
         return "home" if self._repository.load().returning_user else "simon"
@@ -1191,6 +1322,7 @@ class ReckoningInterfaceApplication:
         if expected_session_revision is None:
             expected_session_revision = self.session_revision(channel, session_id)
         state = self._repository.load()
+        occurred_at = self._clock.now()
         turn_id: str | None = None
         placement: PlacementOutcome | None = None
         self._repository.set_activity(
@@ -1234,6 +1366,7 @@ class ReckoningInterfaceApplication:
                 message,
                 turn_id,
                 expected_revision=expected_session_revision,
+                now=occurred_at,
             )
             channel_response = self._responder.respond(
                 ChannelRequest(
@@ -1270,6 +1403,7 @@ class ReckoningInterfaceApplication:
                 notices=tuple(notices),
                 context_status=channel_response.context_status,
                 model_run_id=channel_response.model_run_id,
+                now=occurred_at,
             )
             self._repository.set_activity(
                 "idle", channel=channel, session_id=session_id
@@ -1278,7 +1412,9 @@ class ReckoningInterfaceApplication:
         except Exception:
             if turn_id is not None and placement is not None and placement.status != "blocked":
                 try:
-                    self._repository.fail_turn(channel, session_id, turn_id)
+                    self._repository.fail_turn(
+                        channel, session_id, turn_id, now=occurred_at
+                    )
                 except Exception:
                     pass
             self._repository.set_activity(
@@ -1299,7 +1435,28 @@ class ReckoningInterfaceApplication:
             channel,
             display_name,
             origin,
-            datetime.now(timezone.utc),
+            self._clock.now(),
+        )
+
+    def create_and_select_channel_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None = None,
+        origin: SessionOrigin = "user-created",
+        *,
+        expected_selection_revision: int | None = None,
+    ) -> tuple[ChannelSession, ChannelSelection]:
+        """Create a session and select it as one transaction.
+
+        A failed selection (for example a stale expected revision) rolls back
+        the creation so a race cannot leave an orphan session behind.
+        """
+        return self._repository.create_and_select_session(
+            channel,
+            display_name,
+            origin,
+            self._clock.now(),
+            expected_selection_revision=expected_selection_revision,
         )
 
     def select_channel_session(
@@ -1309,11 +1466,20 @@ class ReckoningInterfaceApplication:
         *,
         expected_selection_revision: int,
     ) -> ChannelSelection:
-        return self._repository.select_session(
-            channel,
-            session_id,
-            expected_selection_revision=expected_selection_revision,
-        )
+        try:
+            return self._repository.select_session(
+                channel,
+                session_id,
+                expected_selection_revision=expected_selection_revision,
+            )
+        except KeyError as error:
+            raise ValueError(str(error)) from error
+
+    def selected_channel_selection(
+        self, channel: ChannelName
+    ) -> ChannelSelection | None:
+        """Public read of the selected session without reaching into storage."""
+        return self._repository.get_selected_session(channel)
 
     def session_revision(self, channel: ChannelName, session_id: str) -> int:
         return self._repository.session_revision(channel, session_id)
@@ -1339,15 +1505,10 @@ class ReckoningInterfaceApplication:
         selected = self.selected_channel_session(channel)
         if selected is not None:
             return selected
-        session = self.create_channel_session(
+        session, _selection = self.create_and_select_channel_session(
             channel,
             display_name="First conversation",
             origin="first-use",
-        )
-        self.select_channel_session(
-            channel,
-            session.session_id,
-            expected_selection_revision=0,
         )
         return session
 
@@ -1375,6 +1536,16 @@ class ReckoningInterfaceApplication:
                 return turn.notices
         return ()
 
+    def channel_turns(
+        self,
+        channel: ChannelName,
+        *,
+        session_id: str | None = None,
+    ) -> tuple[ChannelTurn, ...]:
+        if session_id is None:
+            session_id = self._selected_session_id(channel)
+        return self._repository.list_turns(channel, session_id)
+
     def record_channel_exchange(
         self,
         channel: ChannelName,
@@ -1390,6 +1561,7 @@ class ReckoningInterfaceApplication:
             user_text,
             assistant_text,
             expected_revision=self._repository.session_revision(channel, session_id),
+            now=self._clock.now(),
         )
 
     def status(self, channel: ChannelName) -> ChannelStatus:
@@ -1434,6 +1606,7 @@ class ReckoningInterfaceApplication:
             session_id,
             (delivered,),
             expected_revision=self._repository.session_revision(channel, session_id),
+            now=self._clock.now(),
         )
         return delivered
 

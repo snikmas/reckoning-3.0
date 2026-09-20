@@ -10,6 +10,9 @@ import pytest
 
 from reckoning.conversation_evaluation import (
     SUPPORTED_SCHEMA_VERSION,
+    BudgetExhausted,
+    LiveBudget,
+    LiveConfig,
     ScenarioSetError,
     load_scenario_set,
     run_evaluation,
@@ -26,6 +29,7 @@ def _minimal_scenario(
     mandatory: bool = True,
     rubric: dict[str, str] | None = None,
     scripted_reckoning: dict | None = None,
+    tags: list[str] | None = None,
 ) -> dict:
     if rubric is None:
         rubric = {
@@ -46,6 +50,7 @@ def _minimal_scenario(
         "failure_mode": failure_mode,
         "rubric": rubric,
         "expected_overall": expected_overall,
+        "tags": list(tags or []),
     }
 
 
@@ -86,8 +91,8 @@ def test_load_valid_scenario_set() -> None:
 
     assert scenario_set.scenario_set_id == "stage2-conversation-v1"
     assert scenario_set.schema_version == SUPPORTED_SCHEMA_VERSION
-    assert len(scenario_set.scenarios) == 16
-    assert len({s.id for s in scenario_set.scenarios}) == 16
+    assert len(scenario_set.scenarios) == 20
+    assert len({s.id for s in scenario_set.scenarios}) == 20
 
 
 def test_load_rejects_invalid_json(tmp_path: Path) -> None:
@@ -148,6 +153,26 @@ def test_load_rejects_empty_steps(tmp_path: Path) -> None:
         load_scenario_set(path)
 
 
+def test_profile_selecting_no_mandatory_scenarios_is_rejected(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "set.json"
+    _write_scenario_set(
+        path,
+        [
+            _minimal_scenario(
+                steps=[{"action": "message", "text": "hello"}],
+                mandatory=False,
+                tags=["early-web"],
+            )
+        ],
+    )
+    output = tmp_path / "out.jsonl"
+
+    with pytest.raises(ValueError, match="no mandatory scenarios"):
+        run_evaluation(path, output, mode="fake", profile="early-web")
+
+
 def test_fake_run_matches_expected_overall(tmp_path: Path) -> None:
     output = tmp_path / "out.jsonl"
     rc = run_evaluation(
@@ -206,7 +231,7 @@ def test_live_unauthorized_records_unrun(tmp_path: Path) -> None:
     record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
     assert record["execution_kind"] == "live"
     assert record["overall_status"] == "unrun"
-    assert "requires --provider or --route" in record["observed_output"]
+    assert "explicit mode" in record["observed_output"]
 
 
 def test_live_authorized_records_unrun_without_credentials(
@@ -231,6 +256,8 @@ def test_live_authorized_records_unrun_without_credentials(
         live_provider="deepseek",
         live_model="deepseek-chat",
         max_calls=5,
+        live_processing_permitted=True,
+        acknowledge_unknown_cost=True,
         credentials_path=missing_credentials,
     )
 
@@ -575,7 +602,7 @@ def test_cli_evaluate_fake_runs_and_returns_nonzero() -> None:
     assert "Baseline not accepted" in result.stdout
     assert output.exists()
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-    assert len(records) == 16
+    assert len(records) == 20
 
 
 def test_cli_evaluate_default_mode_is_fake() -> None:
@@ -739,6 +766,8 @@ def test_live_mode_runs_through_adapter_with_injected_transport(
         live_provider="ollama",
         live_model="qwen3",
         max_calls=5,
+        live_processing_permitted=True,
+        acknowledge_unknown_cost=True,
         credentials_path=creds,
         transport=transport,
     )
@@ -782,6 +811,8 @@ def test_live_call_budget_stops_before_exceeding_limit(tmp_path: Path) -> None:
         live_provider="ollama",
         live_model="qwen3",
         max_calls=1,
+        live_processing_permitted=True,
+        acknowledge_unknown_cost=True,
         credentials_path=creds,
         transport=transport,
     )
@@ -793,6 +824,48 @@ def test_live_call_budget_stops_before_exceeding_limit(tmp_path: Path) -> None:
     assert records[0]["overall_status"] == "passed"
     assert records[1]["overall_status"] == "unrun"
     assert "budget" in records[1]["observed_output"].lower()
+
+
+def test_live_proposal_and_message_calls_share_one_budget(tmp_path: Path) -> None:
+    creds = tmp_path / "creds.json"
+    _write_credentials(creds, "ollama", "unused", model="qwen3")
+    scenario_path = tmp_path / "set.json"
+    _write_scenario_set(
+        scenario_path,
+        [
+            _minimal_scenario(
+                "proposal",
+                steps=[{"action": "reckon", "text": "hello"}],
+            ),
+            _minimal_scenario(
+                "chat",
+                steps=[{"action": "message", "text": "hello again"}],
+            ),
+        ],
+    )
+    output = tmp_path / "out.jsonl"
+    transport = _FakeLiveTransport()
+
+    rc = run_evaluation(
+        scenario_path,
+        output,
+        mode="live",
+        live_provider="ollama",
+        live_model="qwen3",
+        max_calls=1,
+        live_processing_permitted=True,
+        acknowledge_unknown_cost=True,
+        credentials_path=creds,
+        transport=transport,
+    )
+
+    assert rc == 1
+    assert transport.calls == 1
+    records = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[1]["overall_status"] == "unrun"
 
 
 def test_live_cost_budget_reserves_before_request(
@@ -850,6 +923,8 @@ def test_live_cost_budget_reserves_before_request(
         live_model="qwen3",
         max_calls=5,
         max_cost=0.00001,
+        live_processing_permitted=True,
+        acknowledge_unknown_cost=True,
         credentials_path=creds,
         transport=transport,
     )
@@ -860,6 +935,83 @@ def test_live_cost_budget_reserves_before_request(
     assert len(records) == 1
     assert records[0]["overall_status"] in ("unrun", "missing-implementation")
     assert "budget" in records[0]["observed_output"].lower()
+
+
+def test_live_budget_reserves_outstanding_cost_per_attempt() -> None:
+    # DeepSeek's versioned basis reserves about $0.004096 per attempt.
+    budget = LiveBudget(provider="deepseek", max_calls=10, max_cost=0.006)
+
+    budget.check_call()
+    assert budget.calls_used == 1
+
+    with pytest.raises(BudgetExhausted):
+        budget.check_call()
+    assert budget.calls_used == 1
+
+
+def test_live_config_requires_model_permission_and_cost_acknowledgement() -> None:
+    base = {
+        "enabled": True,
+        "provider": "ollama",
+        "model": "qwen3",
+        "route": None,
+        "max_calls": 5,
+        "max_cost": None,
+    }
+    assert not LiveConfig(
+        **base, processing_permitted=False, unknown_cost_acknowledged=True
+    ).authorized
+    assert not LiveConfig(
+        **base, processing_permitted=True, unknown_cost_acknowledged=False
+    ).authorized
+    assert not LiveConfig(
+        **{**base, "model": None},
+        processing_permitted=True,
+        unknown_cost_acknowledged=True,
+    ).authorized
+    assert not LiveConfig(
+        **{**base, "max_calls": None},
+        processing_permitted=True,
+        unknown_cost_acknowledged=True,
+    ).authorized
+    assert not LiveConfig(
+        **{**base, "provider": None, "route": None},
+        processing_permitted=True,
+        unknown_cost_acknowledged=True,
+    ).authorized
+    assert LiveConfig(
+        **base, processing_permitted=True, unknown_cost_acknowledged=True
+    ).authorized
+
+
+def test_live_missing_permission_makes_zero_transport_calls(tmp_path: Path) -> None:
+    creds = tmp_path / "creds.json"
+    _write_credentials(creds, "ollama", "unused", model="qwen3")
+    scenario_path = tmp_path / "set.json"
+    _write_scenario_set(
+        scenario_path,
+        [_minimal_scenario(steps=[{"action": "message", "text": "hello"}])],
+    )
+    output = tmp_path / "out.jsonl"
+    transport = _FakeLiveTransport()
+
+    rc = run_evaluation(
+        scenario_path,
+        output,
+        mode="live",
+        live_provider="ollama",
+        live_model="qwen3",
+        max_calls=5,
+        acknowledge_unknown_cost=True,
+        credentials_path=creds,
+        transport=transport,
+    )
+
+    assert rc == 1
+    assert transport.calls == 0
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    assert record["overall_status"] == "unrun"
+    assert "permission" in record["observed_output"].lower()
 
 
 def test_live_cost_only_authorization_is_rejected(tmp_path: Path) -> None:
@@ -907,6 +1059,8 @@ def test_live_malformed_provider_response_records_failure(tmp_path: Path) -> Non
         live_provider="ollama",
         live_model="qwen3",
         max_calls=5,
+        live_processing_permitted=True,
+        acknowledge_unknown_cost=True,
         credentials_path=creds,
         transport=transport,
     )
@@ -937,6 +1091,8 @@ def test_live_missing_usage_records_unavailable_cost(tmp_path: Path) -> None:
         live_provider="ollama",
         live_model="qwen3",
         max_calls=5,
+        live_processing_permitted=True,
+        acknowledge_unknown_cost=True,
         credentials_path=creds,
         transport=transport,
     )

@@ -85,6 +85,83 @@ def test_independent_applications_preserve_each_model_run(tmp_path: Path) -> Non
     assert len(first.inspect_model_runs()) == 2
 
 
+def test_budgeting_evidence_persists_with_the_model_run(tmp_path: Path) -> None:
+    from reckoning.provider_adapters import AdapterConfig
+
+    state_path = tmp_path / "continuity.json"
+    config = AdapterConfig(context_window=2000)
+    application = create_local_application(
+        state_path, provider_name="fake", provider_config=config
+    )
+
+    application.send_message("hello")
+
+    run = application.inspect_model_runs()[0]
+    assert run.history_selection is not None
+    assert run.history_selection.configured_context_window == 2000
+    assert run.history_selection.effective_context_window == 2000
+    assert run.history_selection.response_reserve == 500
+    assert run.history_selection.estimator_method == "utf-8-byte-count"
+
+    restarted = create_local_application(
+        state_path, provider_name="fake", provider_config=config
+    )
+    assert restarted.inspect_model_runs()[0].history_selection == (
+        run.history_selection
+    )
+
+
+def test_restart_retains_full_transcript_while_provider_receives_a_subset(
+    tmp_path: Path,
+) -> None:
+    from reckoning.interfaces import (
+        JsonFileInterfaceRepository,
+        create_local_interface_application,
+    )
+    from reckoning.provider_adapters import AdapterConfig
+
+    state_path = tmp_path / "continuity.json"
+    interface_path = tmp_path / "interfaces.json"
+    config = AdapterConfig(context_window=2000)
+
+    def build_interface() -> tuple[object, ReckoningApplication]:
+        application = create_local_application(
+            state_path, provider_name="fake", provider_config=config
+        )
+        return (
+            create_local_interface_application(application, interface_path),
+            application,
+        )
+
+    interface, _application = build_interface()
+    for index in range(6):
+        interface.send_channel_message(  # type: ignore[attr-defined]
+            "web", f"Message {index} " + "x" * 200
+        )
+
+    session = interface.selected_channel_session("web")  # type: ignore[attr-defined]
+    assert session is not None
+    assert len(session.messages) == 12
+
+    restarted, restarted_application = build_interface()
+    restarted_session = restarted.selected_channel_session("web")  # type: ignore[attr-defined]
+    assert restarted_session is not None
+    assert [message.content for message in restarted_session.messages] == [
+        message.content for message in session.messages
+    ]
+
+    runs = restarted_application.inspect_model_runs()
+    assert runs[-1].history_selection is not None
+    assert runs[-1].history_selection.omitted_turn_count > 0
+    assert (
+        len(runs[-1].history_selection.selected_messages) // 2
+        == runs[-1].history_selection.selected_turn_count
+    )
+
+    # A clean restore keeps the same complete transcript, not just the subset.
+    assert JsonFileInterfaceRepository(interface_path).list_sessions("web")[0].messages
+
+
 def test_processes_initialize_and_append_to_one_placement_database(
     tmp_path: Path,
 ) -> None:
@@ -174,6 +251,7 @@ def test_existing_receipts_migrate_once_without_losing_fields(tmp_path: Path) ->
             "failure": None,
             "output_policy_decision": None,
             "danger_decision": None,
+            "history_selection": None,
         },
         {
             "id": "run-failed",
@@ -191,6 +269,7 @@ def test_existing_receipts_migrate_once_without_losing_fields(tmp_path: Path) ->
             "failure": "Provider outcome and cost are uncertain.",
             "output_policy_decision": None,
             "danger_decision": None,
+            "history_selection": None,
         },
     ]
     assert (source / ROOT_DATABASE_FILENAME).is_file()

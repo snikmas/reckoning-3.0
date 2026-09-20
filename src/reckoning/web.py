@@ -187,6 +187,11 @@ class ReckoningWebApplication:
             str, dict[str, tuple[str, int, float]]
         ] = {}
 
+    @property
+    def application(self) -> ReckoningApplication:
+        """The wired application, exposed for public test and tooling seams."""
+        return self._application
+
     def __call__(
         self, environ: WSGIEnvironment, start_response: StartResponse
     ) -> Iterable[bytes]:
@@ -325,6 +330,15 @@ class ReckoningWebApplication:
             session_id = fields.get("session_id", [""])[0]
             expected_message_revision = fields.get("expected_revision", [""])[0]
             operation_id = fields.get("operation_id", [""])[0] or None
+            replayed = self._replay_completed_decision_operation(
+                message,
+                fields,
+                start_response,
+                csrf_token=csrf_token,
+                response_headers=response_headers,
+            )
+            if replayed is not None:
+                return replayed
             decision_reply = self._interpret_decision_reply(
                 message, fields, csrf_token
             )
@@ -374,17 +388,10 @@ class ReckoningWebApplication:
             fields = self._read_form(environ)
             name = fields.get("display_name", [""])[0].strip() or None
             try:
-                session = self._interfaces.create_channel_session(
+                self._interfaces.create_and_select_channel_session(
                     "web", display_name=name
                 )
-                selection = self._interfaces._repository.get_selected_session("web")
-                expected = selection.revision if selection is not None else 0
-                self._interfaces.select_channel_session(
-                    "web",
-                    session.session_id,
-                    expected_selection_revision=expected,
-                )
-            except (ValueError, RuntimeError) as error:
+            except (KeyError, ValueError, RuntimeError) as error:
                 return self._html_response(
                     start_response,
                     "400 Bad Request",
@@ -400,16 +407,16 @@ class ReckoningWebApplication:
         if method == "POST" and path == "/sessions/select":
             fields = self._read_form(environ)
             session_id = fields.get("session_id", [""])[0]
-            expected_selection_revision = int(
-                fields.get("selection_revision", ["0"])[0]
-            )
             try:
+                expected_selection_revision = int(
+                    fields.get("selection_revision", ["0"])[0]
+                )
                 self._interfaces.select_channel_session(
                     "web",
                     session_id,
                     expected_selection_revision=expected_selection_revision,
                 )
-            except (ValueError, RuntimeError) as error:
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
                 return self._html_response(
                     start_response,
                     "400 Bad Request",
@@ -513,6 +520,104 @@ class ReckoningWebApplication:
             return None
         return reckoning_id, version
 
+    def _replay_completed_decision_operation(
+        self,
+        message: str,
+        fields: dict[str, list[str]],
+        start_response: StartResponse,
+        *,
+        csrf_token: str,
+        response_headers: tuple[tuple[str, str], ...],
+    ) -> list[bytes] | None:
+        """Resolve a completed conversational mutation before anything else.
+
+        A retry must not depend on the proposal still being open, on a
+        process-local presentation receipt, or on the in-memory interpreter.
+        The durable operation binds the kind, target, displayed revision,
+        correction payload, and original submission, so a restart cannot turn a
+        replay into a fresh model request or a second domain mutation.
+        """
+        operation_id = fields.get("operation_id", [""])[0]
+        if not operation_id:
+            return None
+        inspect_operation = getattr(self._application, "inspect_operation", None)
+        if not callable(inspect_operation):
+            return None
+        record = inspect_operation(operation_id)
+        if record is None or record.status != "completed":
+            return None
+        if record.kind not in ("confirm", "correct"):
+            return None
+        if record.displayed_revision is None:
+            return None
+        if record.submission.strip() != message.strip():
+            return self._decision_replay_conflict(
+                operation_id,
+                start_response,
+                csrf_token=csrf_token,
+                response_headers=response_headers,
+            )
+        token = fields.get("decision_presentation_token", [""])[0]
+        if token:
+            receipt = self._presentation_receipt(csrf_token, token)
+            if receipt is not None and receipt != (
+                record.target_id,
+                record.displayed_revision,
+            ):
+                return self._decision_replay_conflict(
+                    operation_id,
+                    start_response,
+                    csrf_token=csrf_token,
+                    response_headers=response_headers,
+                )
+        decision = self._safe_decision(record.target_id)
+        if decision is None:
+            return self._decision_replay_conflict(
+                operation_id,
+                start_response,
+                csrf_token=csrf_token,
+                response_headers=response_headers,
+            )
+        target = DecisionTarget(
+            reckoning_id=record.target_id,
+            version=record.displayed_revision,
+            conflict=decision.draft.conflict,
+            record_ids=tuple(
+                record_version.record_id
+                for record_version in decision.current_records
+            ),
+        )
+        if record.kind == "confirm":
+            reply: DecisionReply = ConfirmDecision(target)
+        else:
+            reply = CorrectDecision(target, record.record_id, record.correction)
+        return self._apply_decision_reply(
+            reply,
+            message,
+            start_response,
+            csrf_token=csrf_token,
+            response_headers=response_headers,
+            operation_id=operation_id,
+        )
+
+    def _decision_replay_conflict(
+        self,
+        operation_id: str,
+        start_response: StartResponse,
+        *,
+        csrf_token: str,
+        response_headers: tuple[tuple[str, str], ...],
+    ) -> list[bytes]:
+        error = ReckoningOperationConflict(operation_id)
+        return self._html_response(
+            start_response,
+            "409 Conflict",
+            self._render_interface_area(
+                "simon", error=str(error), csrf_token=csrf_token
+            ),
+            extra_headers=response_headers,
+        )
+
     def _interpret_decision_reply(
         self, message: str, fields: dict[str, list[str]], csrf_token: str
     ) -> DecisionReply | None:
@@ -612,10 +717,14 @@ class ReckoningWebApplication:
                 start_response,
                 "400 Bad Request",
                 self._render_interface_area(
-                    "decision",
-                    error="Operation identity is required for confirmation or correction.",
+                    "simon",
+                    error=(
+                        "Operation identity is required for confirmation or "
+                        "correction. Open the decision, review the current "
+                        "proposal, and use its control. Your message is kept."
+                    ),
                     csrf_token=csrf_token,
-                    decision=self._safe_decision(reply.target.reckoning_id),
+                    pending_text=message,
                 ),
                 extra_headers=response_headers,
             )
@@ -626,6 +735,7 @@ class ReckoningWebApplication:
                     target.reckoning_id,
                     expected_revision=target.version,
                     operation_id=operation_id,
+                    submission=message,
                 )
                 note = (
                     f'Confirmed "{target.conflict}" exactly as shown '
@@ -638,6 +748,7 @@ class ReckoningWebApplication:
                     reply.meaning,
                     expected_revision=target.version,
                     operation_id=operation_id,
+                    submission=message,
                 )
                 note = (
                     "Corrected the proposal. Revision "
@@ -1556,15 +1667,10 @@ class ReckoningWebApplication:
         selected = self._interfaces.selected_channel_session("web")
         if selected is not None:
             return selected
-        session = self._interfaces.create_channel_session(
+        session, _selection = self._interfaces.create_and_select_channel_session(
             "web",
             display_name="First conversation",
             origin="first-use",
-        )
-        self._interfaces.select_channel_session(
-            "web",
-            session.session_id,
-            expected_selection_revision=0,
         )
         return session
 
@@ -1591,7 +1697,7 @@ class ReckoningWebApplication:
     ) -> str:
         assert self._interfaces is not None
         displayed = self._displayed_web_session(session_id)
-        selection = self._interfaces._repository.get_selected_session("web")
+        selection = self._interfaces.selected_channel_selection("web")
         selection_revision = selection.revision if selection is not None else 0
         revision = self._interfaces.session_revision("web", displayed.session_id)
         messages = self._interfaces.channel_session(
@@ -1600,6 +1706,21 @@ class ReckoningWebApplication:
         notices = self._interfaces.channel_notices(
             "web", session_id=displayed.session_id
         )
+        if not pending_text:
+            failed_turn = next(
+                (
+                    turn
+                    for turn in reversed(
+                        self._interfaces.channel_turns(
+                            "web", session_id=displayed.session_id
+                        )
+                    )
+                    if turn.state == "failed"
+                ),
+                None,
+            )
+            if failed_turn is not None:
+                pending_text = failed_turn.user_speech
         conversation = "".join(
             '<article class="message">'
             f'<strong>{"You" if message.role == "user" else "Simon"}</strong>'

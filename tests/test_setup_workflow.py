@@ -1281,6 +1281,68 @@ def test_migration_previews_backs_up_and_commits_atomically(tmp_path: Path) -> N
     assert migrated["providers"]["deepseek"]["secret"] == "sk-old"
 
 
+def test_migration_merges_the_new_grant_without_dropping_history(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime
+
+    data_dir = tmp_path / "data"
+    setup_instance(data_dir, "local")
+    ProviderCredentialStore().save(tmp_path / "provider.json")
+    (tmp_path / "provider.json").write_text(
+        json.dumps(
+            {"default_provider": "deepseek", "providers": {"deepseek": "sk-old"}}
+        ),
+        encoding="utf-8",
+    )
+    runtime = load_installation_runtime(data_dir)
+    grant_path = runtime.state_path(
+        "confirmed-state", "processing-grants.json"
+    )
+    grant_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "grants": [
+                    {
+                        "destination_id": "narrowed@https://narrowed.example",
+                        "version": 4,
+                        "allowed_categories": ["current-request"],
+                        "changed_at": datetime.now(UTC).isoformat(),
+                    },
+                    {
+                        "destination_id": "revoked@https://revoked.example",
+                        "version": 2,
+                        "allowed_categories": [],
+                        "changed_at": datetime.now(UTC).isoformat(),
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    repository = JsonFileProcessingGrantRepository(grant_path)
+
+    outcome, _ui = run_workflow(
+        tmp_path,
+        [
+            ("migrate", "migrate"),
+            ("migrate-confirm", "y"),
+            ("status-action", "exit"),
+        ],
+    )
+
+    assert outcome.status == "managed"
+    grants = {grant.destination_id: grant for grant in repository.list_all()}
+    assert grants["narrowed@https://narrowed.example"].version == 4
+    assert grants["narrowed@https://narrowed.example"].allowed_categories == (
+        "current-request",
+    )
+    assert grants["revoked@https://revoked.example"].version == 2
+    assert grants["revoked@https://revoked.example"].allowed_categories == ()
+    assert len(grants) == 3
+
+
 def test_non_interactive_setup_matches_the_interactive_result(
     tmp_path: Path,
 ) -> None:

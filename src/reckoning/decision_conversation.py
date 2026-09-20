@@ -3,10 +3,20 @@
 Consent never comes from model confidence: a decision is confirmed or
 corrected only when the user's message unambiguously says so, and always
 against the proposal actually displayed (its current revision).
+
+Intent is parsed structurally rather than by scanning for marker substrings:
+
+* Confirmation is the whole message, after case and trailing punctuation
+  normalization, matching one documented phrase.
+* Correction requires an imperative correction verb as the leading word
+  (optionally after a leading interjection such as "no" or "actually"). A
+  negated, conditional, quoted, or reported verb therefore never starts the
+  message, so it never mutates.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -73,15 +83,92 @@ _ASSENT_PHRASES = frozenset(
     }
 )
 
-_CORRECTION_MARKERS = ("correct", "change", "actually")
+# An imperative correction verb must lead the directive. Anything that puts a
+# word before it (a subject, negation, modal, or reporting clause) is not a
+# direct instruction and never mutates.
+_CORRECTION_VERBS = frozenset(
+    {"correct", "change", "update", "revise", "fix", "adjust", "edit"}
+)
+
+# A leading interjection can introduce a correction but cannot carry one on
+# its own; on its own it asks for the explicit review control.
+_LEADING_INTERJECTIONS = ("no", "actually", "wait", "hmm", "well")
+
+_CONFIRMATION_ROOTS = ("confirm", "подтвержд", "确认")
+
+_INTERJECTION_PREFIX = re.compile(
+    r"^(?:(?:no|actually|wait|hmm|well)\b[\s,;:]*)+", re.IGNORECASE
+)
+_TO_MEANING = re.compile(
+    r"^(?:correct|change|update|revise|fix|adjust|edit)\b.*?\bto\s+(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _normalize_confirmation(text: str) -> str:
     """Strip surrounding whitespace, casefold, and trailing sentence punctuation."""
     normalized = text.strip().casefold()
-    while normalized and normalized[-1] in ".!?":
-        normalized = normalized[:-1]
+    normalized = normalized.rstrip(".!?\u3002\uff01\uff1f")
     return normalized.strip()
+
+
+def _is_question(message: str) -> bool:
+    return message.rstrip().endswith(("?", "\uff1f"))
+
+
+def _references_confirmation(normalized: str) -> bool:
+    return any(root in normalized for root in _CONFIRMATION_ROOTS)
+
+
+def _strip_leading_interjections(message: str) -> tuple[str, bool]:
+    """Return (directive, had_interjection) after removing leading interjections."""
+    stripped = message
+    had_interjection = False
+    while True:
+        match = _INTERJECTION_PREFIX.match(stripped)
+        if match is None:
+            break
+        had_interjection = True
+        stripped = stripped[match.end() :]
+    return stripped.strip(), had_interjection
+
+
+def _leading_verb(directive: str) -> str:
+    if not directive:
+        return ""
+    first_word = directive.split(maxsplit=1)[0]
+    return first_word.rstrip(",;:").casefold()
+
+
+def _extract_meaning(directive: str) -> str | None:
+    for separator in (":", "\u2014", "\u2013"):
+        if separator in directive:
+            _, _, tail = directive.partition(separator)
+            if tail.strip():
+                return tail.strip()
+    match = _TO_MEANING.match(directive)
+    if match is not None and match.group(1).strip():
+        return match.group(1).strip()
+    return None
+
+
+def _correction_reply(
+    message: str, target: DecisionTarget
+) -> DecisionReply | None:
+    directive, had_interjection = _strip_leading_interjections(message)
+    if _leading_verb(directive) in _CORRECTION_VERBS:
+        meaning = _extract_meaning(directive)
+        if meaning is None:
+            return ClarifyDecision(_clarification(target))
+        if len(target.record_ids) != 1:
+            return ClarifyDecision(
+                "Which part of the proposal should I correct? "
+                "Open the decision and edit the exact record."
+            )
+        return CorrectDecision(target, target.record_ids[0], meaning)
+    if had_interjection:
+        return ClarifyDecision(_clarification(target))
+    return None
 
 
 def interpret_decision_message(
@@ -92,54 +179,22 @@ def interpret_decision_message(
         return NotDecisionRelated()
 
     # Questions are never mutations.
-    if message.rstrip().endswith("?"):
+    if _is_question(message):
         return NotDecisionRelated()
 
+    correction = _correction_reply(message, target)
+    if correction is not None:
+        return correction
+
     normalized = _normalize_confirmation(message)
-    has_correction = (
-        normalized.split()[0].rstrip(",.").startswith("no")
-        if normalized
-        else False
-    ) or any(marker in normalized for marker in _CORRECTION_MARKERS)
-
-    if has_correction:
-        meaning = _extract_correction(message)
-        if meaning is None:
-            return ClarifyDecision(_clarification(target))
-        if len(target.record_ids) != 1:
-            return ClarifyDecision(
-                "Which part of the proposal should I correct? "
-                "Open the decision and edit the exact record."
-            )
-        return CorrectDecision(target, target.record_ids[0], meaning)
-
-    confirmed = normalized in _CONFIRM_PHRASES
-    if confirmed:
+    if normalized in _CONFIRM_PHRASES:
         return ConfirmDecision(target)
 
     # Any remaining mention of confirmation, or bare assent, asks for the
     # explicit documented phrase instead of mutating.
-    if "confirm" in normalized or normalized in _ASSENT_PHRASES:
+    if _references_confirmation(normalized) or normalized in _ASSENT_PHRASES:
         return ClarifyDecision(_clarification(target))
     return NotDecisionRelated()
-
-
-def _extract_correction(message: str) -> str | None:
-    for separator in (":", "—", "–"):
-        if separator in message:
-            head, _, tail = message.partition(separator)
-            head_normalized = head.casefold()
-            if (
-                head_normalized.split()[0].rstrip(",.").startswith("no")
-                or any(marker in head_normalized for marker in _CORRECTION_MARKERS)
-            ) and tail.strip():
-                return tail.strip()
-    for prefix in ("correct it to ", "correct that to ", "change it to "):
-        if message.casefold().startswith(prefix):
-            tail = message[len(prefix):].strip()
-            if tail:
-                return tail
-    return None
 
 
 def _clarification(target: DecisionTarget) -> str:

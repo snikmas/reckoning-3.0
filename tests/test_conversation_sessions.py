@@ -74,6 +74,61 @@ def test_start_first_session_is_idempotent(tmp_path: Path) -> None:
     assert repository.list_sessions("web") == (first,)
 
 
+def test_create_and_select_is_atomic_and_selects_the_new_session(
+    tmp_path: Path,
+) -> None:
+    repository = JsonFileInterfaceRepository(tmp_path / "interfaces.json")
+
+    session, selection = repository.create_and_select_session(
+        "web", "Planning", "user-created", datetime.now(timezone.utc)
+    )
+
+    assert selection.selected_session_id == session.session_id
+    assert selection.revision == 1
+    current = repository.get_selected_session("web")
+    assert current is not None
+    assert current.selected_session_id == session.session_id
+
+
+def test_create_and_select_rolls_back_a_stale_selection_race(
+    tmp_path: Path,
+) -> None:
+    repository = JsonFileInterfaceRepository(tmp_path / "interfaces.json")
+    repository.create_and_select_session(
+        "web", "One", "user-created", datetime.now(timezone.utc)
+    )
+
+    with pytest.raises(InterfaceSessionConflict):
+        repository.create_and_select_session(
+            "web",
+            "Two",
+            "user-created",
+            datetime.now(timezone.utc),
+            expected_selection_revision=0,
+        )
+
+    sessions = repository.list_sessions("web")
+    assert [session.display_name for session in sessions] == ["One"]
+
+
+def test_create_and_select_advances_the_selection_revision(tmp_path: Path) -> None:
+    repository = JsonFileInterfaceRepository(tmp_path / "interfaces.json")
+    repository.create_and_select_session(
+        "web", "One", "user-created", datetime.now(timezone.utc)
+    )
+
+    session, selection = repository.create_and_select_session(
+        "web",
+        "Two",
+        "user-created",
+        datetime.now(timezone.utc),
+        expected_selection_revision=1,
+    )
+
+    assert selection.revision == 2
+    assert selection.selected_session_id == session.session_id
+
+
 def test_concurrent_append_to_same_session_conflicts(tmp_path: Path) -> None:
     repository = JsonFileInterfaceRepository(tmp_path / "interfaces.json")
     session = repository.create_session("web", None, "user-created", datetime.now(timezone.utc))

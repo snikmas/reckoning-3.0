@@ -250,6 +250,23 @@ def _run_evaluate(rest: Sequence[str]) -> int:
         ),
     )
     parser.add_argument(
+        "--allow-processing",
+        action="store_true",
+        help=(
+            "Explicitly permit sending the fixture's context to the selected "
+            "provider. Required for live mode; provider selection alone never "
+            "grants permission."
+        ),
+    )
+    parser.add_argument(
+        "--acknowledge-unknown-cost",
+        action="store_true",
+        help=(
+            "Acknowledge that a call-limited live run without --max-cost does "
+            "not enforce a monetary ceiling."
+        ),
+    )
+    parser.add_argument(
         "--profile",
         default="full-stage-2",
         help="Scenario profile to run (full-stage-2 or early-web).",
@@ -267,6 +284,8 @@ def _run_evaluate(rest: Sequence[str]) -> int:
             live_route=arguments.route,
             max_calls=arguments.max_calls,
             max_cost=arguments.max_cost,
+            live_processing_permitted=arguments.allow_processing,
+            acknowledge_unknown_cost=arguments.acknowledge_unknown_cost,
         )
     except ValueError as error:
         print(f"evaluate failed: {error}", file=sys.stderr)

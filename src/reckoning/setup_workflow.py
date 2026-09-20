@@ -2689,14 +2689,14 @@ def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
     )
     grant_payload: bytes | None = None
     if destination.kind == "cloud":
-        existing_grant = JsonFileProcessingGrantRepository(
-            grant_path
-        ).get(destination.id)
+        repository = JsonFileProcessingGrantRepository(grant_path)
+        existing_grant = repository.get(destination.id)
         if existing_grant is None:
             grant_payload = _json_bytes(
                 full_category_grant_payload(
                     destination,
                     changed_at=datetime.now(UTC),
+                    existing=repository.list_all(),
                 )
             )
 

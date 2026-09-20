@@ -317,6 +317,44 @@ def test_clean_encrypted_restore_preserves_interface_state(tmp_path: Path) -> No
     assert reopened.sessions[0].messages[0].content == "Before backup"
 
 
+def test_clean_encrypted_restore_preserves_multiple_sessions_and_selection(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    restored = tmp_path / "restored"
+    archive = tmp_path / "state.reckoning"
+    setup_instance(source, "local")
+    repository = JsonFileInterfaceRepository(
+        source / "confirmed-state" / "interfaces.json"
+    )
+    _first, _first_selection = repository.create_and_select_session(
+        "web", "One", "user-created", NOW
+    )
+    second, _second_selection = repository.create_and_select_session(
+        "web", "Two", "user-created", NOW
+    )
+    repository.append_completed_turn(
+        "web",
+        second.session_id,
+        "Second question",
+        "Second reply",
+        expected_revision=repository.session_revision("web", second.session_id),
+    )
+
+    create_transfer(source, archive, PASSPHRASE, kind="backup")
+    restore_transfer(archive, restored, PASSPHRASE)
+
+    reopened = JsonFileInterfaceRepository(
+        restored / "confirmed-state" / "interfaces.json"
+    )
+    sessions = {session.display_name: session for session in reopened.list_sessions("web")}
+    assert set(sessions) == {"One", "Two"}
+    assert sessions["Two"].messages[0].content == "Second question"
+    selection = reopened.get_selected_session("web")
+    assert selection is not None
+    assert selection.selected_session_id == second.session_id
+
+
 def test_clean_encrypted_restore_preserves_personal_server_placement(
     tmp_path: Path,
 ) -> None:

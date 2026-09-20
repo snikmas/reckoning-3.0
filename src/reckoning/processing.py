@@ -99,6 +99,10 @@ class JsonFileProcessingGrantRepository:
             None,
         )
 
+    def list_all(self) -> tuple[ProcessingGrant, ...]:
+        """Return every stored grant, including historical destinations."""
+        return _load_grants(self._path)
+
     def save(self, grant: ProcessingGrant, *, expected_version: int) -> None:
         with _grant_write_lock(self._path):
             grants = _load_grants(self._path)
@@ -245,15 +249,27 @@ def full_category_grant_payload(
     destination: ProcessingDestination,
     *,
     changed_at: datetime,
+    existing: tuple[ProcessingGrant, ...] = (),
 ) -> dict[str, object]:
-    """The file payload for a version-1 full-category grant to this destination."""
+    """The file payload adding a version-1 full-category grant to a destination.
+
+    Existing grants for other destinations are merged in unchanged, so a
+    migration never replaces the file with a single-grant payload and never
+    drops narrowed, revoked, or historical entries.
+    """
     grant = ProcessingGrant(
         destination_id=destination.id,
         version=1,
         allowed_categories=PROCESSING_CATEGORIES,
         changed_at=changed_at,
     )
-    return {"schema_version": 1, "grants": [_grant_to_data(grant)]}
+    preserved = tuple(
+        item for item in existing if item.destination_id != destination.id
+    )
+    return {
+        "schema_version": 1,
+        "grants": [_grant_to_data(item) for item in (*preserved, grant)],
+    }
 
 
 def ensure_initial_processing_grant(

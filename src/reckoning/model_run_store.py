@@ -9,6 +9,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from reckoning.conversation import (
+    HistorySelection,
+    ProviderMessage,
+    ProviderMessageRole,
+)
 from reckoning.conversation_safety import (
     COVERAGE_VERSION,
     DangerDecision,
@@ -30,7 +35,7 @@ if TYPE_CHECKING:
     from reckoning.application import ModelRunRecord, ModelRunUsageStatus
 
 
-MODEL_RUN_SCHEMA_VERSION = "2"
+MODEL_RUN_SCHEMA_VERSION = "3"
 
 
 def _load_output_policy_decision(
@@ -112,8 +117,9 @@ class SQLiteModelRunRepository:
                     output_policy_delivered_speech,
                     danger_kind,
                     danger_response_kind,
-                    danger_reason_code
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    danger_reason_code,
+                    budgeting_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.id,
@@ -135,6 +141,7 @@ class SQLiteModelRunRepository:
                     danger.kind if danger is not None else None,
                     danger.response_kind if danger is not None else None,
                     danger.reason_code if danger is not None else None,
+                    _budgeting_to_json(run.history_selection),
                 ),
             )
 
@@ -163,7 +170,8 @@ class SQLiteModelRunRepository:
                     output_policy_delivered_speech,
                     danger_kind,
                     danger_response_kind,
-                    danger_reason_code
+                    danger_reason_code,
+                    budgeting_json
                 FROM model_runs
                 ORDER BY sequence
                 """
@@ -189,6 +197,7 @@ class SQLiteModelRunRepository:
                 danger_decision=_load_danger_decision(
                     row[16], row[17], row[18]
                 ),
+                history_selection=_budgeting_from_json(row[19]),
             )
             for row in rows
         )
@@ -230,6 +239,9 @@ class SQLiteModelRunRepository:
                     raise RuntimeError("Unsupported model-run storage schema.")
                 if current_version == "1":
                     _migrate_v1_to_v2(connection)
+                    current_version = "2"
+                if current_version == "2":
+                    _migrate_v2_to_v3(connection)
                 if current_version is None:
                     existing = int(
                         connection.execute(
@@ -344,6 +356,13 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
         connection.execute(
             f"ALTER TABLE model_runs ADD COLUMN {column} TEXT"
         )
+    set_metadata(connection, "model_runs_schema_version", "2")
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "ALTER TABLE model_runs ADD COLUMN budgeting_json TEXT"
+    )
     set_metadata(connection, "model_runs_schema_version", MODEL_RUN_SCHEMA_VERSION)
 
 
@@ -373,7 +392,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             output_policy_delivered_speech TEXT,
             danger_kind TEXT,
             danger_response_kind TEXT,
-            danger_reason_code TEXT
+            danger_reason_code TEXT,
+            budgeting_json TEXT
         )
         """
     )
@@ -536,8 +556,8 @@ def _insert_run(connection: sqlite3.Connection, run: ModelRunRecord) -> None:
             id, requested_at, status, provider, model, model_calls, latency_ms,
             retries, input_tokens, output_tokens, billable_units, usage_status, failure,
             output_policy_action, output_policy_reason_code, output_policy_delivered_speech,
-            danger_kind, danger_response_kind, danger_reason_code
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            danger_kind, danger_response_kind, danger_reason_code, budgeting_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run.id,
@@ -559,7 +579,60 @@ def _insert_run(connection: sqlite3.Connection, run: ModelRunRecord) -> None:
             danger.kind if danger is not None else None,
             danger.response_kind if danger is not None else None,
             danger.reason_code if danger is not None else None,
+            _budgeting_to_json(run.history_selection),
         ),
+    )
+
+
+def _budgeting_to_json(selection: HistorySelection | None) -> str | None:
+    if selection is None:
+        return None
+    return json.dumps(
+        {
+            "selected_messages": [
+                {"role": message.role, "content": message.content}
+                for message in selection.selected_messages
+            ],
+            "omitted_turn_count": selection.omitted_turn_count,
+            "estimated_input_tokens": selection.estimated_input_tokens,
+            "estimator_method": selection.estimator_method,
+            "configured_context_window": selection.configured_context_window,
+            "effective_context_window": selection.effective_context_window,
+            "response_reserve": selection.response_reserve,
+            "required_input_tokens": selection.required_input_tokens,
+            "selected_turn_count": selection.selected_turn_count,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _budgeting_from_json(data: object) -> HistorySelection | None:
+    if data is None:
+        return None
+    parsed = json.loads(str(data))
+    if not isinstance(parsed, dict):
+        return None
+    return HistorySelection(
+        selected_messages=tuple(
+            ProviderMessage(
+                cast(ProviderMessageRole, str(item["role"])),
+                str(item["content"]),
+            )
+            for item in parsed.get("selected_messages", [])
+        ),
+        omitted_turn_count=int(parsed.get("omitted_turn_count", 0)),
+        estimated_input_tokens=int(parsed.get("estimated_input_tokens", 0)),
+        estimator_method=str(parsed.get("estimator_method", "")),
+        configured_context_window=(
+            int(parsed["configured_context_window"])
+            if parsed.get("configured_context_window") is not None
+            else None
+        ),
+        effective_context_window=int(parsed.get("effective_context_window", 0)),
+        response_reserve=int(parsed.get("response_reserve", 0)),
+        required_input_tokens=int(parsed.get("required_input_tokens", 0)),
+        selected_turn_count=int(parsed.get("selected_turn_count", 0)),
     )
 
 

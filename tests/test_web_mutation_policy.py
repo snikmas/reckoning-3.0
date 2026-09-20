@@ -13,6 +13,7 @@ from reckoning.interfaces import (
     ChannelRequest,
     ChannelResponse,
     InMemoryInterfaceRepository,
+    JsonFileInterfaceRepository,
     PlacementPolicy,
     ReckoningInterfaceApplication,
 )
@@ -364,6 +365,66 @@ def test_configured_local_and_private_origins_can_submit_with_a_session_token(
     assert len(responder.requests) == 1
 
 
+def test_malformed_session_selection_is_rejected_without_moving_the_selection() -> None:
+    web, interface, _, _ = build_web()
+    browser = BrowserSession(web)
+    browser.get("/simon")
+
+    status, _, page = browser.post(
+        "/sessions/select",
+        {"session_id": "missing", "selection_revision": "not-a-number"},
+    )
+
+    assert status == "400 Bad Request"
+    assert b"invalid literal" in page
+
+
+def test_repeated_new_conversations_advance_the_web_selection() -> None:
+    web, interface, _, _ = build_web()
+    browser = BrowserSession(web)
+    browser.get("/simon")
+
+    first_status, _, _ = browser.post("/sessions/new", {"display_name": "One"})
+    second_status, _, _ = browser.post("/sessions/new", {"display_name": "Two"})
+
+    assert first_status == "303 See Other"
+    assert second_status == "303 See Other"
+    sessions = {session.display_name: session for session in interface.list_channel_sessions("web")}
+    assert {"One", "Two"}.issubset(set(sessions))
+    selection = interface.selected_channel_selection("web")
+    assert selection is not None
+    assert selection.selected_session_id == sessions["Two"].session_id
+
+
+def test_empty_installation_renders_a_single_first_conversation() -> None:
+    web, interface, _, _ = build_web()
+    browser = BrowserSession(web)
+
+    status, _, page = browser.get("/simon")
+
+    assert status == "200 OK"
+    assert b"First conversation" in page
+    assert b"Send Simon the first message." in page
+    assert b"New conversation" in page
+    assert b"Other conversations" not in page
+
+
+def test_multi_session_installation_offers_resume_controls() -> None:
+    web, interface, _, _ = build_web()
+    browser = BrowserSession(web)
+    browser.get("/simon")
+    browser.post("/sessions/new", {"display_name": "One"})
+    browser.post("/sessions/new", {"display_name": "Two"})
+
+    status, _, page = browser.get("/simon")
+
+    assert status == "200 OK"
+    assert b"Other conversations" in page
+    assert b"Resume One" in page
+    assert b"Resume Two" not in page
+    assert b"New conversation" in page
+
+
 @pytest.mark.parametrize(
     ("path", "form", "expected_action"),
     (
@@ -453,6 +514,42 @@ def test_successful_submission_redirects_to_the_visible_saved_simon_reply() -> N
     assert final_status == "200 OK"
     assert b"Show me the answer" in final_page
     assert b"Persisted Simon reply" in final_page
+
+
+def test_failed_input_is_restored_to_the_composer_after_restart(tmp_path) -> None:
+    path = tmp_path / "interfaces.json"
+    placement = PlacementPolicy(
+        profile="local",
+        categories=(),
+        local_node_available=True,
+        server_node_available=False,
+    )
+
+    def build(response: str) -> ReckoningWebApplication:
+        interface = ReckoningInterfaceApplication(
+            repository=JsonFileInterfaceRepository(path),
+            responder=RecordingResponder(response),
+            placement=placement,
+        )
+        return ReckoningWebApplication(
+            RecordingCore(),  # type: ignore[arg-type]
+            interface_application=interface,
+            allowed_origins=("http://127.0.0.1:8000",),
+        )
+
+    browser = BrowserSession(build("raise"))
+    browser.get("/simon")
+    status, _, page = browser.post(
+        "/messages", {"message": "Exact failed input"}
+    )
+    assert status == "400 Bad Request"
+    assert b"Exact failed input" in page
+
+    # A restart must still surface the persisted failed turn's exact input.
+    browser.web = build("Persisted Simon reply")
+    status, _, page = browser.get("/simon")
+    assert status == "200 OK"
+    assert b"Exact failed input" in page
 
 
 def test_submission_failure_stays_in_simon_and_never_shows_a_success_reply() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -36,6 +37,11 @@ class HistorySelection:
     omitted_turn_count: int
     estimated_input_tokens: int
     estimator_method: str
+    configured_context_window: int | None = None
+    effective_context_window: int = 0
+    response_reserve: int = 0
+    required_input_tokens: int = 0
+    selected_turn_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -128,6 +134,18 @@ class ComposerInput:
 
 _LIMITED_PREFIX = "Limited context:"
 
+# Only exact, application-generated legacy notices are migrated. Unknown prose
+# that merely begins with the prefix stays speech, because the migration cannot
+# prove it was ever an operational notice.
+_KNOWN_LEGACY_NOTICES = (
+    re.compile(r"Limited context: no user profile is available\."),
+    re.compile(r"Limited context: unavailable processing categories: [^.]+\."),
+    re.compile(
+        r"Limited context: \d+ earlier turns? (?:was|were) omitted to fit "
+        r"the model context window\."
+    ),
+)
+
 
 def context_budget(
     context_window: int | None, response_reserve: int = RESPONSE_RESERVE
@@ -171,14 +189,20 @@ def select_history_for_budget(
     history: tuple[ProviderMessage, ...],
     mandatory_messages: tuple[ProviderMessage, ...],
 ) -> HistorySelection:
+    """Select a contiguous suffix of complete recent turns within budget.
+
+    Once the newest candidate turn does not fit, selection stops. It never
+    skips an oversized turn to include older ones, and it never includes half a
+    turn, so the provider history stays a chronological, gap-free suffix.
+    """
     mandatory_tokens = sum(_estimate_message_tokens(message) for message in mandatory_messages)
     if mandatory_tokens > budget.request_allowance:
         raise RuntimeError("Required conversation material exceeds the model context budget.")
     allowance = budget.request_allowance - mandatory_tokens
     turns = _complete_turns(history)
     selected: list[ProviderMessage] = []
-    omitted_turn_count = 0
     estimated_input_tokens = 0
+    selected_turn_count = 0
     for user_message, assistant_message in reversed(turns):
         turn_tokens = _estimate_message_tokens(user_message) + _estimate_message_tokens(
             assistant_message
@@ -186,14 +210,20 @@ def select_history_for_budget(
         if estimated_input_tokens + turn_tokens <= allowance:
             selected.extend((assistant_message, user_message))
             estimated_input_tokens += turn_tokens
-        else:
-            omitted_turn_count += 1
+            selected_turn_count += 1
+            continue
+        break
     selected.reverse()
     return HistorySelection(
         selected_messages=tuple(selected),
-        omitted_turn_count=omitted_turn_count,
+        omitted_turn_count=len(turns) - selected_turn_count,
         estimated_input_tokens=estimated_input_tokens,
         estimator_method=budget.estimator_method,
+        configured_context_window=budget.context_window,
+        effective_context_window=budget.request_allowance + budget.response_reserve,
+        response_reserve=budget.response_reserve,
+        required_input_tokens=mandatory_tokens,
+        selected_turn_count=selected_turn_count,
     )
 
 
@@ -245,12 +275,14 @@ def compose_provider_conversation(
 
 
 def split_legacy_notice_prefix(text: str) -> tuple[str, tuple[str, ...]]:
-    if not text.startswith(_LIMITED_PREFIX):
-        return text, ()
-    remainder = text[len(_LIMITED_PREFIX) :].lstrip()
-    if not remainder:
-        return "", ()
-    first_sentence, _, rest = remainder.partition(". ")
-    notice = f"{_LIMITED_PREFIX} {first_sentence}.".strip()
-    speech = rest
-    return speech, (notice,)
+    """Split one exact known application-generated legacy notice from speech.
+
+    Anything that begins with the prefix but is not a known generated notice is
+    left untouched, so unknown historical assistant prose remains speech.
+    """
+    for pattern in _KNOWN_LEGACY_NOTICES:
+        match = pattern.match(text)
+        if match is not None:
+            notice = match.group(0)
+            return text[match.end() :].lstrip(), (notice,)
+    return text, ()

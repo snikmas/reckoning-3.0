@@ -100,7 +100,11 @@ def test_orcarouter_uses_same_boundary_and_records_billable_units() -> None:
 
     assert response.speech == "Choose the smaller proof."
     assert seen_authorization == "Bearer secret-value"
-    assert application.inspect_model_runs()[0].__dict__ == {
+    run = application.inspect_model_runs()[0]
+    run_fields = dict(run.__dict__)
+    history_selection = run_fields.pop("history_selection")
+    assert history_selection.effective_context_window == 4096
+    assert run_fields == {
         "id": "run-1",
         "requested_at": datetime(2026, 8, 30, 16, 0, tzinfo=timezone.utc),
         "status": "succeeded",

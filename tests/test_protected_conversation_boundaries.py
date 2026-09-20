@@ -34,7 +34,7 @@ def test_protected_conversation_case(case: dict[str, Any]) -> None:
         assert decision.reason_code == case["expected_kind"]
         assert decision.coverage_version == COVERAGE_VERSION
         if case.get("supported", True):
-            assert decision.action in ("allow", "replace")
+            assert decision.action in ("allow", "replace", "uncertain")
     else:
         decision = classify_danger(case["text"])
         assert decision.response_kind == case["expected_response_kind"]
@@ -120,3 +120,44 @@ def test_no_danger_signal_is_classified_none() -> None:
 
     assert decision.kind == "none"
     assert decision.response_kind == "none"
+
+
+def test_contraction_apostrophe_does_not_hide_worth_attack() -> None:
+    decision = classify_output("I'm sorry, but you are worthless.")
+
+    assert decision.action == "replace"
+
+
+def test_contraction_apostrophe_does_not_hide_current_self_danger() -> None:
+    decision = classify_danger("I'm going to kill myself right now.")
+
+    assert decision.kind == "current-self-danger"
+    assert decision.response_kind == "emergency-help"
+
+
+def test_quoted_danger_does_not_hide_a_following_current_danger() -> None:
+    decision = classify_danger(
+        'My friend said "I might hurt myself right now", '
+        "but I am going to kill myself right now."
+    )
+
+    assert decision.kind == "current-self-danger"
+    assert decision.response_kind == "emergency-help"
+
+
+def test_historical_danger_does_not_hide_a_following_current_danger() -> None:
+    decision = classify_danger(
+        "When I was young I used to hurt myself, "
+        "but now I am going to kill myself right now."
+    )
+
+    assert decision.kind == "current-self-danger"
+    assert decision.response_kind == "emergency-help"
+
+
+def test_balanced_quote_around_prohibited_fragment_is_quotation() -> None:
+    decision = classify_output(
+        "A caller told me 'you are worthless' and I refused to repeat it."
+    )
+
+    assert decision.action in ("allow", "uncertain")

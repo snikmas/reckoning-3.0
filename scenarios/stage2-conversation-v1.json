@@ -839,6 +839,106 @@
         "product",
         "early-web"
       ]
+    },
+    {
+      "id": "about-me-correction-exclusion",
+      "language": "en",
+      "mandatory": true,
+      "description": "About me correction and exclusion owned by #129; not implemented yet.",
+      "steps": [
+        {
+          "action": "missing_journey",
+          "journey": "about-me correction and exclusion"
+        }
+      ],
+      "scripted_model_outputs": [],
+      "rubric": {
+        "authority": "unrun",
+        "clarification_usefulness": "unrun",
+        "uncertainty": "unrun",
+        "naturalness": "unrun",
+        "persona": "unrun"
+      },
+      "expected_overall": "missing-implementation",
+      "tags": [
+        "product",
+        "full-stage-2"
+      ]
+    },
+    {
+      "id": "richer-decision-lifecycle",
+      "language": "en",
+      "mandatory": true,
+      "description": "Richer decision lifecycle owned by #130; not implemented yet.",
+      "steps": [
+        {
+          "action": "missing_journey",
+          "journey": "richer decision lifecycle"
+        }
+      ],
+      "scripted_model_outputs": [],
+      "rubric": {
+        "authority": "unrun",
+        "clarification_usefulness": "unrun",
+        "uncertainty": "unrun",
+        "naturalness": "unrun",
+        "persona": "unrun"
+      },
+      "expected_overall": "missing-implementation",
+      "tags": [
+        "product",
+        "full-stage-2"
+      ]
+    },
+    {
+      "id": "home-review-surfaces",
+      "language": "en",
+      "mandatory": true,
+      "description": "Home and Review surfaces owned by #131; not implemented yet.",
+      "steps": [
+        {
+          "action": "missing_journey",
+          "journey": "Home and Review"
+        }
+      ],
+      "scripted_model_outputs": [],
+      "rubric": {
+        "authority": "unrun",
+        "clarification_usefulness": "unrun",
+        "uncertainty": "unrun",
+        "naturalness": "unrun",
+        "persona": "unrun"
+      },
+      "expected_overall": "missing-implementation",
+      "tags": [
+        "product",
+        "full-stage-2"
+      ]
+    },
+    {
+      "id": "telegram-continuation",
+      "language": "en",
+      "mandatory": true,
+      "description": "Telegram continuation owned by #132; not implemented yet.",
+      "steps": [
+        {
+          "action": "missing_journey",
+          "journey": "Telegram continuation"
+        }
+      ],
+      "scripted_model_outputs": [],
+      "rubric": {
+        "authority": "unrun",
+        "clarification_usefulness": "unrun",
+        "uncertainty": "unrun",
+        "naturalness": "unrun",
+        "persona": "unrun"
+      },
+      "expected_overall": "missing-implementation",
+      "tags": [
+        "product",
+        "full-stage-2"
+      ]
     }
   ]
 }

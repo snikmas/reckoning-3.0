@@ -227,7 +227,8 @@ class JsonFileReckoningRepository:
             row = connection.execute(
                 """
                 SELECT operation_id, payload_digest, status, result_id,
-                       pending_input, occurred_at
+                       pending_input, occurred_at, kind, target_id,
+                       displayed_revision, record_id, correction, submission
                 FROM continuity_operations WHERE operation_id = ?
                 """,
                 (operation_id,),
@@ -254,7 +255,8 @@ class JsonFileReckoningRepository:
             rows = connection.execute(
                 """
                 SELECT operation_id, payload_digest, status, result_id,
-                       pending_input, occurred_at
+                       pending_input, occurred_at, kind, target_id,
+                       displayed_revision, record_id, correction, submission
                 FROM continuity_operations
                 WHERE status = 'failed'
                 ORDER BY rowid
@@ -435,10 +437,42 @@ def _create_operations_table(connection: sqlite3.Connection) -> None:
             status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
             result_id TEXT NOT NULL,
             pending_input TEXT NOT NULL,
-            occurred_at TEXT NOT NULL
+            occurred_at TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT '',
+            target_id TEXT NOT NULL DEFAULT '',
+            displayed_revision INTEGER,
+            record_id TEXT NOT NULL DEFAULT '',
+            correction TEXT NOT NULL DEFAULT '',
+            submission TEXT NOT NULL DEFAULT ''
         )
         """
     )
+    _add_operation_columns(connection)
+
+
+_OPERATION_COLUMNS = (
+    ("kind", "TEXT NOT NULL DEFAULT ''"),
+    ("target_id", "TEXT NOT NULL DEFAULT ''"),
+    ("displayed_revision", "INTEGER"),
+    ("record_id", "TEXT NOT NULL DEFAULT ''"),
+    ("correction", "TEXT NOT NULL DEFAULT ''"),
+    ("submission", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _add_operation_columns(connection: sqlite3.Connection) -> None:
+    """Add operation-binding columns to pre-change installations additively."""
+    existing = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(continuity_operations)"
+        ).fetchall()
+    }
+    for name, declaration in _OPERATION_COLUMNS:
+        if name not in existing:
+            connection.execute(
+                f"ALTER TABLE continuity_operations ADD COLUMN {name} {declaration}"
+            )
 
 
 def _upsert_operation(
@@ -454,8 +488,9 @@ def _upsert_operation(
         """
         INSERT OR REPLACE INTO continuity_operations (
             operation_id, payload_digest, status, result_id,
-            pending_input, occurred_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            pending_input, occurred_at, kind, target_id,
+            displayed_revision, record_id, correction, submission
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             operation.operation_id,
@@ -464,6 +499,12 @@ def _upsert_operation(
             operation.result_id,
             operation.pending_input,
             operation.occurred_at.isoformat(),
+            operation.kind,
+            operation.target_id,
+            operation.displayed_revision,
+            operation.record_id,
+            operation.correction,
+            operation.submission,
         ),
     )
 
@@ -476,6 +517,14 @@ def _operation_from_row(row: tuple[object, ...]) -> OperationRecord:
         result_id=str(row[3]),
         pending_input=str(row[4]),
         occurred_at=datetime.fromisoformat(str(row[5])),
+        kind=str(row[6]) if len(row) > 6 else "",
+        target_id=str(row[7]) if len(row) > 7 else "",
+        displayed_revision=(
+            int(str(row[8])) if len(row) > 8 and row[8] is not None else None
+        ),
+        record_id=str(row[9]) if len(row) > 9 else "",
+        correction=str(row[10]) if len(row) > 10 else "",
+        submission=str(row[11]) if len(row) > 11 else "",
     )
 
 

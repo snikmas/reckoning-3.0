@@ -319,6 +319,72 @@ def test_message_path_publishes_real_reasoning_state_then_returns_to_idle(
     assert repository.load().activity == "idle"
 
 
+def test_session_creation_uses_the_application_clock(tmp_path: Path) -> None:
+    repository = JsonFileInterfaceRepository(tmp_path / "interfaces.json")
+    interface = ReckoningInterfaceApplication(
+        repository=repository,
+        responder=RecordingResponder(),
+        placement=local_policy(),
+        clock=FixedClock(),
+    )
+
+    session, _selection = interface.create_and_select_channel_session(
+        "web", "Clocked", "user-created"
+    )
+
+    assert session.created_at == NOW
+    assert session.last_activity_at == NOW
+
+
+def test_selected_sessions_keep_transcripts_isolated(tmp_path: Path) -> None:
+    interface, responder = build_interface(tmp_path)
+    first, _ = interface.create_and_select_channel_session(
+        "web", "Web one", "user-created"
+    )
+    interface.send_channel_message("web", "Web one question.")
+    second, _ = interface.create_and_select_channel_session(
+        "web", "Web two", "user-created"
+    )
+    interface.send_channel_message("web", "Web two question.")
+
+    first_messages = interface.channel_session("web", session_id=first.session_id)
+    second_messages = interface.channel_session("web", session_id=second.session_id)
+    assert first_messages[0].content == "Web one question."
+    assert second_messages[0].content == "Web two question."
+    assert len(first_messages) == 2
+    assert len(second_messages) == 2
+
+    last_request = responder.requests[-1]
+    assert all(
+        "Web one question." not in message.content
+        for message in last_request.recent_history
+    )
+
+
+def test_web_recovers_when_the_selected_session_is_unavailable() -> None:
+    repository = InMemoryInterfaceRepository()
+    interface = ReckoningInterfaceApplication(
+        repository=repository,
+        responder=RecordingResponder(),
+        placement=local_policy(),
+    )
+    removed, _ = interface.create_and_select_channel_session(
+        "web", "Gone", "user-created"
+    )
+    repository.save(InterfaceState())
+
+    web = ReckoningWebApplication(
+        LegacyApplicationStub(), interface_application=interface
+    )
+    status, _, page = request(web, "GET", "/simon")
+
+    assert status == "200 OK"
+    assert b"data-area=\"simon\"" in page
+    sessions = interface.list_channel_sessions("web")
+    assert len(sessions) == 1
+    assert sessions[0].session_id != removed.session_id
+
+
 @pytest.mark.parametrize("area", ("home", "simon", "plan", "review", "control"))
 def test_each_task_area_keeps_clear_navigation_and_narrow_layout(
     tmp_path: Path, area: str

@@ -287,6 +287,47 @@ def test_additive_upgrade_adds_operation_storage_to_a_pre_change_installation(
     assert upgraded.get(reckoning.id) == reckoning
 
 
+def test_pre_change_operation_table_gains_binding_columns_additively(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "confirmed-state" / "continuity.json"
+    repository = JsonFileReckoningRepository(state_path)
+    with closing(connect_database(repository.database_path)) as connection:
+        connection.execute("DROP TABLE continuity_operations")
+        connection.execute(
+            """
+            CREATE TABLE continuity_operations (
+                operation_id TEXT PRIMARY KEY,
+                payload_digest TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+                result_id TEXT NOT NULL,
+                pending_input TEXT NOT NULL,
+                occurred_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+    upgraded = JsonFileReckoningRepository(state_path)
+    bound = OperationRecord(
+        operation_id="op-bound",
+        payload_digest="digest-bound",
+        status="completed",
+        result_id="decision-bound",
+        pending_input="",
+        occurred_at=NOW,
+        kind="correct",
+        target_id="decision-bound",
+        displayed_revision=3,
+        record_id="record-bound",
+        correction="the corrected meaning",
+        submission="No, correct it: the corrected meaning",
+    )
+    upgraded.record_operation(bound)
+
+    assert upgraded.lookup_operation("op-bound") == bound
+
+
 def test_legacy_continuity_migrates_without_confirming_proposals(
     tmp_path: Path,
 ) -> None:

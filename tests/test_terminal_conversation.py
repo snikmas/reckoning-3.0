@@ -75,6 +75,97 @@ def test_terminal_message_uses_installed_persona_and_persists(
     assert contents[1][1].strip()
 
 
+def test_terminal_can_start_a_second_conversation_after_restart(
+    tmp_path: Path,
+) -> None:
+    data_dir, credentials, _telegram, _draft = _install(tmp_path)
+
+    first_replies = iter(["First question", "/exit"])
+    first_outputs: list[str] = []
+    assert (
+        terminal_main(
+            ["--data-dir", str(data_dir), "--credentials", str(credentials)],
+            line_reader=lambda prompt: next(first_replies),
+            output=first_outputs.append,
+        )
+        == 0
+    )
+
+    second_replies = iter(["/new Second thread", "Second question", "/exit"])
+    second_outputs: list[str] = []
+    assert (
+        terminal_main(
+            ["--data-dir", str(data_dir), "--credentials", str(credentials)],
+            line_reader=lambda prompt: next(second_replies),
+            output=second_outputs.append,
+        )
+        == 0
+    )
+    assert not any("Could not answer" in line for line in second_outputs)
+
+    runtime = load_installation_runtime(data_dir)
+    repository = JsonFileInterfaceRepository(
+        runtime.state_path("confirmed-state", "interfaces.json")
+    )
+    terminal_sessions = repository.list_sessions("terminal")
+    assert len(terminal_sessions) == 2
+    second = next(
+        session for session in terminal_sessions if session.display_name == "Second thread"
+    )
+    assert (second.messages[0].role, second.messages[0].content) == (
+        "user",
+        "Second question",
+    )
+    first = next(
+        session for session in terminal_sessions if session.display_name != "Second thread"
+    )
+    assert first.messages[0].content == "First question"
+
+    selection = repository.get_selected_session("terminal")
+    assert selection is not None
+    assert selection.selected_session_id == second.session_id
+
+
+def test_terminal_repeated_new_and_resume_keep_sessions_separate(
+    tmp_path: Path,
+) -> None:
+    data_dir, credentials, _telegram, _draft = _install(tmp_path)
+    replies = iter(
+        [
+            "/new First thread",
+            "First thread question",
+            "/new Second thread",
+            "Second thread question",
+            "/resume",
+            "/exit",
+        ]
+    )
+    outputs: list[str] = []
+
+    returncode = terminal_main(
+        ["--data-dir", str(data_dir), "--credentials", str(credentials)],
+        line_reader=lambda prompt: next(replies),
+        output=outputs.append,
+    )
+
+    assert returncode == 0
+    assert any("Started First thread." in line for line in outputs)
+    assert any("Started Second thread." in line for line in outputs)
+    assert any("Second thread:" in line for line in outputs)
+
+    runtime = load_installation_runtime(data_dir)
+    repository = JsonFileInterfaceRepository(
+        runtime.state_path("confirmed-state", "interfaces.json")
+    )
+    sessions = {session.display_name: session for session in repository.list_sessions("terminal")}
+    assert set(sessions) == {"First thread", "Second thread"}
+    assert sessions["First thread"].messages[0].content == "First thread question"
+    assert sessions["Second thread"].messages[0].content == "Second thread question"
+    selection = repository.get_selected_session("terminal")
+    assert selection is not None
+    assert selection.selected_session_id == sessions["Second thread"].session_id
+
+
 def test_terminal_exits_without_a_durable_session_when_nothing_is_sent(
     tmp_path: Path,
 ) -> None:

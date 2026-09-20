@@ -76,6 +76,32 @@ def test_negated_confirmation_never_confirms() -> None:
     assert isinstance(reply, ClarifyDecision)
 
 
+def test_negated_conditional_and_reported_corrections_never_mutate() -> None:
+    for message in (
+        "Don't change it: keep the current wording.",
+        "Do not correct it: leave it alone.",
+        "I would change it to: option B.",
+        "Never change it to: something else.",
+        "If I were to change it: option B.",
+        "He said \"correct it: option B\".",
+        "She told me to change it: option B.",
+    ):
+        reply = interpret_decision_message(message, TARGET)
+        assert not isinstance(reply, (ConfirmDecision, CorrectDecision)), message
+
+
+def test_imperative_correction_forms_still_mutate() -> None:
+    for message in (
+        "Correct it: new meaning.",
+        "Change it to new meaning.",
+        "No, correct it: new meaning.",
+        "Actually, update it: new meaning.",
+    ):
+        reply = interpret_decision_message(message, TARGET)
+        assert isinstance(reply, CorrectDecision), message
+        assert reply.meaning == "new meaning."
+
+
 def test_questions_and_indirect_confirmations_never_mutate() -> None:
     for message in (
         "What happens if I confirm?",

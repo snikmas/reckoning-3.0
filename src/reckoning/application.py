@@ -38,10 +38,12 @@ from reckoning.conversation import (
     compose_provider_conversation,
 )
 from reckoning.conversation_safety import (
+    COVERAGE_VERSION,
     DangerDecision,
     OutputPolicyDecision,
     classify_danger,
     classify_output,
+    danger_response_for,
 )
 from reckoning.external_content import ExternalContentResult
 from reckoning.personal_context import (
@@ -146,6 +148,7 @@ class ModelRunRecord:
     failure: str | None = None
     output_policy_decision: OutputPolicyDecision | None = None
     danger_decision: DangerDecision | None = None
+    history_selection: HistorySelection | None = None
 
 
 class ModelRunRepository(Protocol):
@@ -189,16 +192,12 @@ class ProtectedResponsePolicy:
     def evaluate_danger(self, user_message: str) -> DangerDecision:
         return classify_danger(user_message)
 
+    def safety_response(self, user_message: str) -> str | None:
+        """Return the canonical application-owned response, if one is required."""
+        return danger_response_for(self.evaluate_danger(user_message))
+
     def immediate_danger_response(self, user_message: str) -> str | None:
-        decision = self.evaluate_danger(user_message)
-        if decision.response_kind == "emergency-help":
-            return (
-                "If you are in immediate danger, contact local emergency services now "
-                "or go to the nearest emergency department. If you can, contact a "
-                "trusted person nearby and do not stay alone. I can help you focus on "
-                "the next practical step, but I am not a clinician or an emergency service."
-            )
-        return None
+        return self.safety_response(user_message)
 
     def evaluate_output(self, proposed_response: str) -> OutputPolicyDecision:
         return classify_output(proposed_response)
@@ -323,19 +322,25 @@ class ReckoningApplication:
                 for index, (role, content) in enumerate(history, start=1)
             )
         )
-        immediate_danger_response = (
-            self._dependencies.response_policy.immediate_danger_response(user_message)
+        danger_decision = self._dependencies.response_policy.evaluate_danger(
+            user_message
         )
-        if immediate_danger_response is not None:
+        safety_response = danger_response_for(danger_decision)
+        if safety_response is not None:
+            run_record = self._safety_run_record(
+                safety_response, danger_decision, requested_at=requested_at
+            )
+            self._dependencies.model_runs.save_run(run_record)
             if persist_session:
                 self._dependencies.storage.append("user", user_message, requested_at)
                 self._dependencies.storage.append(
-                    "assistant", immediate_danger_response, requested_at
+                    "assistant", safety_response, requested_at
                 )
             return ConversationReply(
-                speech=immediate_danger_response,
+                speech=safety_response,
                 notices=(),
                 context_status=ContextStatus((), (), (), ()),
+                model_run_id=run_record.id,
             )
 
         supplied_context = (
@@ -462,9 +467,6 @@ class ReckoningApplication:
             proposed_response
         )
         speech = output_policy.delivered_speech
-        danger_decision = self._dependencies.response_policy.evaluate_danger(
-            user_message
-        )
 
         notices: list[str] = []
         if profile_missing:
@@ -496,6 +498,7 @@ class ReckoningApplication:
             status=run_status,
             output_policy_decision=output_policy,
             danger_decision=danger_decision,
+            history_selection=history_selection,
         )
         self._dependencies.model_runs.save_run(run_record)
 
@@ -620,6 +623,13 @@ class ReckoningApplication:
         operation_id: str | None,
         payload_digest: str,
         result_id: str,
+        *,
+        kind: str = "",
+        target_id: str = "",
+        displayed_revision: int | None = None,
+        record_id: str = "",
+        correction: str = "",
+        submission: str = "",
     ) -> OperationRecord | None:
         if operation_id is None:
             return None
@@ -630,6 +640,12 @@ class ReckoningApplication:
             result_id=result_id,
             pending_input="",
             occurred_at=self._dependencies.clock.now(),
+            kind=kind,
+            target_id=target_id,
+            displayed_revision=displayed_revision,
+            record_id=record_id,
+            correction=correction,
+            submission=submission,
         )
 
     def list_reckonings(self) -> tuple[Reckoning, ...]:
@@ -656,7 +672,6 @@ class ReckoningApplication:
         previous_result = self._replay_result(operation_id, payload_digest)
         if previous_result is not None:
             return self._dependencies.reckoning_repository.get(previous_result)
-
         processing = self._dependencies.processing_scope.evaluate(
             ("raw-reckoning-input",),
             required_categories=("raw-reckoning-input",),
@@ -685,6 +700,8 @@ class ReckoningApplication:
                         result_id="",
                         pending_input=source_input,
                         occurred_at=requested_at,
+                        kind="start-reckoning",
+                        submission=source_input,
                     )
                 )
             raise RuntimeError(
@@ -757,7 +774,12 @@ class ReckoningApplication:
             reckoning,
             expected_version=0,
             operation=self._completed_operation(
-                operation_id, payload_digest, reckoning.id
+                operation_id,
+                payload_digest,
+                reckoning.id,
+                kind="start-reckoning",
+                target_id=reckoning.id,
+                submission=source_input,
             ),
         )
         return reckoning
@@ -770,13 +792,14 @@ class ReckoningApplication:
         *,
         expected_revision: int | None = None,
         operation_id: str | None = None,
+        submission: str | None = None,
     ) -> Reckoning:
         meaning = corrected_meaning.strip()
         if not meaning:
             raise ValueError("A correction cannot be empty.")
 
         payload_digest = self._operation_payload_digest(
-            reckoning_id, record_id, meaning, expected_revision
+            reckoning_id, record_id, meaning, expected_revision, submission or ""
         )
         previous_result = self._replay_result(operation_id, payload_digest)
         if previous_result is not None:
@@ -828,7 +851,15 @@ class ReckoningApplication:
             corrected,
             expected_version=reckoning.version,
             operation=self._completed_operation(
-                operation_id, payload_digest, reckoning_id
+                operation_id,
+                payload_digest,
+                reckoning_id,
+                kind="correct",
+                target_id=reckoning_id,
+                displayed_revision=expected_revision,
+                record_id=record_id,
+                correction=meaning,
+                submission=submission or "",
             ),
         )
         return corrected
@@ -839,9 +870,10 @@ class ReckoningApplication:
         *,
         expected_revision: int | None = None,
         operation_id: str | None = None,
+        submission: str | None = None,
     ) -> Reckoning:
         payload_digest = self._operation_payload_digest(
-            reckoning_id, expected_revision
+            reckoning_id, expected_revision, submission or ""
         )
         previous_result = self._replay_result(operation_id, payload_digest)
         if previous_result is not None:
@@ -854,7 +886,13 @@ class ReckoningApplication:
             )
         if reckoning.status == "confirmed":
             completed = self._completed_operation(
-                operation_id, payload_digest, reckoning_id
+                operation_id,
+                payload_digest,
+                reckoning_id,
+                kind="confirm",
+                target_id=reckoning_id,
+                displayed_revision=expected_revision,
+                submission=submission or "",
             )
             if completed is not None:
                 self._dependencies.reckoning_repository.record_operation(completed)
@@ -881,7 +919,13 @@ class ReckoningApplication:
             confirmed,
             expected_version=reckoning.version,
             operation=self._completed_operation(
-                operation_id, payload_digest, reckoning_id
+                operation_id,
+                payload_digest,
+                reckoning_id,
+                kind="confirm",
+                target_id=reckoning_id,
+                displayed_revision=expected_revision,
+                submission=submission or "",
             ),
         )
         return confirmed
@@ -1052,6 +1096,41 @@ class ReckoningApplication:
             usage=ProviderUsage(),
         )
 
+    def _safety_run_record(
+        self,
+        speech: str,
+        danger_decision: DangerDecision,
+        *,
+        requested_at: datetime,
+    ) -> ModelRunRecord:
+        """Durable evidence for an application-owned safety response.
+
+        The response is produced before any provider call, so the record uses a
+        distinct provider identity and records no billable usage.
+        """
+        return ModelRunRecord(
+            id=self._dependencies.identifiers.new(),
+            requested_at=requested_at,
+            status="limited",
+            provider="application",
+            model="protected-boundary",
+            model_calls=0,
+            latency_ms=0,
+            retries=0,
+            input_tokens=0,
+            output_tokens=0,
+            billable_units=0,
+            usage_status="not-billable",
+            failure=None,
+            output_policy_decision=OutputPolicyDecision(
+                action="replace",
+                reason_code="application-safety-response",
+                delivered_speech=speech,
+                coverage_version=COVERAGE_VERSION,
+            ),
+            danger_decision=danger_decision,
+        )
+
     def _model_run_record(
         self,
         response: ProviderResponse,
@@ -1061,6 +1140,7 @@ class ReckoningApplication:
         failure: str | None = None,
         output_policy_decision: OutputPolicyDecision | None = None,
         danger_decision: DangerDecision | None = None,
+        history_selection: HistorySelection | None = None,
     ) -> ModelRunRecord:
         return ModelRunRecord(
             id=self._dependencies.identifiers.new(),
@@ -1083,6 +1163,7 @@ class ReckoningApplication:
             failure=failure,
             output_policy_decision=output_policy_decision,
             danger_decision=danger_decision,
+            history_selection=history_selection,
         )
 
     def _reckoning_run_record(
@@ -1227,6 +1308,8 @@ def create_local_application(
     persona: PersonaSettings | None = None,
     placement: PlacementState | None = None,
     processing_grants_path: Path | None = None,
+    model_override: ModelProvider | None = None,
+    reckoning_provider_override: ReckoningProvider | None = None,
 ) -> ReckoningApplication:
     from reckoning.persistence import JsonFileReckoningRepository
     from reckoning.personal_context import JsonFilePersonalContextRepository
@@ -1259,6 +1342,10 @@ def create_local_application(
         )
         model = runtime_model
         reckoning_provider = OrcaRouterReckoningProvider(runtime_model)
+    if model_override is not None:
+        model = model_override
+    if reckoning_provider_override is not None:
+        reckoning_provider = reckoning_provider_override
     model_runs = JsonFileModelRunRepository(
         continuity_path.with_name("model-runs.json")
     )

@@ -22,6 +22,7 @@ from reckoning.continuity import (
     Evidence,
     PersonalRecordProposal,
     ReckoningDraft,
+    ReckoningProvider,
     SourcedFact,
 )
 from reckoning.providers import ProviderFailure
@@ -223,9 +224,8 @@ class BrowserSession:
 
 
 def build_web_app(
-    data_dir: Path, *, reckoning_provider: object | None = None
+    data_dir: Path, *, reckoning_provider: ReckoningProvider | None = None
 ) -> ReckoningWebApplication:
-    from dataclasses import replace
     from reckoning.operations import load_installation_runtime
 
     runtime = load_installation_runtime(data_dir)
@@ -250,11 +250,8 @@ def build_web_app(
         ),
         persona=runtime.persona,
         placement=runtime.application_placement,
+        reckoning_provider_override=reckoning_provider,
     )
-    if reckoning_provider is not None:
-        application._dependencies = replace(
-            application._dependencies, reckoning_provider=reckoning_provider
-        )
     interface = create_local_interface_application(
         application,
         runtime.state_path("confirmed-state", "interfaces.json"),
@@ -465,20 +462,19 @@ def test_conversational_correction_replay_creates_one_record_version(
     assert b"Revision 2" in page
     assert b'class="status status-proposed"' in page
 
-    # After restart the old review context is expired; the identical
-    # submission is rejected without mutating, and a fresh binding with the
-    # old operation id still conflicts.
+    # After restart the in-memory review context is gone, but the durable
+    # operation identity still resolves the identical retry to its saved
+    # result instead of failing on the process-local presentation receipt.
     browser.web = build_web_app(data_dir)
     browser.get("/simon")
     status, headers, _ = browser.post("/messages", correction)
     assert status == "303 See Other"
-    assert headers["Location"] == "/simon"
-    status, _, page = browser.get("/simon")
-    assert b"review context is missing or expired" in page
+    assert headers["Location"] == decision_location
     status, _, page = browser.get(decision_location)
     assert b"Revision 2" in page
     assert b'class="status status-proposed"' in page
 
+    # A fresh binding with the old operation id still conflicts.
     replay = {
         **_simon_composer(browser).submission(message=f"No, correct it: {CORRECTED_MEANING}"),
         "operation_id": correction["operation_id"],
@@ -520,6 +516,61 @@ def test_conversational_confirmation_replay_cannot_hit_a_later_proposal(
 
     status, _, page = browser.get(second_location)
     assert b'class="status status-proposed"' in page
+
+
+def test_completed_confirmation_retry_replays_without_a_model_call(
+    tmp_path: Path,
+) -> None:
+    """A retry after the proposal is gone resolves its saved operation."""
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    decision_location = propose_via_composer(browser, SITUATION)
+    confirmation = _simon_composer(browser).submission(
+        message="I confirm this version"
+    )
+    status, _, _ = browser.post("/messages", confirmation)
+    assert status == "303 See Other"
+    status, _, page = browser.get(decision_location)
+    assert b'class="status status-confirmed"' in page
+
+    runs_before = len(web._application.inspect_model_runs())
+    # No proposal is open now. The identical retry must resolve the saved
+    # operation instead of becoming an ordinary model request.
+    status, headers, _ = browser.post("/messages", confirmation)
+    assert status == "303 See Other"
+    assert headers["Location"] == decision_location
+    assert len(web._application.inspect_model_runs()) == runs_before
+
+    status, _, page = browser.get(decision_location)
+    assert b'class="status status-confirmed"' in page
+
+
+def test_completed_confirmation_retry_with_changed_text_conflicts(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    decision_location = propose_via_composer(browser, SITUATION)
+    confirmation = _simon_composer(browser).submission(
+        message="I confirm this version"
+    )
+    status, _, _ = browser.post("/messages", confirmation)
+    assert status == "303 See Other"
+
+    status, _, page = browser.post(
+        "/messages", {**confirmation, "message": "Confirm this version."}
+    )
+    assert status == "409 Conflict"
+    assert b"already completed with a different payload" in page
+
+    status, _, page = browser.get(decision_location)
+    assert b'class="status status-confirmed"' in page
 
 
 def test_failed_proposal_input_survives_restart_and_retries_once(

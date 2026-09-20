@@ -17,13 +17,17 @@ from reckoning.interfaces import (
     ChannelSelection,
     ChannelSession,
     ChannelTurn,
+    InterfaceClock,
     InterfaceProjectionConflict,
     InterfaceSessionConflict,
     InterfaceState,
     OperationalFailure,
     RunReceipt,
     SessionOrigin,
+    SystemInterfaceClock,
     _state_from_data,
+    apply_turn_completion,
+    apply_turn_failure,
 )
 from reckoning.root_database import (
     ROOT_DATABASE_FILENAME,
@@ -58,8 +62,11 @@ _DEFAULT_ACTIVITY = "idle"
 class SQLiteInterfaceRepository:
     """Transactional per-placement-root storage for interface sessions and projections."""
 
-    def __init__(self, legacy_path: Path) -> None:
+    def __init__(
+        self, legacy_path: Path, *, clock: InterfaceClock | None = None
+    ) -> None:
         self._legacy_path = legacy_path
+        self._clock = clock or SystemInterfaceClock()
         self._root = logical_root_for(legacy_path)
         self._path = self._root / ROOT_DATABASE_FILENAME
         self._initialize_or_migrate()
@@ -257,7 +264,7 @@ class SQLiteInterfaceRepository:
                 if row is not None:
                     connection.commit()
                     return _channel_session_from_row(connection, row)
-                created_at = datetime.now().astimezone()
+                created_at = self._clock.now()
                 session_id = str(uuid4())
                 display_name = display_name or "First conversation"
                 connection.execute(
@@ -301,6 +308,71 @@ class SQLiteInterfaceRepository:
             revision=1,
         )
 
+    def create_and_select_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None,
+        origin: SessionOrigin,
+        created_at: datetime,
+        *,
+        expected_selection_revision: int | None = None,
+    ) -> tuple[ChannelSession, ChannelSelection]:
+        session_id = str(uuid4())
+        display_name = display_name or _default_display_name(channel, origin)
+        with closing(connect_database(self._path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                actual = _selection_revision(connection, channel)
+                if (
+                    expected_selection_revision is not None
+                    and actual != expected_selection_revision
+                ):
+                    raise InterfaceSessionConflict(
+                        channel, "", expected_selection_revision, actual
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO interface_sessions (
+                        channel, session_id, revision, display_name, origin,
+                        created_at, last_activity_at
+                    ) VALUES (?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        channel,
+                        session_id,
+                        display_name,
+                        origin,
+                        _isoformat_or_none(created_at),
+                        _isoformat_or_none(created_at),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO interface_session_selections (
+                        channel, selected_session_id, revision
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT (channel) DO UPDATE SET
+                        selected_session_id = excluded.selected_session_id,
+                        revision = excluded.revision
+                    """,
+                    (channel, session_id, actual + 1),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        session = ChannelSession(
+            channel=channel,
+            session_id=session_id,
+            messages=(),
+            display_name=display_name,
+            origin=origin,
+            created_at=created_at,
+            last_activity_at=created_at,
+            revision=1,
+        )
+        return session, ChannelSelection(channel, session_id, actual + 1)
+
     def append_completed_turn(
         self,
         channel: ChannelName,
@@ -309,6 +381,7 @@ class SQLiteInterfaceRepository:
         assistant_text: str,
         *,
         expected_revision: int,
+        now: datetime | None = None,
     ) -> ChannelSession:
         return self.append_messages(
             channel,
@@ -319,6 +392,7 @@ class SQLiteInterfaceRepository:
             ),
             expected_revision=expected_revision,
             returning_user=True,
+            now=now,
         )
 
     def append_messages(
@@ -329,8 +403,9 @@ class SQLiteInterfaceRepository:
         *,
         expected_revision: int,
         returning_user: bool = False,
+        now: datetime | None = None,
     ) -> ChannelSession:
-        now = datetime.now().astimezone()
+        now = now or self._clock.now()
         with closing(connect_database(self._path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -407,8 +482,9 @@ class SQLiteInterfaceRepository:
         turn_id: str,
         *,
         expected_revision: int,
+        now: datetime | None = None,
     ) -> ChannelTurn:
-        now = datetime.now().astimezone()
+        now = now or self._clock.now()
         with closing(connect_database(self._path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -446,7 +522,7 @@ class SQLiteInterfaceRepository:
                         (channel, session_id),
                     ).fetchone()[0]
                 )
-                created_at = datetime.now().astimezone().isoformat()
+                created_at = now.isoformat()
                 connection.execute(
                     """
                     INSERT INTO interface_turns (
@@ -495,19 +571,35 @@ class SQLiteInterfaceRepository:
         notices: tuple[str, ...] = (),
         context_status: ContextStatus | None = None,
         model_run_id: str | None = None,
+        now: datetime | None = None,
     ) -> ChannelTurn:
         with closing(connect_database(self._path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                completed_at = datetime.now().astimezone().isoformat()
+                row = connection.execute(
+                    f"SELECT {_TURN_COLUMNS} FROM interface_turns WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Unknown turn: {turn_id}")
+                completed = apply_turn_completion(
+                    _turn_from_row(row),
+                    assistant_speech,
+                    notices=notices,
+                    context_status=context_status,
+                    model_run_id=model_run_id,
+                    completed_at=now or self._clock.now(),
+                )
                 context_status_data = None
-                if context_status is not None:
+                if completed.context_status is not None:
                     context_status_data = json.dumps(
                         {
-                            "used": list(context_status.used),
-                            "unavailable": list(context_status.unavailable),
-                            "excluded": list(context_status.excluded),
-                            "truncated": list(context_status.truncated),
+                            "used": list(completed.context_status.used),
+                            "unavailable": list(
+                                completed.context_status.unavailable
+                            ),
+                            "excluded": list(completed.context_status.excluded),
+                            "truncated": list(completed.context_status.truncated),
                         }
                     )
                 connection.execute(
@@ -522,26 +614,21 @@ class SQLiteInterfaceRepository:
                     WHERE turn_id = ?
                     """,
                     (
-                        assistant_speech,
-                        completed_at,
-                        json.dumps(list(notices)),
+                        completed.assistant_speech,
+                        completed.completed_at.isoformat()  # type: ignore[union-attr]
+                        if completed.completed_at is not None
+                        else None,
+                        json.dumps(list(completed.notices)),
                         context_status_data,
-                        model_run_id,
+                        completed.model_run_id,
                         turn_id,
                     ),
                 )
-                if connection.total_changes == 0:
-                    raise KeyError(f"Unknown turn: {turn_id}")
-                row = connection.execute(
-                    "SELECT user_speech FROM interface_turns WHERE turn_id = ?",
-                    (turn_id,),
-                ).fetchone()
-                user_speech = str(row[0]) if row is not None else ""
                 _append_speech_messages(
                     connection,
                     channel,
                     session_id,
-                    user_speech=user_speech,
+                    user_speech=completed.user_speech,
                     assistant_speech=assistant_speech,
                 )
                 connection.execute(
@@ -549,37 +636,41 @@ class SQLiteInterfaceRepository:
                     UPDATE interface_sessions SET last_activity_at = ?
                     WHERE channel = ? AND session_id = ?
                     """,
-                    (completed_at, channel, session_id),
+                    (
+                        completed.completed_at.isoformat()  # type: ignore[union-attr]
+                        if completed.completed_at is not None
+                        else None,
+                        channel,
+                        session_id,
+                    ),
                 )
                 _set_returning_user(connection)
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
-        return ChannelTurn(
-            turn_id=turn_id,
-            channel=channel,
-            session_id=session_id,
-            user_speech="",
-            assistant_speech=assistant_speech,
-            state="completed",
-            created_at=datetime.now(),
-            completed_at=datetime.fromisoformat(completed_at),
-            notices=notices,
-            context_status=context_status,
-            model_run_id=model_run_id,
-        )
+        return completed
 
     def fail_turn(
         self,
         channel: ChannelName,
         session_id: str,
         turn_id: str,
+        *,
+        now: datetime | None = None,
     ) -> ChannelTurn:
         with closing(connect_database(self._path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                completed_at = datetime.now().astimezone().isoformat()
+                row = connection.execute(
+                    f"SELECT {_TURN_COLUMNS} FROM interface_turns WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Unknown turn: {turn_id}")
+                failed = apply_turn_failure(
+                    _turn_from_row(row), completed_at=now or self._clock.now()
+                )
                 connection.execute(
                     """
                     UPDATE interface_turns SET
@@ -587,24 +678,18 @@ class SQLiteInterfaceRepository:
                         completed_at = ?
                     WHERE turn_id = ?
                     """,
-                    (completed_at, turn_id),
+                    (
+                        failed.completed_at.isoformat()  # type: ignore[union-attr]
+                        if failed.completed_at is not None
+                        else None,
+                        turn_id,
+                    ),
                 )
-                if connection.total_changes == 0:
-                    raise KeyError(f"Unknown turn: {turn_id}")
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
-        return ChannelTurn(
-            turn_id=turn_id,
-            channel=channel,
-            session_id=session_id,
-            user_speech="",
-            assistant_speech=None,
-            state="failed",
-            created_at=datetime.now(),
-            completed_at=datetime.fromisoformat(completed_at),
-        )
+        return failed
 
     def list_turns(
         self,
@@ -1083,6 +1168,13 @@ def _append_speech_messages(
             """,
             (channel, session_id, start + offset, role, content),
         )
+
+
+_TURN_COLUMNS = (
+    "turn_id, channel, session_id, user_speech, assistant_speech, "
+    "state, created_at, completed_at, notices_json, context_status_json, "
+    "model_run_id"
+)
 
 
 def _turn_from_row(row: tuple[Any, ...]) -> ChannelTurn:

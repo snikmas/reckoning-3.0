@@ -90,9 +90,10 @@ def test_strong_honest_challenge_is_preserved() -> None:
 
 
 def test_immediate_danger_gets_local_help_without_a_clinical_role() -> None:
-    application = build_application(
-        ScriptedModel("Stay here with me. I understand your diagnosis better than anyone.")
+    model = ScriptedModel(
+        "Stay here with me. I understand your diagnosis better than anyone."
     )
+    application = build_application(model)
 
     response = application.send_message(
         "I am in immediate danger and might hurt myself right now."
@@ -102,3 +103,45 @@ def test_immediate_danger_gets_local_help_without_a_clinical_role() -> None:
     assert "contact a trusted person nearby" in response.speech
     assert "not a clinician or an emergency service" in response.speech
     assert "diagnosis" not in response.speech
+    assert model.requests == []
+    run = application.inspect_model_runs()[0]
+    assert run.provider == "application"
+    assert run.danger_decision is not None
+    assert run.danger_decision.response_kind == "emergency-help"
+
+
+def test_contraction_danger_is_not_hidden_by_an_apostrophe() -> None:
+    model = ScriptedModel("unused")
+    application = build_application(model)
+
+    response = application.send_message("I'm going to kill myself right now.")
+
+    assert "contact local emergency services now" in response.speech
+    assert model.requests == []
+
+
+def test_ambiguous_danger_gets_clarification_before_any_provider_call() -> None:
+    model = ScriptedModel("unused")
+    application = build_application(model)
+
+    response = application.send_message("I am not going to hurt myself right now.")
+
+    assert "Are you in danger" in response.speech
+    assert "not a clinician" in response.speech
+    assert model.requests == []
+    run = application.inspect_model_runs()[0]
+    assert run.danger_decision is not None
+    assert run.danger_decision.response_kind == "uncertain-boundary"
+
+
+def test_quoted_danger_does_not_hide_a_current_danger_clause() -> None:
+    model = ScriptedModel("unused")
+    application = build_application(model)
+
+    response = application.send_message(
+        'My friend said "I might hurt myself right now", '
+        "but I am going to kill myself right now."
+    )
+
+    assert "contact local emergency services now" in response.speech
+    assert model.requests == []

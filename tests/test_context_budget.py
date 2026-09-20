@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from reckoning.conversation import (
+    DEFAULT_CONTEXT_WINDOW,
     ChannelCapabilities,
     ComposerInput,
     ProviderMessage,
@@ -111,7 +112,7 @@ def test_malformed_or_incomplete_history_is_dropped() -> None:
     )
 
 
-def test_individual_oversized_turn_is_omitted_not_truncated() -> None:
+def test_newest_oversized_turn_stops_selection_without_older_turns() -> None:
     history = (
         _message("user", "x"),
         _message("assistant", "short"),
@@ -128,11 +129,29 @@ def test_individual_oversized_turn_is_omitted_not_truncated() -> None:
 
     selection = select_history_for_budget(budget, history, mandatory)
 
-    assert selection.selected_messages == (
-        _message("user", "x"),
-        _message("assistant", "short"),
+    # The newest turn cannot fit, so selection stops. It must not skip that
+    # turn to reach the small older one, and it must not select half a turn.
+    assert selection.selected_messages == ()
+    assert selection.omitted_turn_count == 2
+    assert selection.selected_turn_count == 0
+
+
+def test_selection_records_inspectable_budget_evidence() -> None:
+    budget = context_budget(2000)
+    history = (_message("user", "u"), _message("assistant", "a"))
+    mandatory = (_message("system", "s"), _message("user", "current"))
+
+    selection = select_history_for_budget(budget, history, mandatory)
+
+    assert selection.configured_context_window == 2000
+    assert selection.effective_context_window == 2000
+    assert selection.response_reserve == 500
+    assert selection.required_input_tokens == sum(
+        len(message.content.encode("utf-8")) + 8 for message in mandatory
     )
-    assert selection.omitted_turn_count == 1
+    assert selection.selected_turn_count == 1
+    assert selection.estimated_input_tokens > 0
+    assert selection.estimator_method == "utf-8-byte-count"
 
 
 def test_required_material_exceeding_allowance_raises() -> None:
@@ -249,6 +268,62 @@ def test_composer_does_not_add_plain_text_instruction_for_html_channel() -> None
     assert not any(
         "Do not return HTML" in message.content for message in conversation.messages
     )
+
+
+def test_unknown_limit_uses_conservative_fallback_for_exact_outbound_messages() -> None:
+    history = (
+        _message("user", "old question"),
+        _message("assistant", "old answer"),
+    )
+    conversation, selection = compose_provider_conversation(
+        ComposerInput(
+            protected_contract="protected",
+            product_identity="identity",
+            persona_expression="persona",
+            current_request="current request",
+            history=history,
+            context_window=None,
+        )
+    )
+
+    assert selection.configured_context_window is None
+    assert selection.effective_context_window == DEFAULT_CONTEXT_WINDOW
+    assert conversation.messages == (
+        _message("system", "protected"),
+        _message("system", "identity"),
+        _message("system", "persona"),
+        _message("user", "old question"),
+        _message("assistant", "old answer"),
+        _message("user", "current request"),
+    )
+
+
+def test_multilingual_history_is_bounded_as_a_contiguous_suffix() -> None:
+    history = (
+        _message("user", "Первый вопрос " + "я" * 300),
+        _message("assistant", "Первый ответ " + "о" * 300),
+        _message("user", "第二个问题 " + "问" * 300),
+        _message("assistant", "第二个回答 " + "答" * 300),
+        _message("user", "Final question"),
+        _message("assistant", "Final answer"),
+    )
+    budget = context_budget(700)
+    mandatory = (
+        _message("system", "protected"),
+        _message("system", "identity"),
+        _message("system", "persona"),
+        _message("user", "current"),
+    )
+
+    selection = select_history_for_budget(budget, history, mandatory)
+
+    assert selection.selected_messages == (
+        _message("user", "Final question"),
+        _message("assistant", "Final answer"),
+    )
+    assert selection.omitted_turn_count == 2
+    assert selection.selected_turn_count == 1
+    assert selection.estimated_input_tokens <= budget.request_allowance
 
 
 def test_composer_required_instruction_ordering() -> None:

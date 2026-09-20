@@ -156,7 +156,13 @@ OperationStatus = Literal["completed", "failed"]
 
 @dataclass(frozen=True)
 class OperationRecord:
-    """Durable identity of one decision mutation, stored with the decision."""
+    """Durable identity of one decision mutation, stored with the decision.
+
+    The digest binds the semantic payload, but the web layer also needs the
+    operation kind, target, displayed revision, correction record, and original
+    submission to reconstruct and validate a retry after a restart, when
+    process-local presentation receipts no longer exist.
+    """
 
     operation_id: str
     payload_digest: str
@@ -164,6 +170,12 @@ class OperationRecord:
     result_id: str
     pending_input: str
     occurred_at: datetime
+    kind: str = ""
+    target_id: str = ""
+    displayed_revision: int | None = None
+    record_id: str = ""
+    correction: str = ""
+    submission: str = ""
 
 
 @dataclass(frozen=True)

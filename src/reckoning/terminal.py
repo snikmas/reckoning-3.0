@@ -45,15 +45,10 @@ def _ensure_terminal_session(interface: ReckoningInterfaceApplication) -> Channe
     selected = interface.selected_channel_session("terminal")
     if selected is not None:
         return selected
-    session = interface.create_channel_session(
+    session, _selection = interface.create_and_select_channel_session(
         "terminal",
         display_name="Terminal",
         origin="first-use",
-    )
-    interface.select_channel_session(
-        "terminal",
-        session.session_id,
-        expected_selection_revision=0,
     )
     return session
 
@@ -138,14 +133,9 @@ def main(
         if text.casefold().startswith("/new"):
             parts = text.split(None, 1)
             name = parts[1].strip() if len(parts) > 1 else None
-            current_session = interface.create_channel_session(
+            current_session, _selection = interface.create_and_select_channel_session(
                 "terminal",
                 display_name=name,
-            )
-            interface.select_channel_session(
-                "terminal",
-                current_session.session_id,
-                expected_selection_revision=0,
             )
             output(
                 f"Started {current_session.display_name or 'a new conversation'}."

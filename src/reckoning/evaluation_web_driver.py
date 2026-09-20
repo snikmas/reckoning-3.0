@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
+import re
 from typing import Any, Callable, Iterable, cast
 from urllib.request import Request
 from urllib.parse import urlencode
@@ -273,7 +274,6 @@ def build_evaluation_web_app(
     credentials_path: Path = DEFAULT_PROVIDER_CREDENTIALS,
 ) -> ReckoningWebApplication:
     """Set up a temporary installation and return a wired web application."""
-    from dataclasses import replace
     from reckoning.application import create_local_application
     from reckoning.provider_adapters import urlopen_transport
 
@@ -316,13 +316,17 @@ def build_evaluation_web_app(
         provider_transport=transport or urlopen_transport,
         persona=runtime.persona,
         placement=runtime.application_placement,
+        model_override=(
+            ScriptedModel(scripted_model_outputs or ())
+            if scripted_model_outputs is not None or scripted_reckoning is not None
+            else None
+        ),
+        reckoning_provider_override=(
+            ScriptedReckoningProvider(scripted_reckoning)
+            if scripted_model_outputs is not None or scripted_reckoning is not None
+            else None
+        ),
     )
-    if scripted_model_outputs is not None or scripted_reckoning is not None:
-        application._dependencies = replace(
-            application._dependencies,
-            model=ScriptedModel(scripted_model_outputs or ()),
-            reckoning_provider=ScriptedReckoningProvider(scripted_reckoning),
-        )
     interface = create_local_interface_application(
         application,
         runtime.state_path("confirmed-state", "interfaces.json"),
@@ -366,10 +370,11 @@ class WebEvaluationDriver:
         self._observed: list[str] = []
         self._assistant_text: list[str] = []
         self._missing: list[str] = []
+        self._composers_by_revision: dict[int, ParsedForm] = {}
 
     @property
     def application(self) -> ReckoningApplication:
-        return self._web._application
+        return self._web.application
 
     def send_message(self, text: str) -> None:
         self._browser.get("/simon")
@@ -409,29 +414,26 @@ class WebEvaluationDriver:
                 f"status={self._last_reckoning.status} "
                 f"version={self._last_reckoning.version}"
             )
+            self._capture_proposal_composer()
         else:
             self._last_reckoning = None
             self._last_record_id = None
 
     def correct_record(self, text: str) -> None:
+        """Correct through the rendered /messages composer, not a direct form."""
         if self._last_reckoning is None or self._last_record_id is None:
             raise RuntimeError("correct step requires a preceding reckon step.")
         decision_id = self._last_reckoning.id
-        status, _, body = self._browser.get(f"/decisions/{decision_id}")
-        self._observed.append(f"correct-get status={status}")
-        if not status.startswith("200"):
+        composer = self._composer_for_current_revision()
+        if composer is None:
+            self._observed.append("No rendered proposal composer found")
             return
-        page = self._browser.parse(body)
-        correction_forms = page.forms_ending("/correct")
-        if not correction_forms:
-            self._observed.append("No correction form found")
-            return
-        correction = correction_forms[0]
         status, headers, _ = self._browser.post(
-            correction.action, correction.submission(meaning=text)
+            "/messages",
+            composer.submission(message=f"No, correct it: {text}"),
         )
         self._observed.append(
-            f"correct-post status={status} redirect={headers.get('Location', '')}"
+            f"correct status={status} redirect={headers.get('Location', '')}"
         )
         if status.startswith("303") and headers.get("Location", "").startswith("/decisions/"):
             self._last_reckoning = self.application.inspect_reckoning(decision_id)
@@ -439,37 +441,73 @@ class WebEvaluationDriver:
                 f"Corrected {self._last_record_id} to version "
                 f"{self._last_reckoning.current_records[0].version}"
             )
+            self._capture_proposal_composer()
+        else:
+            self._observed.append(
+                "Correction not applied: the handler asked for review"
+            )
 
     def confirm_reckoning(self, expected_revision: int | None = None) -> None:
+        """Confirm through the rendered /messages composer.
+
+        When expected_revision names a rendered revision, the form captured for
+        that revision is submitted as-is. A stale form is sent to the real
+        handler; the driver never rejects it before the application sees it.
+        """
         if self._last_reckoning is None:
             raise RuntimeError("confirm step requires a preceding reckon step.")
         decision_id = self._last_reckoning.id
-        status, _, body = self._browser.get(f"/decisions/{decision_id}")
-        self._observed.append(f"confirm-get status={status}")
-        if not status.startswith("200"):
-            return
-        page = self._browser.parse(body)
-        confirm_forms = page.forms_ending("/confirm")
-        if not confirm_forms:
-            self._observed.append("No confirmation form found")
-            return
-        confirm = confirm_forms[0]
-        form_revision = int(confirm.fields.get("expected_revision", "0"))
-        if expected_revision is not None and form_revision != expected_revision:
-            self._observed.append(
-                f"Confirm rejected: expected revision {expected_revision}, "
-                f"but current revision is {form_revision}"
-            )
-            return
-        status, headers, _ = self._browser.post(confirm.action, confirm.submission())
-        self._observed.append(
-            f"confirm-post status={status} redirect={headers.get('Location', '')}"
+        if expected_revision is not None:
+            composer = self._composers_by_revision.get(expected_revision)
+            if composer is None:
+                self._observed.append(
+                    f"No rendered composer for revision {expected_revision}"
+                )
+                return
+        else:
+            composer = self._composer_for_current_revision()
+            if composer is None:
+                self._observed.append("No rendered proposal composer found")
+                return
+        status, headers, _ = self._browser.post(
+            "/messages", composer.submission(message="I confirm this version")
         )
-        if status.startswith("303") and headers.get("Location", "").startswith("/decisions/"):
-            self._last_reckoning = self.application.inspect_reckoning(decision_id)
+        self._observed.append(
+            f"confirm status={status} redirect={headers.get('Location', '')}"
+        )
+        self._last_reckoning = self.application.inspect_reckoning(decision_id)
+        if self._last_reckoning.status == "confirmed":
             self._observed.append(f"Confirmed version {self._last_reckoning.version}")
-        elif status == "409 Conflict":
-            self._observed.append(f"Confirm rejected: {status}")
+        else:
+            self._observed.append(
+                f"Confirm rejected: status={status} "
+                f"redirect={headers.get('Location', '')}"
+            )
+
+    def _composer_for_current_revision(self) -> ParsedForm | None:
+        captured = self._capture_proposal_composer()
+        if captured is None:
+            return None
+        _revision, composer = captured
+        return composer
+
+    def _capture_proposal_composer(self) -> tuple[int, ParsedForm] | None:
+        status, _, body = self._browser.get("/simon")
+        if not status.startswith("200"):
+            return None
+        text = body.decode("utf-8")
+        match = re.search(r"\(revision (\d+)\)", text)
+        parser = _PageParser()
+        parser.feed(text)
+        try:
+            composer = parser.form_by_action("/messages")
+        except StopIteration:
+            return None
+        if match is None:
+            return None
+        revision = int(match.group(1))
+        self._composers_by_revision[revision] = composer
+        return revision, composer
 
     def explain_reckoning(self) -> None:
         if self._last_reckoning is None:
@@ -490,6 +528,10 @@ class WebEvaluationDriver:
 
     def feedback(self) -> None:
         self._missing.append("reply feedback")
+
+    def missing_journey(self, journey: str) -> None:
+        """Record a journey owned by a later ticket as missing implementation."""
+        self._missing.append(journey)
 
     def finish(self) -> tuple[str, str, dict[str, Any]]:
         if self._missing:
