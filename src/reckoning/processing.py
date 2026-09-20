@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+import fcntl
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime
-import fcntl
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import Literal
 from urllib.parse import urlsplit
 
 from reckoning.json_store import atomic_write_json, read_json
 from reckoning.provider_adapters import AdapterConfig
 from reckoning.provider_registry import find_provider
-
 
 ProcessingCategory = Literal[
     "current-request",
@@ -239,6 +239,48 @@ class UnrestrictedProcessingScope:
             )
         )
         return ProcessingDecision(routed, (), ())
+
+
+def full_category_grant_payload(
+    destination: ProcessingDestination,
+    *,
+    changed_at: datetime,
+) -> dict[str, object]:
+    """The file payload for a version-1 full-category grant to this destination."""
+    grant = ProcessingGrant(
+        destination_id=destination.id,
+        version=1,
+        allowed_categories=PROCESSING_CATEGORIES,
+        changed_at=changed_at,
+    )
+    return {"schema_version": 1, "grants": [_grant_to_data(grant)]}
+
+
+def ensure_initial_processing_grant(
+    repository: JsonFileProcessingGrantRepository,
+    destination: ProcessingDestination,
+    *,
+    changed_at: datetime,
+) -> tuple[ProcessingGrant, bool] | None:
+    """Create a version-1 full-category grant only when a cloud grant is missing.
+
+    Local and fake destinations need no explicit grant. An existing grant is
+    returned unchanged so previously narrowed or revoked grants are never
+    widened. The boolean is True when this call created the grant.
+    """
+    if destination.kind != "cloud":
+        return None
+    existing = repository.get(destination.id)
+    if existing is not None:
+        return existing, False
+    grant = ProcessingGrant(
+        destination_id=destination.id,
+        version=1,
+        allowed_categories=PROCESSING_CATEGORIES,
+        changed_at=changed_at,
+    )
+    repository.save(grant, expected_version=0)
+    return grant, True
 
 
 def provider_destination(
