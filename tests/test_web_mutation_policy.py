@@ -511,7 +511,7 @@ def test_decision_mutation_accepts_valid_browser_authority(
     browser = BrowserSession(web)
     browser.get("/simon")
 
-    status, headers, _ = browser.post(path, form)
+    status, headers, _ = browser.post(path, {**form, "operation_id": "op-test"})
     assert status == "303 See Other"
     assert headers["Location"].startswith("/decisions/")
     assert any(action[0] in {"start", "confirm", "correct_record"} for action in core.actions)

@@ -418,3 +418,32 @@ def test_restore_refuses_to_replace_a_newer_live_continuity_root(tmp_path: Path)
     assert JsonFileReckoningRepository(
         target / "continuity.json"
     ).get(newer.id).status == "confirmed"
+
+
+def test_mutation_save_is_atomic_with_its_replay_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_path = tmp_path / "confirmed-state" / "continuity.json"
+    application = build_application(state_path, "first")
+    decision = application.start_reckoning("atomic")
+
+    import reckoning.persistence as persistence
+
+    real_upsert = persistence._upsert_operation
+
+    def failing_upsert(connection: object, operation: object) -> None:
+        del connection, operation
+        raise RuntimeError("simulated operation storage fault")
+
+    monkeypatch.setattr(persistence, "_upsert_operation", failing_upsert)
+
+    with pytest.raises(RuntimeError, match="simulated operation storage fault"):
+        application.confirm_reckoning(
+            decision.id, expected_revision=decision.version, operation_id="op-fault"
+        )
+
+    monkeypatch.setattr(persistence, "_upsert_operation", real_upsert)
+
+    reopened = build_application(state_path, "second")
+    assert reopened.inspect_reckoning(decision.id).status == "proposed"
+    assert reopened._dependencies.reckoning_repository.lookup_operation("op-fault") is None

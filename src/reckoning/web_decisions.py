@@ -44,7 +44,9 @@ def render_decision_content(
     )
     confirm = ""
     if decision.status == "proposed" and decision.current_records:
-        confirm = _confirmation_form(decision.id, csrf_token, decision.version)
+        confirm = _confirmation_form(
+            decision.id, csrf_token, decision.version, decision.draft.conflict
+        )
     uncertainties = render_list(decision.draft.uncertainties)
     return f"""
       <header>
@@ -145,13 +147,17 @@ def _correction_form(
 
 
 def _confirmation_form(
-    reckoning_id: str, csrf_token: str, expected_revision: int
+    reckoning_id: str, csrf_token: str, expected_revision: int, conflict: str
 ) -> str:
     return f"""
       <form action="/decisions/{escape(reckoning_id)}/confirm" method="post">
         <input type="hidden" name="_csrf_token" value="{escape(csrf_token, quote=True)}">
         <input type="hidden" name="expected_revision" value="{expected_revision}">
         <input type="hidden" name="operation_id" value="{escape(fresh_operation_id())}">
+        <p class="next-action">
+          Confirming saves <strong>{escape(conflict)}</strong> exactly as shown
+          (revision {expected_revision}).
+        </p>
         <button type="submit">Confirm this version</button>
       </form>
     """
