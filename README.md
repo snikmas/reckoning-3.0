@@ -115,8 +115,7 @@ older versions migrate to the multi-provider format automatically.
 `reckoning`, `reckoning web`, and `reckoning gateway` use the installed
 provider automatically; no `.env` file or `--provider` flag is needed. You can
 still override with environment variables or an ignored `.env` file in the
-repository root; those values take precedence over the saved credential. See
-[operations](docs/operations.md) for the variable names.
+repository root; those values take precedence over the saved credential. See operations documentation for the variable names.
 
 ## Storage and access limits
 
@@ -129,13 +128,10 @@ The built-in web server accepts loopback addresses only and has no public
 login. Do not expose it directly to the internet. For remote access to a
 personal server, use an SSH tunnel. Every browser mutation requires the
 configured Host, an allowed Origin when the browser sends one, and a
-session-bound form token. See
-[web access](docs/operations.md#use-the-web-interface-safely) for the supported
-origin and private-access contract.
+session-bound form token.
 
 Reckoning supports `local`, `personal-server`, and `hybrid` placement profiles.
-The local profile is the default. See [operations](docs/operations.md) for
-placement, health checks, encrypted backup, restore, and migration details.
+The local profile is the default.
 
 ## Check an installation
 
@@ -164,7 +160,3 @@ python3 -m pytest
 
 The test suite uses fake time, model, placement, connectors, and temporary
 storage. It does not call an external model or service.
-
-For implementation details, read the
-[architecture overview](docs/architecture/vertical-slices-06-15.md) and the
-[encrypted transfer format](docs/encrypted-transfer-format.md).
