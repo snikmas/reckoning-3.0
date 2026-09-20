@@ -492,7 +492,7 @@ class _ProviderSetupResponder:
         )
         from reckoning.personas import SelectedPersona
 
-        conversation = compose_provider_conversation(
+        conversation, _history_selection = compose_provider_conversation(
             ComposerInput(
                 protected_contract=PROTECTED_PRODUCT_CONTRACT,
                 product_identity=(
@@ -2048,12 +2048,12 @@ class SetupWorkflow:
         if self._accepted is None:
             return
         user_text, assistant_text = self._accepted
-        web_sessions = [
+        first_use_sessions = [
             session
             for session in state.sessions
-            if session.channel == "web" and session.session_id == ""
+            if session.channel == "web" and session.origin == "first-use"
         ]
-        for session in web_sessions:
+        for session in first_use_sessions:
             contents = [(m.role, m.content) for m in session.messages]
             if ("user", user_text) in contents and (
                 "assistant",

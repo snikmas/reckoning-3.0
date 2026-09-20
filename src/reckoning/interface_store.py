@@ -8,11 +8,13 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from reckoning.conversation import ContextStatus, split_legacy_notice_prefix
 from reckoning.interfaces import (
     ChannelMessage,
     ChannelName,
+    ChannelSelection,
     ChannelSession,
     ChannelTurn,
     InterfaceProjectionConflict,
@@ -20,6 +22,7 @@ from reckoning.interfaces import (
     InterfaceState,
     OperationalFailure,
     RunReceipt,
+    SessionOrigin,
     _state_from_data,
 )
 from reckoning.root_database import (
@@ -38,7 +41,7 @@ from reckoning.store_migration import (
 )
 
 
-INTERFACE_SCHEMA_VERSION = "2"
+INTERFACE_SCHEMA_VERSION = "3"
 
 _PROJECTIONS = (
     "returning_user",
@@ -87,6 +90,217 @@ class SQLiteInterfaceRepository:
         with closing(connect_database(self._path)) as connection:
             return _projection_revision(connection, projection)
 
+    def create_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None,
+        origin: SessionOrigin,
+        created_at: datetime,
+    ) -> ChannelSession:
+        session_id = str(uuid4())
+        display_name = display_name or _default_display_name(channel, origin)
+        with closing(connect_database(self._path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO interface_sessions (
+                        channel, session_id, revision, display_name, origin,
+                        created_at, last_activity_at
+                    ) VALUES (?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        channel,
+                        session_id,
+                        display_name,
+                        origin,
+                        _isoformat_or_none(created_at),
+                        _isoformat_or_none(created_at),
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return ChannelSession(
+            channel=channel,
+            session_id=session_id,
+            messages=(),
+            display_name=display_name,
+            origin=origin,
+            created_at=created_at,
+            last_activity_at=created_at,
+            revision=1,
+        )
+
+    def list_sessions(self, channel: ChannelName) -> tuple[ChannelSession, ...]:
+        with closing(connect_database(self._path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    channel, session_id, display_name, origin, created_at,
+                    last_activity_at, revision
+                FROM interface_sessions
+                WHERE channel = ?
+                ORDER BY created_at, rowid
+                """,
+                (channel,),
+            ).fetchall()
+            sessions: list[ChannelSession] = []
+            for row in rows:
+                session_id = str(row[1])
+                messages = tuple(
+                    ChannelMessage(
+                        cast(Literal["user", "assistant"], str(message_row[0])),
+                        str(message_row[1]),
+                    )
+                    for message_row in connection.execute(
+                        """
+                        SELECT role, content FROM interface_session_messages
+                        WHERE channel = ? AND session_id = ?
+                        ORDER BY position
+                        """,
+                        (channel, session_id),
+                    ).fetchall()
+                )
+                sessions.append(
+                    ChannelSession(
+                        channel=cast(ChannelName, str(row[0])),
+                        session_id=session_id,
+                        messages=messages,
+                        display_name=row[2],
+                        origin=cast(SessionOrigin, str(row[3])),
+                        created_at=_datetime_from_iso(row[4]),
+                        last_activity_at=_datetime_from_iso(row[5]),
+                        revision=int(row[6]),
+                    )
+                )
+            return tuple(sessions)
+
+    def select_session(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        *,
+        expected_selection_revision: int,
+    ) -> ChannelSelection:
+        with closing(connect_database(self._path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                exists = connection.execute(
+                    """
+                    SELECT 1 FROM interface_sessions
+                    WHERE channel = ? AND session_id = ?
+                    """,
+                    (channel, session_id),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(f"Unknown session: {session_id}")
+                actual = _selection_revision(connection, channel)
+                if actual != expected_selection_revision:
+                    raise InterfaceSessionConflict(
+                        channel, session_id, expected_selection_revision, actual
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO interface_session_selections (
+                        channel, selected_session_id, revision
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT (channel) DO UPDATE SET
+                        selected_session_id = excluded.selected_session_id,
+                        revision = excluded.revision
+                    """,
+                    (channel, session_id, actual + 1),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return ChannelSelection(channel, session_id, expected_selection_revision + 1)
+
+    def get_selected_session(self, channel: ChannelName) -> ChannelSelection | None:
+        with closing(connect_database(self._path)) as connection:
+            row = connection.execute(
+                """
+                SELECT selected_session_id, revision
+                FROM interface_session_selections
+                WHERE channel = ?
+                """,
+                (channel,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ChannelSelection(
+            channel, str(row[0]), int(row[1])
+        )
+
+    def start_first_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None = None,
+    ) -> ChannelSession:
+        with closing(connect_database(self._path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT
+                        channel, session_id, display_name, origin, created_at,
+                        last_activity_at, revision
+                    FROM interface_sessions
+                    WHERE channel = ? AND origin = 'first-use'
+                    ORDER BY rowid
+                    LIMIT 1
+                    """,
+                    (channel,),
+                ).fetchone()
+                if row is not None:
+                    connection.commit()
+                    return _channel_session_from_row(connection, row)
+                created_at = datetime.now().astimezone()
+                session_id = str(uuid4())
+                display_name = display_name or "First conversation"
+                connection.execute(
+                    """
+                    INSERT INTO interface_sessions (
+                        channel, session_id, revision, display_name, origin,
+                        created_at, last_activity_at
+                    ) VALUES (?, ?, 1, ?, 'first-use', ?, ?)
+                    """,
+                    (
+                        channel,
+                        session_id,
+                        display_name,
+                        _isoformat_or_none(created_at),
+                        _isoformat_or_none(created_at),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO interface_session_selections (
+                        channel, selected_session_id, revision
+                    ) VALUES (?, ?, 1)
+                    ON CONFLICT (channel) DO UPDATE SET
+                        selected_session_id = excluded.selected_session_id,
+                        revision = interface_session_selections.revision + 1
+                    """,
+                    (channel, session_id),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return ChannelSession(
+            channel=channel,
+            session_id=session_id,
+            messages=(),
+            display_name=display_name,
+            origin="first-use",
+            created_at=created_at,
+            last_activity_at=created_at,
+            revision=1,
+        )
+
     def append_completed_turn(
         self,
         channel: ChannelName,
@@ -116,6 +330,7 @@ class SQLiteInterfaceRepository:
         expected_revision: int,
         returning_user: bool = False,
     ) -> ChannelSession:
+        now = datetime.now().astimezone()
         with closing(connect_database(self._path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -129,18 +344,21 @@ class SQLiteInterfaceRepository:
                 if actual == 0:
                     connection.execute(
                         """
-                        INSERT INTO interface_sessions (channel, session_id, revision)
-                        VALUES (?, ?, 1)
+                        INSERT INTO interface_sessions (
+                            channel, session_id, revision, origin, last_activity_at
+                        ) VALUES (?, ?, 1, 'user-created', ?)
                         """,
-                        (channel, session_id),
+                        (channel, session_id, _isoformat_or_none(now)),
                     )
                 else:
                     connection.execute(
                         """
-                        UPDATE interface_sessions SET revision = revision + 1
+                        UPDATE interface_sessions SET
+                            revision = revision + 1,
+                            last_activity_at = ?
                         WHERE channel = ? AND session_id = ?
                         """,
-                        (channel, session_id),
+                        (_isoformat_or_none(now), channel, session_id),
                     )
                 start = int(
                     connection.execute(
@@ -173,7 +391,13 @@ class SQLiteInterfaceRepository:
             except BaseException:
                 connection.rollback()
                 raise
-        return ChannelSession(channel, session_id, messages)
+        return ChannelSession(
+            channel=channel,
+            session_id=session_id,
+            messages=messages,
+            last_activity_at=now,
+            revision=expected_revision + 1,
+        )
 
     def reserve_turn(
         self,
@@ -184,6 +408,7 @@ class SQLiteInterfaceRepository:
         *,
         expected_revision: int,
     ) -> ChannelTurn:
+        now = datetime.now().astimezone()
         with closing(connect_database(self._path)) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -195,18 +420,21 @@ class SQLiteInterfaceRepository:
                 if actual == 0:
                     connection.execute(
                         """
-                        INSERT INTO interface_sessions (channel, session_id, revision)
-                        VALUES (?, ?, 1)
+                        INSERT INTO interface_sessions (
+                            channel, session_id, revision, origin, last_activity_at
+                        ) VALUES (?, ?, 1, 'user-created', ?)
                         """,
-                        (channel, session_id),
+                        (channel, session_id, _isoformat_or_none(now)),
                     )
                 else:
                     connection.execute(
                         """
-                        UPDATE interface_sessions SET revision = revision + 1
+                        UPDATE interface_sessions SET
+                            revision = revision + 1,
+                            last_activity_at = ?
                         WHERE channel = ? AND session_id = ?
                         """,
-                        (channel, session_id),
+                        (_isoformat_or_none(now), channel, session_id),
                     )
                 position = int(
                     connection.execute(
@@ -316,6 +544,13 @@ class SQLiteInterfaceRepository:
                     user_speech=user_speech,
                     assistant_speech=assistant_speech,
                 )
+                connection.execute(
+                    """
+                    UPDATE interface_sessions SET last_activity_at = ?
+                    WHERE channel = ? AND session_id = ?
+                    """,
+                    (completed_at, channel, session_id),
+                )
                 _set_returning_user(connection)
                 connection.commit()
             except BaseException:
@@ -374,9 +609,12 @@ class SQLiteInterfaceRepository:
     def list_turns(
         self,
         channel: ChannelName,
-        session_id: str = "",
+        session_id: str | None = None,
     ) -> tuple[ChannelTurn, ...]:
         with closing(connect_database(self._path)) as connection:
+            if not session_id:
+                selection = _selected_session_id(connection, channel)
+                session_id = selection or session_id or ""
             rows = connection.execute(
                 """
                 SELECT
@@ -585,7 +823,7 @@ class SQLiteInterfaceRepository:
                     )
                 _create_schema(connection)
                 current_version = metadata(connection, "interfaces_schema_version")
-                if current_version not in (None, "1", INTERFACE_SCHEMA_VERSION):
+                if current_version not in (None, "1", "2", INTERFACE_SCHEMA_VERSION):
                     raise RuntimeError("Unsupported interface storage schema.")
                 if current_version is None:
                     if _record_count(connection):
@@ -596,23 +834,21 @@ class SQLiteInterfaceRepository:
                         _merge_state(connection, legacy_state)
                     else:
                         _merge_state(connection, InterfaceState())
-                    set_metadata(
-                        connection,
-                        "interfaces_schema_version",
-                        INTERFACE_SCHEMA_VERSION,
-                    )
-                    set_metadata(
-                        connection,
-                        "interfaces_legacy_sha256",
-                        legacy_digest or "not-required",
-                    )
                 elif current_version == "1":
                     _migrate_v1_to_v2(connection)
-                    set_metadata(
-                        connection,
-                        "interfaces_schema_version",
-                        INTERFACE_SCHEMA_VERSION,
-                    )
+                    _migrate_v2_to_v3(connection)
+                elif current_version == "2":
+                    _migrate_v2_to_v3(connection)
+                set_metadata(
+                    connection,
+                    "interfaces_schema_version",
+                    INTERFACE_SCHEMA_VERSION,
+                )
+                set_metadata(
+                    connection,
+                    "interfaces_legacy_sha256",
+                    legacy_digest or "not-required",
+                )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -648,7 +884,23 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             channel TEXT NOT NULL,
             session_id TEXT NOT NULL,
             revision INTEGER NOT NULL,
+            display_name TEXT,
+            origin TEXT NOT NULL DEFAULT 'user-created',
+            created_at TEXT,
+            last_activity_at TEXT,
             PRIMARY KEY (channel, session_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS interface_session_selections (
+            channel TEXT NOT NULL PRIMARY KEY,
+            selected_session_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            FOREIGN KEY (channel, selected_session_id)
+                REFERENCES interface_sessions(channel, session_id)
+                ON DELETE RESTRICT
         )
         """
     )
@@ -736,6 +988,7 @@ def _tables_exist(connection: sqlite3.Connection) -> bool:
         for table in (
             "interface_projections",
             "interface_sessions",
+            "interface_session_selections",
             "interface_session_messages",
             "interface_activity",
             "interface_pending_approvals",
@@ -752,6 +1005,7 @@ def _any_table_exists(connection: sqlite3.Connection) -> bool:
         for table in (
             "interface_projections",
             "interface_sessions",
+            "interface_session_selections",
             "interface_session_messages",
             "interface_activity",
             "interface_pending_approvals",
@@ -769,6 +1023,7 @@ def _record_count(connection: sqlite3.Connection) -> int:
             SELECT
                 (SELECT COUNT(*) FROM interface_projections) +
                 (SELECT COUNT(*) FROM interface_sessions) +
+                (SELECT COUNT(*) FROM interface_session_selections) +
                 (SELECT COUNT(*) FROM interface_session_messages) +
                 (SELECT COUNT(*) FROM interface_activity) +
                 (SELECT COUNT(*) FROM interface_pending_approvals) +
@@ -940,7 +1195,86 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
                     turn_session_id,
                     turn_position * 2 + 1,
                 ),
+)
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    # Add session metadata columns if they are missing (e.g. from a v2 database).
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(interface_sessions)"
+        ).fetchall()
+    }
+    for column, ddl in (
+        ("display_name", "ALTER TABLE interface_sessions ADD COLUMN display_name TEXT"),
+        ("origin", "ALTER TABLE interface_sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy'"),
+        ("created_at", "ALTER TABLE interface_sessions ADD COLUMN created_at TEXT"),
+        ("last_activity_at", "ALTER TABLE interface_sessions ADD COLUMN last_activity_at TEXT"),
+    ):
+        if column not in columns:
+            connection.execute(ddl)
+
+    # Rename any remaining empty session identifiers to deterministic legacy ids.
+    empty_sessions = connection.execute(
+        "SELECT channel, session_id FROM interface_sessions WHERE session_id = ''"
+    ).fetchall()
+    for channel, _ in empty_sessions:
+        legacy_id = _legacy_session_id(channel)
+        collision = connection.execute(
+            "SELECT 1 FROM interface_sessions WHERE channel = ? AND session_id = ?",
+            (channel, legacy_id),
+        ).fetchone()
+        if collision is not None:
+            raise RuntimeError(
+                f"Cannot migrate empty session for {channel}: "
+                f"{legacy_id} already exists."
             )
+        for table in (
+            "interface_sessions",
+            "interface_session_messages",
+            "interface_turns",
+            "interface_activity",
+        ):
+            connection.execute(
+                f"""
+                UPDATE {table}
+                SET session_id = ?
+                WHERE channel = ? AND session_id = ''
+                """,
+                (legacy_id, channel),
+            )
+        connection.execute(
+            """
+            UPDATE interface_sessions
+            SET origin = 'legacy', display_name = ?
+            WHERE channel = ? AND session_id = ?
+            """,
+            (f"Legacy {channel}", channel, legacy_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO interface_session_selections (
+                channel, selected_session_id, revision
+            ) VALUES (?, ?, 1)
+            ON CONFLICT (channel) DO UPDATE SET
+                selected_session_id = excluded.selected_session_id,
+                revision = interface_session_selections.revision + 1
+            """,
+            (channel, legacy_id),
+        )
+
+
+def _legacy_session_id(channel: str) -> str:
+    return f"legacy-{channel}"
+
+
+def _isoformat_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _datetime_from_iso(value: object) -> datetime | None:
+    return datetime.fromisoformat(str(value)) if value is not None else None
 
 
 def _merge_state(connection: sqlite3.Connection, state: InterfaceState) -> None:
@@ -953,6 +1287,22 @@ def _merge_state(connection: sqlite3.Connection, state: InterfaceState) -> None:
     _write_projection(connection, "permissions", state.permissions)
     for session in state.sessions:
         _replace_session(connection, session)
+    for channel in dict.fromkeys(session.channel for session in state.sessions):
+        existing = _selected_session_id(connection, channel)
+        if existing is None:
+            first = connection.execute(
+                "SELECT session_id FROM interface_sessions WHERE channel = ? ORDER BY rowid LIMIT 1",
+                (channel,),
+            ).fetchone()
+            if first is not None:
+                connection.execute(
+                    """
+                    INSERT INTO interface_session_selections (
+                        channel, selected_session_id, revision
+                    ) VALUES (?, ?, 1)
+                    """,
+                    (channel, first[0]),
+                )
     if state.activity in _ACTIVITY_RANK:
         connection.execute(
             """
@@ -983,33 +1333,60 @@ def _merge_state(connection: sqlite3.Connection, state: InterfaceState) -> None:
 def _replace_session(
     connection: sqlite3.Connection, session: ChannelSession
 ) -> None:
+    channel = session.channel
+    session_id = session.session_id or _legacy_session_id(channel)
+    origin: SessionOrigin = session.origin or ("legacy" if not session.session_id else "user-created")
+    display_name = session.display_name or (
+        f"Legacy {channel}" if origin == "legacy" else None
+    )
     row = connection.execute(
         "SELECT revision FROM interface_sessions "
         "WHERE channel = ? AND session_id = ?",
-        (session.channel, session.session_id),
+        (channel, session_id),
     ).fetchone()
     if row is None:
         connection.execute(
             """
-            INSERT INTO interface_sessions (channel, session_id, revision)
-            VALUES (?, ?, 1)
+            INSERT INTO interface_sessions (
+                channel, session_id, revision, display_name, origin,
+                created_at, last_activity_at
+            ) VALUES (?, ?, 1, ?, ?, ?, ?)
             """,
-            (session.channel, session.session_id),
+            (
+                channel,
+                session_id,
+                display_name,
+                origin,
+                _isoformat_or_none(session.created_at),
+                _isoformat_or_none(session.last_activity_at),
+            ),
         )
     else:
         connection.execute(
             """
-            UPDATE interface_sessions SET revision = revision + 1
+            UPDATE interface_sessions SET
+                revision = revision + 1,
+                display_name = ?,
+                origin = ?,
+                created_at = ?,
+                last_activity_at = ?
             WHERE channel = ? AND session_id = ?
             """,
-            (session.channel, session.session_id),
+            (
+                display_name,
+                origin,
+                _isoformat_or_none(session.created_at),
+                _isoformat_or_none(session.last_activity_at),
+                channel,
+                session_id,
+            ),
         )
         connection.execute(
             """
             DELETE FROM interface_session_messages
             WHERE channel = ? AND session_id = ?
             """,
-            (session.channel, session.session_id),
+            (channel, session_id),
         )
     for position, message in enumerate(session.messages):
         connection.execute(
@@ -1019,8 +1396,8 @@ def _replace_session(
             ) VALUES (?, ?, ?, ?, ?)
             """,
             (
-                session.channel,
-                session.session_id,
+                channel,
+                session_id,
                 position,
                 message.role,
                 message.content,
@@ -1080,6 +1457,61 @@ def _session_revision(
     return int(row[0]) if row is not None else 0
 
 
+def _selection_revision(connection: sqlite3.Connection, channel: str) -> int:
+    row = connection.execute(
+        "SELECT revision FROM interface_session_selections WHERE channel = ?",
+        (channel,),
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _selected_session_id(connection: sqlite3.Connection, channel: str) -> str | None:
+    row = connection.execute(
+        "SELECT selected_session_id FROM interface_session_selections WHERE channel = ?",
+        (channel,),
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _default_display_name(channel: ChannelName, origin: SessionOrigin) -> str:
+    if origin == "first-use":
+        return "First conversation"
+    if origin == "legacy":
+        return f"Legacy {channel}"
+    return "New conversation"
+
+
+def _channel_session_from_row(
+    connection: sqlite3.Connection, row: tuple[Any, ...]
+) -> ChannelSession:
+    channel = cast(ChannelName, str(row[0]))
+    session_id = str(row[1])
+    messages = tuple(
+        ChannelMessage(
+            cast(Literal["user", "assistant"], str(message_row[0])),
+            str(message_row[1]),
+        )
+        for message_row in connection.execute(
+            """
+            SELECT role, content FROM interface_session_messages
+            WHERE channel = ? AND session_id = ?
+            ORDER BY position
+            """,
+            (channel, session_id),
+        ).fetchall()
+    )
+    return ChannelSession(
+        channel=channel,
+        session_id=session_id,
+        messages=messages,
+        display_name=row[2],
+        origin=cast(SessionOrigin, str(row[3])),
+        created_at=_datetime_from_iso(row[4]),
+        last_activity_at=_datetime_from_iso(row[5]),
+        revision=int(row[6]),
+    )
+
+
 def _receipt_revision(connection: sqlite3.Connection, run_id: str) -> int:
     row = connection.execute(
         "SELECT revision FROM interface_receipts WHERE run_id = ?", (run_id,)
@@ -1132,7 +1564,7 @@ def _load_state(connection: sqlite3.Connection) -> InterfaceState:
     }
     sessions = tuple(
         ChannelSession(
-            channel=session_row[0],
+            channel=cast(ChannelName, str(session_row[0])),
             session_id=str(session_row[1]),
             messages=tuple(
                 ChannelMessage(
@@ -1148,10 +1580,20 @@ def _load_state(connection: sqlite3.Connection) -> InterfaceState:
                     (session_row[0], session_row[1]),
                 ).fetchall()
             ),
+            display_name=session_row[2],
+            origin=cast(SessionOrigin, str(session_row[3])),
+            created_at=_datetime_from_iso(session_row[4]),
+            last_activity_at=_datetime_from_iso(session_row[5]),
+            revision=int(session_row[6]),
         )
         for session_row in connection.execute(
-            "SELECT channel, session_id FROM interface_sessions "
-            "ORDER BY rowid"
+            """
+            SELECT
+                channel, session_id, display_name, origin, created_at,
+                last_activity_at, revision
+            FROM interface_sessions
+            ORDER BY rowid
+            """
         ).fetchall()
     )
     activity_rows = connection.execute(

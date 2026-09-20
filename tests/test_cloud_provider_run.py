@@ -15,6 +15,10 @@ from reckoning.application import (
     ProtectedResponsePolicy,
     ReckoningApplication,
 )
+from reckoning.conversation_safety import (
+    classify_danger,
+    classify_output,
+)
 from reckoning.providers import (
     DeepSeekModelProvider,
     OrcaRouterModelProvider,
@@ -110,6 +114,8 @@ def test_orcarouter_uses_same_boundary_and_records_billable_units() -> None:
         "billable_units": 129,
         "usage_status": "reported",
         "failure": None,
+        "output_policy_decision": classify_output("Choose the smaller proof."),
+        "danger_decision": classify_danger("Compare these options."),
     }
 
 

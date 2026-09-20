@@ -172,6 +172,8 @@ def test_existing_receipts_migrate_once_without_losing_fields(tmp_path: Path) ->
             "billable_units": 18,
             "usage_status": "reported",
             "failure": None,
+            "output_policy_decision": None,
+            "danger_decision": None,
         },
         {
             "id": "run-failed",
@@ -187,6 +189,8 @@ def test_existing_receipts_migrate_once_without_losing_fields(tmp_path: Path) ->
             "billable_units": 18,
             "usage_status": "reported",
             "failure": "Provider outcome and cost are uncertain.",
+            "output_policy_decision": None,
+            "danger_decision": None,
         },
     ]
     assert (source / ROOT_DATABASE_FILENAME).is_file()

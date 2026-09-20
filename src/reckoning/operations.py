@@ -392,30 +392,22 @@ def _write_staged_setup(
             processing_location=processing_location,
         )
     if first_conversation is not None:
-        from reckoning.interfaces import (
-            ChannelMessage,
-            ChannelSession,
-            InterfaceState,
-            JsonFileInterfaceRepository,
-        )
+        from reckoning.interfaces import JsonFileInterfaceRepository
 
         confirmed_route = next(
             route for route in routes if route.category == "confirmed-state"
         )
         user_text, assistant_text = first_conversation
-        JsonFileInterfaceRepository(confirmed_route.root / "interfaces.json").save(
-            InterfaceState(
-                sessions=(
-                    ChannelSession(
-                        "web",
-                        "",
-                        (
-                            ChannelMessage("user", user_text),
-                            ChannelMessage("assistant", assistant_text),
-                        ),
-                    ),
-                )
-            )
+        repository = JsonFileInterfaceRepository(
+            confirmed_route.root / "interfaces.json"
+        )
+        session = repository.start_first_session("web", display_name="First conversation")
+        repository.append_completed_turn(
+            "web",
+            session.session_id,
+            user_text,
+            assistant_text,
+            expected_revision=session.revision,
         )
     atomic_write_json(
         local_staging / "release-evidence.json",

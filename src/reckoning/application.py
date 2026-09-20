@@ -27,13 +27,21 @@ from reckoning.continuity import (
 )
 from reckoning.conversation import (
     PROTECTED_PRODUCT_CONTRACT,
+    ChannelCapabilities,
     ComposerInput,
     ConversationReply,
     ContextStatus,
+    HistorySelection,
     ProviderConversation,
     ProviderMessage,
     ProviderMessageRole,
     compose_provider_conversation,
+)
+from reckoning.conversation_safety import (
+    DangerDecision,
+    OutputPolicyDecision,
+    classify_danger,
+    classify_output,
 )
 from reckoning.external_content import ExternalContentResult
 from reckoning.personal_context import (
@@ -136,6 +144,8 @@ class ModelRunRecord:
     billable_units: int
     usage_status: ModelRunUsageStatus
     failure: str | None = None
+    output_policy_decision: OutputPolicyDecision | None = None
+    danger_decision: DangerDecision | None = None
 
 
 class ModelRunRepository(Protocol):
@@ -170,57 +180,31 @@ class ApplicationDependencies:
     processing_scope: ProcessingScope | UnrestrictedProcessingScope = field(
         default_factory=UnrestrictedProcessingScope
     )
+    context_window: int | None = None
 
 
 class ProtectedResponsePolicy:
-    _prohibited_response_fragments = (
-        "you are worthless",
-        "you're worthless",
-        "you are a failure as a person",
-        "do not speak to anyone else",
-        "don't speak to anyone else",
-        "do not need anyone else",
-        "don't need anyone else",
-        "you only need me",
-        "never leave me",
-        "as your therapist",
-        "your diagnosis is",
-    )
+    """Backward-compatible wrapper around the typed conversation safety policy."""
+
+    def evaluate_danger(self, user_message: str) -> DangerDecision:
+        return classify_danger(user_message)
 
     def immediate_danger_response(self, user_message: str) -> str | None:
-        normalized = user_message.casefold()
-        danger_is_current = "right now" in normalized or "immediate danger" in normalized
-        danger_is_credible = any(
-            phrase in normalized
-            for phrase in (
-                "hurt myself",
-                "kill myself",
-                "hurt someone",
-                "someone might hurt me",
-                "someone is threatening me",
+        decision = self.evaluate_danger(user_message)
+        if decision.response_kind == "emergency-help":
+            return (
+                "If you are in immediate danger, contact local emergency services now "
+                "or go to the nearest emergency department. If you can, contact a "
+                "trusted person nearby and do not stay alone. I can help you focus on "
+                "the next practical step, but I am not a clinician or an emergency service."
             )
-        )
-        if not (danger_is_current and danger_is_credible):
-            return None
-        return (
-            "If you are in immediate danger, contact local emergency services now "
-            "or go to the nearest emergency department. If you can, contact a "
-            "trusted person nearby and do not stay alone. I can help you focus on "
-            "the next practical step, but I am not a clinician or an emergency service."
-        )
+        return None
+
+    def evaluate_output(self, proposed_response: str) -> OutputPolicyDecision:
+        return classify_output(proposed_response)
 
     def apply(self, proposed_response: str) -> str:
-        normalized = proposed_response.casefold()
-        if any(
-            fragment in normalized
-            for fragment in self._prohibited_response_fragments
-        ):
-            return (
-                "That request crosses a protected boundary. I can challenge your "
-                "choice and reasoning, but not your worth or your relationships. "
-                "You remain the authority over what you do."
-            )
-        return proposed_response
+        return self.evaluate_output(proposed_response).delivered_speech
 
 
 class ReckoningApplication:
@@ -425,6 +409,14 @@ class ReckoningApplication:
             if available_connectors is None
             else available_connectors
         )
+        provider_conversation, history_selection = self._compose_provider_conversation(
+            user_message,
+            recent_history,
+            connectors,
+            retrieved_context=profile_context + supplied_context,
+            confirmed_records=confirmed_records,
+            permissions=permissions,
+        )
         request = ModelRequest(
             user_message=user_message,
             history=recent_history,
@@ -434,14 +426,7 @@ class ReckoningApplication:
             processing_destination=(
                 self._dependencies.processing_scope.destination.id
             ),
-            provider_conversation=self._compose_provider_conversation(
-                user_message,
-                recent_history,
-                connectors,
-                retrieved_context=profile_context + supplied_context,
-                confirmed_records=confirmed_records,
-                permissions=permissions,
-            ),
+            provider_conversation=provider_conversation,
         )
         try:
             provider_result = self._normalize_provider_response(
@@ -473,7 +458,13 @@ class ReckoningApplication:
                     "user", user_message, requested_at
                 )
             raise RuntimeError("The model provider returned an empty response.")
-        speech = self._dependencies.response_policy.apply(proposed_response)
+        output_policy = self._dependencies.response_policy.evaluate_output(
+            proposed_response
+        )
+        speech = output_policy.delivered_speech
+        danger_decision = self._dependencies.response_policy.evaluate_danger(
+            user_message
+        )
 
         notices: list[str] = []
         if profile_missing:
@@ -484,15 +475,27 @@ class ReckoningApplication:
                 + ", ".join(processing.unavailable_categories)
                 + "."
             )
+        if history_selection.omitted_turn_count > 0:
+            notices.append(
+                f"Limited context: {history_selection.omitted_turn_count} earlier "
+                f"turn{' was' if history_selection.omitted_turn_count == 1 else 's were'} "
+                "omitted to fit the model context window."
+            )
         run_status: ModelRunStatus = (
             "limited"
-            if (notices or speech != proposed_response)
+            if (
+                notices
+                or output_policy.action != "allow"
+                or danger_decision.kind != "none"
+            )
             else "succeeded"
         )
         run_record = self._model_run_record(
             provider_result,
             requested_at=requested_at,
             status=run_status,
+            output_policy_decision=output_policy,
+            danger_decision=danger_decision,
         )
         self._dependencies.model_runs.save_run(run_record)
 
@@ -521,6 +524,7 @@ class ReckoningApplication:
             notices=tuple(notices),
             context_status=context_status,
             model_run_id=run_record.id,
+            history_selection=history_selection,
         )
 
     def open_session(self) -> tuple[Message, ...]:
@@ -971,7 +975,7 @@ class ReckoningApplication:
         retrieved_context: tuple[str, ...] = (),
         confirmed_records: tuple[str, ...] = (),
         permissions: tuple[str, ...] = (),
-    ) -> ProviderConversation:
+    ) -> tuple[ProviderConversation, HistorySelection]:
         history = tuple(
             ProviderMessage(cast(ProviderMessageRole, str(message.role)), message.content)
             for message in recent_history
@@ -991,6 +995,8 @@ class ReckoningApplication:
                 retrieved_context=retrieved_context,
                 available_connectors=available_connectors,
                 history=history,
+                context_window=self._dependencies.context_window,
+                channel_capabilities=ChannelCapabilities(),
             )
         )
 
@@ -1053,6 +1059,8 @@ class ReckoningApplication:
         requested_at: datetime,
         status: ModelRunStatus,
         failure: str | None = None,
+        output_policy_decision: OutputPolicyDecision | None = None,
+        danger_decision: DangerDecision | None = None,
     ) -> ModelRunRecord:
         return ModelRunRecord(
             id=self._dependencies.identifiers.new(),
@@ -1073,6 +1081,8 @@ class ReckoningApplication:
                 response.usage.total_tokens,
             ),
             failure=failure,
+            output_policy_decision=output_policy_decision,
+            danger_decision=danger_decision,
         )
 
     def _reckoning_run_record(
@@ -1286,5 +1296,6 @@ def create_local_application(
             model_runs=model_runs,
             personal_context=personal_context,
             processing_scope=processing_scope,
+            context_window=provider_config.context_window if provider_config is not None else None,
         )
     )

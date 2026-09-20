@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
-from dataclasses import asdict
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
+from reckoning.conversation_safety import (
+    COVERAGE_VERSION,
+    DangerDecision,
+    OutputPolicyDecision,
+)
 from reckoning.json_store import atomic_write_json, read_json
 from reckoning.root_database import (
     ROOT_DATABASE_FILENAME,
@@ -26,7 +30,48 @@ if TYPE_CHECKING:
     from reckoning.application import ModelRunRecord, ModelRunUsageStatus
 
 
-MODEL_RUN_SCHEMA_VERSION = "1"
+MODEL_RUN_SCHEMA_VERSION = "2"
+
+
+def _load_output_policy_decision(
+    action: object, reason_code: object, delivered_speech: object
+) -> OutputPolicyDecision | None:
+    if action is None or reason_code is None or delivered_speech is None:
+        return None
+    return OutputPolicyDecision(
+        action=cast(Literal["allow", "replace", "uncertain"], str(action)),
+        reason_code=str(reason_code),
+        delivered_speech=str(delivered_speech),
+        coverage_version=COVERAGE_VERSION,
+    )
+
+
+def _load_danger_decision(
+    kind: object, response_kind: object, reason_code: object
+) -> DangerDecision | None:
+    if kind is None or response_kind is None or reason_code is None:
+        return None
+    return DangerDecision(
+        kind=cast(
+            Literal[
+                "none",
+                "current-self-danger",
+                "current-other-danger",
+                "ambiguous-concern",
+                "quotation",
+                "historical",
+                "hypothetical",
+                "uncertain",
+            ],
+            str(kind),
+        ),
+        response_kind=cast(
+            Literal["none", "emergency-help", "safe-replacement", "uncertain-boundary"],
+            str(response_kind),
+        ),
+        reason_code=str(reason_code),
+        coverage_version=COVERAGE_VERSION,
+    )
 
 
 class SQLiteModelRunRepository:
@@ -43,6 +88,8 @@ class SQLiteModelRunRepository:
         return self._path
 
     def save_run(self, run: ModelRunRecord) -> None:
+        output_policy = run.output_policy_decision
+        danger = run.danger_decision
         with closing(connect_database(self._path)) as connection, connection:
             connection.execute(
                 """
@@ -59,8 +106,14 @@ class SQLiteModelRunRepository:
                     output_tokens,
                     billable_units,
                     usage_status,
-                    failure
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    failure,
+                    output_policy_action,
+                    output_policy_reason_code,
+                    output_policy_delivered_speech,
+                    danger_kind,
+                    danger_response_kind,
+                    danger_reason_code
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.id,
@@ -76,6 +129,12 @@ class SQLiteModelRunRepository:
                     run.billable_units,
                     run.usage_status,
                     run.failure,
+                    output_policy.action if output_policy is not None else None,
+                    output_policy.reason_code if output_policy is not None else None,
+                    output_policy.delivered_speech if output_policy is not None else None,
+                    danger.kind if danger is not None else None,
+                    danger.response_kind if danger is not None else None,
+                    danger.reason_code if danger is not None else None,
                 ),
             )
 
@@ -98,7 +157,13 @@ class SQLiteModelRunRepository:
                     output_tokens,
                     billable_units,
                     usage_status,
-                    failure
+                    failure,
+                    output_policy_action,
+                    output_policy_reason_code,
+                    output_policy_delivered_speech,
+                    danger_kind,
+                    danger_response_kind,
+                    danger_reason_code
                 FROM model_runs
                 ORDER BY sequence
                 """
@@ -118,6 +183,12 @@ class SQLiteModelRunRepository:
                 billable_units=int(row[10]),
                 usage_status=row[11],
                 failure=str(row[12]) if row[12] is not None else None,
+                output_policy_decision=_load_output_policy_decision(
+                    row[13], row[14], row[15]
+                ),
+                danger_decision=_load_danger_decision(
+                    row[16], row[17], row[18]
+                ),
             )
             for row in rows
         )
@@ -157,6 +228,8 @@ class SQLiteModelRunRepository:
                 current_version = metadata(connection, "model_runs_schema_version")
                 if current_version not in (None, MODEL_RUN_SCHEMA_VERSION):
                     raise RuntimeError("Unsupported model-run storage schema.")
+                if current_version == "1":
+                    _migrate_v1_to_v2(connection)
                 if current_version is None:
                     existing = int(
                         connection.execute(
@@ -259,6 +332,21 @@ def validate_database_bytes(content: bytes) -> None:
         validate_database(path)
 
 
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    for column in (
+        "output_policy_action",
+        "output_policy_reason_code",
+        "output_policy_delivered_speech",
+        "danger_kind",
+        "danger_response_kind",
+        "danger_reason_code",
+    ):
+        connection.execute(
+            f"ALTER TABLE model_runs ADD COLUMN {column} TEXT"
+        )
+    set_metadata(connection, "model_runs_schema_version", MODEL_RUN_SCHEMA_VERSION)
+
+
 def _create_schema(connection: sqlite3.Connection) -> None:
     ensure_root_schema(connection)
     connection.execute(
@@ -279,7 +367,13 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             usage_status TEXT NOT NULL CHECK (
                 usage_status IN ('reported', 'not-billable', 'unknown')
             ),
-            failure TEXT
+            failure TEXT,
+            output_policy_action TEXT,
+            output_policy_reason_code TEXT,
+            output_policy_delivered_speech TEXT,
+            danger_kind TEXT,
+            danger_response_kind TEXT,
+            danger_reason_code TEXT
         )
         """
     )
@@ -434,28 +528,37 @@ def _finalize_legacy_authority(database: Path, legacy_path: Path) -> None:
 
 
 def _insert_run(connection: sqlite3.Connection, run: ModelRunRecord) -> None:
-    values = asdict(run)
+    output_policy = run.output_policy_decision
+    danger = run.danger_decision
     connection.execute(
         """
         INSERT INTO model_runs (
             id, requested_at, status, provider, model, model_calls, latency_ms,
-            retries, input_tokens, output_tokens, billable_units, usage_status, failure
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            retries, input_tokens, output_tokens, billable_units, usage_status, failure,
+            output_policy_action, output_policy_reason_code, output_policy_delivered_speech,
+            danger_kind, danger_response_kind, danger_reason_code
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            values["id"],
+            run.id,
             run.requested_at.isoformat(),
-            values["status"],
-            values["provider"],
-            values["model"],
-            values["model_calls"],
-            values["latency_ms"],
-            values["retries"],
-            values["input_tokens"],
-            values["output_tokens"],
-            values["billable_units"],
-            values["usage_status"],
-            values["failure"],
+            run.status,
+            run.provider,
+            run.model,
+            run.model_calls,
+            run.latency_ms,
+            run.retries,
+            run.input_tokens,
+            run.output_tokens,
+            run.billable_units,
+            run.usage_status,
+            run.failure,
+            output_policy.action if output_policy is not None else None,
+            output_policy.reason_code if output_policy is not None else None,
+            output_policy.delivered_speech if output_policy is not None else None,
+            danger.kind if danger is not None else None,
+            danger.response_kind if danger is not None else None,
+            danger.reason_code if danger is not None else None,
         ),
     )
 

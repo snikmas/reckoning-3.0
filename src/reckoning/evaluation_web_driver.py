@@ -540,6 +540,8 @@ class WebEvaluationDriver:
 
     @staticmethod
     def _extract_assistant_text(body: bytes) -> str:
+        import re
+
         text = body.decode("utf-8")
         # Extract the most recent assistant message from the rendered page.
         # This is a coarse heuristic for fake-mode authority scoring only.
@@ -547,11 +549,15 @@ class WebEvaluationDriver:
         index = text.rfind(marker)
         if index == -1:
             return ""
-        start = text.find("<p>", index)
-        end = text.find("</p>", start)
-        if start == -1 or end == -1:
-            return ""
-        return text[start + 3 : end]
+        article_start = text.rfind('<article', 0, index)
+        article_end = text.find("</article>", index)
+        if article_end == -1:
+            article_end = len(text)
+        block = text[article_start:article_end]
+        cleaned = re.sub(r"<[^>]+>", "", block)
+        if cleaned.startswith("Simon"):
+            cleaned = cleaned[len("Simon") :].lstrip()
+        return cleaned
 
 
 class MissingImplementationError(RuntimeError):

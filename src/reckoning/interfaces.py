@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
-from reckoning.conversation import ContextStatus, ConversationReply
+from reckoning.conversation import (
+    ChannelCapabilities,
+    ContextStatus,
+    ConversationReply,
+    HistorySelection,
+)
 
 
 
@@ -142,11 +147,30 @@ class ChannelMessage:
     content: str
 
 
+SessionOrigin = Literal["first-use", "user-created", "legacy"]
+
+
 @dataclass(frozen=True)
 class ChannelSession:
     channel: ChannelName
-    session_id: str = ""
+    session_id: str
     messages: tuple[ChannelMessage, ...] = ()
+    display_name: str | None = None
+    origin: SessionOrigin = "user-created"
+    created_at: datetime | None = None
+    last_activity_at: datetime | None = None
+    revision: int = 0
+
+    @property
+    def id(self) -> str:
+        return self.session_id
+
+
+@dataclass(frozen=True)
+class ChannelSelection:
+    channel: ChannelName
+    selected_session_id: str
+    revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -248,6 +272,32 @@ class InterfaceRepository(Protocol):
 
     def save(self, state: InterfaceState) -> None: ...
 
+    def create_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None,
+        origin: SessionOrigin,
+        created_at: datetime,
+    ) -> ChannelSession: ...
+
+    def list_sessions(self, channel: ChannelName) -> tuple[ChannelSession, ...]: ...
+
+    def select_session(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        *,
+        expected_selection_revision: int,
+    ) -> ChannelSelection: ...
+
+    def get_selected_session(self, channel: ChannelName) -> ChannelSelection | None: ...
+
+    def start_first_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None = None,
+    ) -> ChannelSession: ...
+
     def session_revision(self, channel: ChannelName, session_id: str) -> int: ...
 
     def projection_revision(self, projection: str) -> int: ...
@@ -304,7 +354,7 @@ class InterfaceRepository(Protocol):
     def list_turns(
         self,
         channel: ChannelName,
-        session_id: str = "",
+        session_id: str | None = None,
     ) -> tuple[ChannelTurn, ...]: ...
 
     def set_activity(
@@ -340,9 +390,12 @@ class InMemoryInterfaceRepository:
     def __init__(self, state: InterfaceState | None = None) -> None:
         self._state = state or InterfaceState()
         self._session_revisions: dict[tuple[str, str], int] = {
-            (session.channel, session.session_id): 1
+            (session.channel, session.session_id): session.revision or 1
             for session in self._state.sessions
+            if session.session_id
         }
+        self._selection_revisions: dict[str, int] = {}
+        self._selections: dict[str, str] = {}
         self._projection_revisions: dict[str, int] = {}
         self._approval_revisions: dict[str, int] = {
             approval_id: 1 for approval_id in self._state.pending_approvals
@@ -355,12 +408,92 @@ class InMemoryInterfaceRepository:
     def save(self, state: InterfaceState) -> None:
         self._state = state
         self._session_revisions = {
-            (session.channel, session.session_id): 1 for session in state.sessions
+            (session.channel, session.session_id): session.revision or 1
+            for session in state.sessions
+            if session.session_id
         }
-        self._projection_revisions = {}
-        self._approval_revisions = {
-            approval_id: 1 for approval_id in state.pending_approvals
-        }
+
+    def create_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None,
+        origin: SessionOrigin,
+        created_at: datetime,
+    ) -> ChannelSession:
+        session_id = str(uuid4())
+        session = ChannelSession(
+            channel=channel,
+            session_id=session_id,
+            messages=(),
+            display_name=display_name,
+            origin=origin,
+            created_at=created_at,
+            last_activity_at=created_at,
+            revision=1,
+        )
+        self._state = replace(
+            self._state, sessions=self._state.sessions + (session,)
+        )
+        self._session_revisions[(channel, session_id)] = 1
+        return session
+
+    def list_sessions(self, channel: ChannelName) -> tuple[ChannelSession, ...]:
+        return tuple(
+            session
+            for session in self._state.sessions
+            if session.channel == channel
+        )
+
+    def select_session(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        *,
+        expected_selection_revision: int,
+    ) -> ChannelSelection:
+        if not any(
+            session.channel == channel and session.session_id == session_id
+            for session in self._state.sessions
+        ):
+            raise KeyError(f"Unknown session: {session_id}")
+        actual = self._selection_revisions.get(channel, 0)
+        if actual != expected_selection_revision:
+            raise InterfaceSessionConflict(
+                channel, session_id, expected_selection_revision, actual
+            )
+        self._selections[channel] = session_id
+        self._selection_revisions[channel] = actual + 1
+        return ChannelSelection(channel, session_id, actual + 1)
+
+    def get_selected_session(self, channel: ChannelName) -> ChannelSelection | None:
+        session_id = self._selections.get(channel)
+        if session_id is None:
+            return None
+        return ChannelSelection(
+            channel, session_id, self._selection_revisions.get(channel, 0)
+        )
+
+    def start_first_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None = None,
+    ) -> ChannelSession:
+        existing = next(
+            (
+                session
+                for session in self._state.sessions
+                if session.channel == channel and session.origin == "first-use"
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        return self.create_session(
+            channel,
+            display_name or "First conversation",
+            "first-use",
+            datetime.now(timezone.utc),
+        )
 
     def session_revision(self, channel: ChannelName, session_id: str) -> int:
         return self._session_revisions.get((channel, session_id), 0)
@@ -404,20 +537,26 @@ class InMemoryInterfaceRepository:
             )
         existing = _find_session(self._state, channel, session_id)
         combined = existing.messages + messages
+        session = replace(
+            existing,
+            messages=combined,
+            last_activity_at=datetime.now(timezone.utc),
+            revision=actual + 1,
+        )
         sessions = tuple(
             session
             for session in self._state.sessions
             if not (
                 session.channel == channel and session.session_id == session_id
             )
-        ) + (ChannelSession(channel, session_id, combined),)
+        ) + (session,)
         self._state = replace(
             self._state,
             sessions=sessions,
             returning_user=self._state.returning_user or returning_user,
         )
         self._session_revisions[(channel, session_id)] = actual + 1
-        return ChannelSession(channel, session_id, combined)
+        return session
 
     def reserve_turn(
         self,
@@ -488,13 +627,19 @@ class InMemoryInterfaceRepository:
             ChannelMessage("user", user_speech),
             ChannelMessage("assistant", assistant_speech),
         )
+        session = replace(
+            existing,
+            messages=combined,
+            last_activity_at=datetime.now(timezone.utc),
+            revision=self._session_revisions.get((channel, session_id), 0) + 1,
+        )
         sessions = tuple(
             session
             for session in self._state.sessions
             if not (
                 session.channel == channel and session.session_id == session_id
             )
-        ) + (ChannelSession(channel, session_id, combined),)
+        ) + (session,)
         self._state = replace(
             self._state,
             sessions=sessions,
@@ -525,8 +670,11 @@ class InMemoryInterfaceRepository:
     def list_turns(
         self,
         channel: ChannelName,
-        session_id: str = "",
+        session_id: str | None = None,
     ) -> tuple[ChannelTurn, ...]:
+        if not session_id:
+            selection = self.get_selected_session(channel)
+            session_id = selection.selected_session_id if selection is not None else ""
         return tuple(
             turn
             for turn in self._turns
@@ -630,6 +778,41 @@ class JsonFileInterfaceRepository:
     def save(self, state: InterfaceState) -> None:
         self._delegate.save(state)
 
+    def create_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None,
+        origin: SessionOrigin,
+        created_at: datetime,
+    ) -> ChannelSession:
+        return self._delegate.create_session(
+            channel, display_name, origin, created_at
+        )
+
+    def list_sessions(self, channel: ChannelName) -> tuple[ChannelSession, ...]:
+        return self._delegate.list_sessions(channel)
+
+    def select_session(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        *,
+        expected_selection_revision: int,
+    ) -> ChannelSelection:
+        return self._delegate.select_session(
+            channel, session_id, expected_selection_revision=expected_selection_revision
+        )
+
+    def get_selected_session(self, channel: ChannelName) -> ChannelSelection | None:
+        return self._delegate.get_selected_session(channel)
+
+    def start_first_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None = None,
+    ) -> ChannelSession:
+        return self._delegate.start_first_session(channel, display_name)
+
     def session_revision(self, channel: ChannelName, session_id: str) -> int:
         return self._delegate.session_revision(channel, session_id)
 
@@ -719,7 +902,7 @@ class JsonFileInterfaceRepository:
     def list_turns(
         self,
         channel: ChannelName,
-        session_id: str = "",
+        session_id: str | None = None,
     ) -> tuple[ChannelTurn, ...]:
         return self._delegate.list_turns(channel, session_id)
 
@@ -777,6 +960,7 @@ class ChannelRequest:
     limited: bool
     required_processing_categories: tuple[str, ...] = ()
     safe_when_incomplete: bool = True
+    capabilities: ChannelCapabilities = ChannelCapabilities()
 
 
 @dataclass(frozen=True)
@@ -785,6 +969,7 @@ class ChannelResponse:
     notices: tuple[str, ...]
     context_status: ContextStatus | None = None
     model_run_id: str | None = None
+    history_selection: HistorySelection | None = None
 
 
 class ChannelResponder(Protocol):
@@ -833,6 +1018,7 @@ class ApplicationChannelResponder:
             notices=reply.notices,
             context_status=reply.context_status,
             model_run_id=reply.model_run_id,
+            history_selection=reply.history_selection,
         )
 
 
@@ -987,15 +1173,24 @@ class ReckoningInterfaceApplication:
         channel: ChannelName,
         text: str,
         *,
-        session_id: str = "",
+        session_id: str | None = None,
+        expected_session_revision: int | None = None,
         required_categories: tuple[str, ...] | None = None,
         safe_when_incomplete: bool = True,
     ) -> ChannelReply:
         message = text.strip()
         if not message:
             raise ValueError("A message cannot be empty.")
+        if session_id is None:
+            selected = self.selected_channel_session(channel)
+            if selected is None:
+                session = self._ensure_channel_session(channel)
+                session_id = session.session_id
+            else:
+                session_id = selected.session_id
+        if expected_session_revision is None:
+            expected_session_revision = self.session_revision(channel, session_id)
         state = self._repository.load()
-        expected_revision = self._repository.session_revision(channel, session_id)
         turn_id: str | None = None
         placement: PlacementOutcome | None = None
         self._repository.set_activity(
@@ -1038,7 +1233,7 @@ class ReckoningInterfaceApplication:
                 session_id,
                 message,
                 turn_id,
-                expected_revision=expected_revision,
+                expected_revision=expected_session_revision,
             )
             channel_response = self._responder.respond(
                 ChannelRequest(
@@ -1057,6 +1252,7 @@ class ReckoningInterfaceApplication:
                         categories
                     ),
                     safe_when_incomplete=safe_when_incomplete,
+                    capabilities=ChannelCapabilities(),
                 )
             )
             speech = channel_response.speech.strip()
@@ -1090,20 +1286,89 @@ class ReckoningInterfaceApplication:
             )
             raise
 
+    def list_channel_sessions(self, channel: ChannelName) -> tuple[ChannelSession, ...]:
+        return self._repository.list_sessions(channel)
+
+    def create_channel_session(
+        self,
+        channel: ChannelName,
+        display_name: str | None = None,
+        origin: SessionOrigin = "user-created",
+    ) -> ChannelSession:
+        return self._repository.create_session(
+            channel,
+            display_name,
+            origin,
+            datetime.now(timezone.utc),
+        )
+
+    def select_channel_session(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        *,
+        expected_selection_revision: int,
+    ) -> ChannelSelection:
+        return self._repository.select_session(
+            channel,
+            session_id,
+            expected_selection_revision=expected_selection_revision,
+        )
+
+    def session_revision(self, channel: ChannelName, session_id: str) -> int:
+        return self._repository.session_revision(channel, session_id)
+
+    def selected_channel_session(self, channel: ChannelName) -> ChannelSession | None:
+        selection = self._repository.get_selected_session(channel)
+        if selection is None:
+            return None
+        return next(
+            (
+                session
+                for session in self._repository.list_sessions(channel)
+                if session.session_id == selection.selected_session_id
+            ),
+            None,
+        )
+
+    def _selected_session_id(self, channel: ChannelName) -> str:
+        selection = self._repository.get_selected_session(channel)
+        return selection.selected_session_id if selection is not None else ""
+
+    def _ensure_channel_session(self, channel: ChannelName) -> ChannelSession:
+        selected = self.selected_channel_session(channel)
+        if selected is not None:
+            return selected
+        session = self.create_channel_session(
+            channel,
+            display_name="First conversation",
+            origin="first-use",
+        )
+        self.select_channel_session(
+            channel,
+            session.session_id,
+            expected_selection_revision=0,
+        )
+        return session
+
     def channel_session(
         self,
         channel: ChannelName,
         *,
-        session_id: str = "",
+        session_id: str | None = None,
     ) -> tuple[ChannelMessage, ...]:
+        if session_id is None:
+            session_id = self._selected_session_id(channel)
         return self._session(self._repository.load(), channel, session_id).messages
 
     def channel_notices(
         self,
         channel: ChannelName,
         *,
-        session_id: str = "",
+        session_id: str | None = None,
     ) -> tuple[str, ...]:
+        if session_id is None:
+            session_id = self._selected_session_id(channel)
         turns = self._repository.list_turns(channel, session_id)
         for turn in reversed(turns):
             if turn.state == "completed":
@@ -1116,7 +1381,7 @@ class ReckoningInterfaceApplication:
         user_text: str,
         assistant_text: str,
         *,
-        session_id: str = "",
+        session_id: str,
     ) -> None:
         """Persist one channel exchange that needed no model call."""
         self._repository.append_completed_turn(
@@ -1158,7 +1423,7 @@ class ReckoningInterfaceApplication:
         channel: ChannelName,
         text: str,
         *,
-        session_id: str = "",
+        session_id: str,
     ) -> ChannelMessage:
         content = text.strip()
         if not content:
@@ -1394,7 +1659,29 @@ def _state_to_data(state: InterfaceState) -> dict[str, object]:
             {**asdict(failure), "occurred_at": failure.occurred_at.isoformat()}
             for failure in state.failures
         ],
-        "sessions": [asdict(session) for session in state.sessions],
+        "sessions": [_channel_session_to_data(session) for session in state.sessions],
+    }
+
+
+def _channel_session_to_data(session: ChannelSession) -> dict[str, object]:
+    return {
+        "channel": session.channel,
+        "session_id": session.session_id,
+        "messages": [
+            {"role": message.role, "content": message.content}
+            for message in session.messages
+        ],
+        "display_name": session.display_name,
+        "origin": session.origin,
+        "created_at": (
+            session.created_at.isoformat() if session.created_at is not None else None
+        ),
+        "last_activity_at": (
+            session.last_activity_at.isoformat()
+            if session.last_activity_at is not None
+            else None
+        ),
+        "revision": session.revision,
     }
 
 
@@ -1457,17 +1744,32 @@ def _state_from_data(data: dict[str, Any]) -> InterfaceState:
             for item in data.get("failures", [])
         ),
         sessions=tuple(
-            ChannelSession(
-                channel=str(item["channel"]),  # type: ignore[arg-type]
-                session_id=str(item.get("session_id", "")),
-                messages=tuple(
-                    ChannelMessage(
-                        role=str(message["role"]),  # type: ignore[arg-type]
-                        content=str(message["content"]),
-                    )
-                    for message in item.get("messages", [])
-                ),
-            )
+            _channel_session_from_data(item)
             for item in data.get("sessions", [])
         ),
+    )
+
+
+def _channel_session_from_data(item: dict[str, Any]) -> ChannelSession:
+    created_at = item.get("created_at")
+    last_activity_at = item.get("last_activity_at")
+    return ChannelSession(
+        channel=str(item["channel"]),  # type: ignore[arg-type]
+        session_id=str(item.get("session_id", "")),
+        messages=tuple(
+            ChannelMessage(
+                role=str(message["role"]),  # type: ignore[arg-type]
+                content=str(message["content"]),
+            )
+            for message in item.get("messages", [])
+        ),
+        display_name=item.get("display_name"),
+        origin=str(item.get("origin", "legacy")),  # type: ignore[arg-type]
+        created_at=datetime.fromisoformat(str(created_at)) if created_at else None,
+        last_activity_at=(
+            datetime.fromisoformat(str(last_activity_at))
+            if last_activity_at
+            else None
+        ),
+        revision=int(item.get("revision", 0)),
     )

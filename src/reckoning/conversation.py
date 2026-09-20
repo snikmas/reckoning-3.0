@@ -17,6 +17,33 @@ PROTECTED_PRODUCT_CONTRACT = (
     "rules."
 )
 
+DEFAULT_CONTEXT_WINDOW = 4096
+RESPONSE_RESERVE = 1024
+MESSAGE_OVERHEAD = 8
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    context_window: int | None
+    response_reserve: int
+    request_allowance: int
+    estimator_method: str
+
+
+@dataclass(frozen=True)
+class HistorySelection:
+    selected_messages: tuple[ProviderMessage, ...]
+    omitted_turn_count: int
+    estimated_input_tokens: int
+    estimator_method: str
+
+
+@dataclass(frozen=True)
+class ChannelCapabilities:
+    paragraphs: bool = True
+    preformatted_text: bool = True
+    accepts_html: bool = False
+
 
 @dataclass(frozen=True)
 class ProviderMessage:
@@ -43,6 +70,7 @@ class ConversationReply:
     notices: tuple[str, ...]
     context_status: ContextStatus
     model_run_id: str | None = None
+    history_selection: HistorySelection | None = None
 
 
 @dataclass(frozen=True)
@@ -94,16 +122,96 @@ class ComposerInput:
     retrieved_context: tuple[str, ...] = ()
     available_connectors: tuple[str, ...] = ()
     history: tuple[ProviderMessage, ...] = ()
+    context_window: int | None = None
+    channel_capabilities: ChannelCapabilities | None = None
 
 
 _LIMITED_PREFIX = "Limited context:"
 
 
-def compose_provider_conversation(composer_input: ComposerInput) -> ProviderConversation:
+def context_budget(
+    context_window: int | None, response_reserve: int = RESPONSE_RESERVE
+) -> ContextBudget:
+    effective_window = (
+        DEFAULT_CONTEXT_WINDOW if context_window is None or context_window <= 0 else context_window
+    )
+    reserve = min(response_reserve, max(1, effective_window // 4))
+    return ContextBudget(
+        context_window=context_window,
+        response_reserve=reserve,
+        request_allowance=max(0, effective_window - reserve),
+        estimator_method="utf-8-byte-count",
+    )
+
+
+def _estimate_message_tokens(message: ProviderMessage, overhead: int = MESSAGE_OVERHEAD) -> int:
+    return len(message.content.encode("utf-8")) + overhead
+
+
+def _complete_turns(
+    history: tuple[ProviderMessage, ...],
+) -> tuple[tuple[ProviderMessage, ProviderMessage], ...]:
+    turns: list[tuple[ProviderMessage, ProviderMessage]] = []
+    index = 0
+    while index < len(history):
+        if (
+            history[index].role == "user"
+            and index + 1 < len(history)
+            and history[index + 1].role == "assistant"
+        ):
+            turns.append((history[index], history[index + 1]))
+            index += 2
+        else:
+            index += 1
+    return tuple(turns)
+
+
+def select_history_for_budget(
+    budget: ContextBudget,
+    history: tuple[ProviderMessage, ...],
+    mandatory_messages: tuple[ProviderMessage, ...],
+) -> HistorySelection:
+    mandatory_tokens = sum(_estimate_message_tokens(message) for message in mandatory_messages)
+    if mandatory_tokens > budget.request_allowance:
+        raise RuntimeError("Required conversation material exceeds the model context budget.")
+    allowance = budget.request_allowance - mandatory_tokens
+    turns = _complete_turns(history)
+    selected: list[ProviderMessage] = []
+    omitted_turn_count = 0
+    estimated_input_tokens = 0
+    for user_message, assistant_message in reversed(turns):
+        turn_tokens = _estimate_message_tokens(user_message) + _estimate_message_tokens(
+            assistant_message
+        )
+        if estimated_input_tokens + turn_tokens <= allowance:
+            selected.extend((assistant_message, user_message))
+            estimated_input_tokens += turn_tokens
+        else:
+            omitted_turn_count += 1
+    selected.reverse()
+    return HistorySelection(
+        selected_messages=tuple(selected),
+        omitted_turn_count=omitted_turn_count,
+        estimated_input_tokens=estimated_input_tokens,
+        estimator_method=budget.estimator_method,
+    )
+
+
+def compose_provider_conversation(
+    composer_input: ComposerInput,
+) -> tuple[ProviderConversation, HistorySelection]:
     messages: list[ProviderMessage] = []
     messages.append(ProviderMessage("system", composer_input.protected_contract))
     messages.append(ProviderMessage("system", composer_input.product_identity))
     messages.append(ProviderMessage("system", composer_input.persona_expression))
+    if composer_input.channel_capabilities is not None and not composer_input.channel_capabilities.accepts_html:
+        messages.append(
+            ProviderMessage(
+                "system",
+                "Return plain conversational text. Use paragraphs and fenced code "
+                "blocks for preformatted content. Do not return HTML.",
+            )
+        )
     if composer_input.confirmed_records:
         content = "\n\n".join(
             f"[CONFIRMED CONTEXT]\n{record}"
@@ -126,9 +234,14 @@ def compose_provider_conversation(composer_input: ComposerInput) -> ProviderConv
                 f"Available tools: {', '.join(composer_input.available_connectors)}",
             )
         )
-    messages.extend(composer_input.history)
+    budget = context_budget(composer_input.context_window)
+    mandatory_messages = (*messages, ProviderMessage("user", composer_input.current_request))
+    history_selection = select_history_for_budget(
+        budget, composer_input.history, mandatory_messages
+    )
+    messages.extend(history_selection.selected_messages)
     messages.append(ProviderMessage("user", composer_input.current_request))
-    return ProviderConversation(tuple(messages))
+    return ProviderConversation(tuple(messages)), history_selection
 
 
 def split_legacy_notice_prefix(text: str) -> tuple[str, tuple[str, ...]]:

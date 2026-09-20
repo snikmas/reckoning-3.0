@@ -57,7 +57,7 @@ def _conversation_text(conversation: ProviderConversation) -> str:
 
 
 def test_current_request_is_last_user_message() -> None:
-    conversation = compose_provider_conversation(
+    conversation, _history_selection = compose_provider_conversation(
         ComposerInput(
             protected_contract="protected",
             product_identity="identity",
@@ -73,7 +73,7 @@ def test_current_request_is_last_user_message() -> None:
 
 
 def test_empty_optional_sections_disappear() -> None:
-    conversation = compose_provider_conversation(
+    conversation, _history_selection = compose_provider_conversation(
         ComposerInput(
             protected_contract="protected",
             product_identity="identity",
@@ -91,7 +91,7 @@ def test_empty_optional_sections_disappear() -> None:
 
 
 def test_internal_layer_names_never_reach_provider() -> None:
-    conversation = compose_provider_conversation(
+    conversation, _history_selection = compose_provider_conversation(
         ComposerInput(
             protected_contract="The protected product contract content.",
             product_identity="identity",
@@ -110,7 +110,7 @@ def test_internal_layer_names_never_reach_provider() -> None:
 
 
 def test_confirmed_context_appears_as_delimited_data() -> None:
-    conversation = compose_provider_conversation(
+    conversation, _history_selection = compose_provider_conversation(
         ComposerInput(
             protected_contract="protected",
             product_identity="identity",
@@ -131,7 +131,7 @@ def test_confirmed_context_appears_as_delimited_data() -> None:
 
 
 def test_history_includes_prior_user_and_assistant_speech() -> None:
-    conversation = compose_provider_conversation(
+    conversation, _history_selection = compose_provider_conversation(
         ComposerInput(
             protected_contract="protected",
             product_identity="identity",
@@ -150,7 +150,7 @@ def test_history_includes_prior_user_and_assistant_speech() -> None:
 
 
 def test_notices_are_not_part_of_provider_conversation() -> None:
-    conversation = compose_provider_conversation(
+    conversation, _history_selection = compose_provider_conversation(
         ComposerInput(
             protected_contract="protected",
             product_identity="identity",

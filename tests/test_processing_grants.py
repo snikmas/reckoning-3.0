@@ -147,7 +147,10 @@ def test_local_destination_defaults_to_all_context_with_fake_transport(
 
     application.respond_with_channel_context(
         "SYNTHETIC LOCAL REQUEST",
-        (("user", "SYNTHETIC LOCAL HISTORY"),),
+        (
+            ("user", "SYNTHETIC LOCAL HISTORY"),
+            ("assistant", "SYNTHETIC LOCAL REPLY"),
+        ),
         ("SYNTHETIC LOCAL STATE",),
         ("synthetic.local.permission",),
     )
@@ -178,7 +181,10 @@ def test_each_context_route_is_filtered_before_real_adapter_transport(
 
     limited = application.respond_with_channel_context(
         "SYNTHETIC CURRENT REQUEST",
-        (("user", "SYNTHETIC PRIOR TURN"),),
+        (
+            ("user", "SYNTHETIC PRIOR TURN"),
+            ("assistant", "SYNTHETIC PRIOR REPLY"),
+        ),
         ("SYNTHETIC CONFIRMED STATE",),
         ("synthetic.permission",),
     )
@@ -206,7 +212,10 @@ def test_each_context_route_is_filtered_before_real_adapter_transport(
     )
     application.respond_with_channel_context(
         "SYNTHETIC SECOND REQUEST",
-        (("user", "SYNTHETIC PRIOR TURN"),),
+        (
+            ("user", "SYNTHETIC PRIOR TURN"),
+            ("assistant", "SYNTHETIC PRIOR REPLY"),
+        ),
         ("SYNTHETIC CONFIRMED STATE",),
         ("synthetic.permission",),
     )

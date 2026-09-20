@@ -66,6 +66,7 @@ def test_protected_contract_outranks_every_application_prompt_layer() -> None:
         "system",
         "system",
         "system",
+        "system",
         "user",
         "user",
     ]

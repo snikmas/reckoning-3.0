@@ -943,12 +943,13 @@ def test_real_channel_boundary_passes_shared_context_below_protected_layers() ->
         "system",
         "system",
         "system",
+        "system",
         "user",
         "system",
         "user",
     ]
-    assert "decision d-1: keep the smaller proof" in messages[3].content
-    assert "calendar.read" in messages[4].content
+    assert "decision d-1: keep the smaller proof" in messages[4].content
+    assert "calendar.read" in messages[5].content
 
 
 def test_hybrid_placement_prevents_private_copy_and_declares_limited_mode(

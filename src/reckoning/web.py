@@ -42,6 +42,7 @@ from reckoning.decision_conversation import (
     interpret_decision_message,
 )
 from reckoning.interfaces import (
+    ChannelSession,
     ControlView,
     ReckoningInterfaceApplication,
     create_local_interface_application,
@@ -98,6 +99,47 @@ def validate_allowed_origin(origin: str) -> str:
     if port in ({"http": 80, "https": 443}[scheme], None):
         return f"{scheme}://{rendered_host}"
     return f"{scheme}://{rendered_host}:{port}"
+
+
+def render_channel_text(text: str) -> str:
+    """Render plain conversational text as safe HTML paragraphs and code blocks."""
+    parts: list[str] = []
+    lines = text.splitlines()
+    in_fence = False
+    fence_lines: list[str] = []
+    paragraph_lines: list[str] = []
+
+    def flush_paragraph() -> None:
+        if paragraph_lines:
+            paragraph = " ".join(paragraph_lines)
+            parts.append(f"<p>{escape(paragraph)}</p>")
+            paragraph_lines.clear()
+
+    def flush_fence() -> None:
+        if fence_lines:
+            code = "\n".join(fence_lines)
+            parts.append(f"<pre><code>{escape(code)}</code></pre>")
+            fence_lines.clear()
+
+    for line in lines:
+        if line.startswith("```"):
+            if in_fence:
+                flush_fence()
+                in_fence = False
+            else:
+                flush_paragraph()
+                in_fence = True
+        elif in_fence:
+            fence_lines.append(line)
+        elif line.strip() == "":
+            flush_paragraph()
+        else:
+            paragraph_lines.append(line)
+
+    if in_fence:
+        flush_fence()
+    flush_paragraph()
+    return "".join(parts)
 
 
 def local_browser_origins(port: int) -> tuple[str, ...]:
@@ -280,6 +322,8 @@ class ReckoningWebApplication:
         if method == "POST" and path == "/messages":
             fields = self._read_form(environ)
             message = fields.get("message", [""])[0]
+            session_id = fields.get("session_id", [""])[0]
+            expected_message_revision = fields.get("expected_revision", [""])[0]
             operation_id = fields.get("operation_id", [""])[0] or None
             decision_reply = self._interpret_decision_reply(
                 message, fields, csrf_token
@@ -294,7 +338,77 @@ class ReckoningWebApplication:
                     operation_id=operation_id,
                 )
             try:
-                self._interfaces.send_channel_message("web", message)
+                if not session_id:
+                    selected = self._interfaces.selected_channel_session("web")
+                    if selected is None:
+                        raise ValueError("A session is required to send a message.")
+                    session_id = selected.session_id
+                revision = (
+                    int(expected_message_revision)
+                    if expected_message_revision
+                    else self._interfaces.session_revision("web", session_id)
+                )
+                self._interfaces.send_channel_message(
+                    "web",
+                    message,
+                    session_id=session_id,
+                    expected_session_revision=revision,
+                )
+            except (ValueError, RuntimeError) as error:
+                return self._html_response(
+                    start_response,
+                    "400 Bad Request",
+                    self._render_interface_area(
+                        "simon",
+                        error=str(error),
+                        csrf_token=csrf_token,
+                        pending_text=message,
+                    ),
+                )
+            start_response(
+                "303 See Other",
+                [("Location", "/simon"), ("Content-Length", "0")],
+            )
+            return [b""]
+        if method == "POST" and path == "/sessions/new":
+            fields = self._read_form(environ)
+            name = fields.get("display_name", [""])[0].strip() or None
+            try:
+                session = self._interfaces.create_channel_session(
+                    "web", display_name=name
+                )
+                selection = self._interfaces._repository.get_selected_session("web")
+                expected = selection.revision if selection is not None else 0
+                self._interfaces.select_channel_session(
+                    "web",
+                    session.session_id,
+                    expected_selection_revision=expected,
+                )
+            except (ValueError, RuntimeError) as error:
+                return self._html_response(
+                    start_response,
+                    "400 Bad Request",
+                    self._render_interface_area(
+                        "simon", error=str(error), csrf_token=csrf_token
+                    ),
+                )
+            start_response(
+                "303 See Other",
+                [("Location", "/simon"), ("Content-Length", "0")],
+            )
+            return [b""]
+        if method == "POST" and path == "/sessions/select":
+            fields = self._read_form(environ)
+            session_id = fields.get("session_id", [""])[0]
+            expected_selection_revision = int(
+                fields.get("selection_revision", ["0"])[0]
+            )
+            try:
+                self._interfaces.select_channel_session(
+                    "web",
+                    session_id,
+                    expected_selection_revision=expected_selection_revision,
+                )
             except (ValueError, RuntimeError) as error:
                 return self._html_response(
                     start_response,
@@ -482,8 +596,11 @@ class ReckoningWebApplication:
         operation_id: str | None = None,
     ) -> list[bytes]:
         assert self._interfaces is not None
+        web_session_id = self._selected_web_session_id()
         if isinstance(reply, ClarifyDecision):
-            self._interfaces.record_channel_exchange("web", message, reply.prompt)
+            self._interfaces.record_channel_exchange(
+                "web", message, reply.prompt, session_id=web_session_id
+            )
             start_response(
                 "303 See Other",
                 [("Location", "/simon"), ("Content-Length", "0")],
@@ -550,7 +667,9 @@ class ReckoningWebApplication:
                 ),
                 extra_headers=response_headers,
             )
-        self._interfaces.record_channel_exchange("web", message, note)
+        self._interfaces.record_channel_exchange(
+            "web", message, note, session_id=web_session_id
+        )
         start_response(
             "303 See Other",
             [
@@ -938,6 +1057,7 @@ class ReckoningWebApplication:
         csrf_token: str = "",
         pending_text: str = "",
         pending_record_id: str = "",
+        session_id: str | None = None,
         decision: Reckoning | None = None,
         why: WhyView | None = None,
     ) -> str:
@@ -959,7 +1079,10 @@ class ReckoningWebApplication:
             )
         elif area == "simon":
             content = self._render_simon(
-                csrf_token, error=error, pending_text=pending_text
+                csrf_token,
+                error=error,
+                pending_text=pending_text,
+                session_id=session_id,
             )
             inspector = self._render_inspector(
                 status_label, status_modifier, visual_state=visual_state
@@ -1414,16 +1537,73 @@ class ReckoningWebApplication:
             + self._render_processing_scope(csrf_token)
         )
 
+    def _displayed_web_session(
+        self, preferred_id: str | None = None
+    ) -> ChannelSession:
+        assert self._interfaces is not None
+        if preferred_id:
+            sessions = self._interfaces.list_channel_sessions("web")
+            match = next(
+                (session for session in sessions if session.session_id == preferred_id),
+                None,
+            )
+            if match is not None:
+                return match
+        return self._ensure_selected_web_session()
+
+    def _ensure_selected_web_session(self) -> ChannelSession:
+        assert self._interfaces is not None
+        selected = self._interfaces.selected_channel_session("web")
+        if selected is not None:
+            return selected
+        session = self._interfaces.create_channel_session(
+            "web",
+            display_name="First conversation",
+            origin="first-use",
+        )
+        self._interfaces.select_channel_session(
+            "web",
+            session.session_id,
+            expected_selection_revision=0,
+        )
+        return session
+
+    def _selected_web_session_id(self) -> str:
+        return self._ensure_selected_web_session().session_id
+
+    def _session_preview(self, session: ChannelSession) -> str:
+        messages = session.messages
+        if not messages:
+            return '<p class="empty">No messages yet.</p>'
+        lines: list[str] = []
+        for message in messages[-4:]:
+            label = "You" if message.role == "user" else "Simon"
+            lines.append(f"{label}: {message.content}")
+        return escape("\n".join(lines))
+
     def _render_simon(
-        self, csrf_token: str, *, error: str | None, pending_text: str
+        self,
+        csrf_token: str,
+        *,
+        error: str | None,
+        pending_text: str,
+        session_id: str | None = None,
     ) -> str:
         assert self._interfaces is not None
-        messages = self._interfaces.channel_session("web")
-        notices = self._interfaces.channel_notices("web")
+        displayed = self._displayed_web_session(session_id)
+        selection = self._interfaces._repository.get_selected_session("web")
+        selection_revision = selection.revision if selection is not None else 0
+        revision = self._interfaces.session_revision("web", displayed.session_id)
+        messages = self._interfaces.channel_session(
+            "web", session_id=displayed.session_id
+        )
+        notices = self._interfaces.channel_notices(
+            "web", session_id=displayed.session_id
+        )
         conversation = "".join(
             '<article class="message">'
             f'<strong>{"You" if message.role == "user" else "Simon"}</strong>'
-            f"<p>{escape(message.content)}</p></article>"
+            f"{render_channel_text(message.content)}</article>"
             for message in messages
         ) or '<p class="empty">Send Simon the first message.</p>'
         notice_markup = ""
@@ -1446,8 +1626,58 @@ class ReckoningWebApplication:
             for operation in self._pending_decision_inputs()
         )
         active_proposal, target_fields = self._active_proposal_state(csrf_token)
+
+        last_activity = (
+            displayed.last_activity_at.isoformat()
+            if displayed.last_activity_at is not None
+            else "unknown"
+        )
+        session_header = (
+            f'<p class="session-meta">{escape(displayed.display_name or "Conversation")} · '
+            f'last activity {escape(last_activity)}</p>'
+        )
+
+        sessions = self._interfaces.list_channel_sessions("web")
+        session_list_items = "".join(
+            f"""<li>
+            <form action="/sessions/select" method="post" class="inline">
+              <input type="hidden" name="_csrf_token"
+                value="{escape(csrf_token, quote=True)}">
+              <input type="hidden" name="session_id"
+                value="{escape(session.session_id, quote=True)}">
+              <input type="hidden" name="selection_revision"
+                value="{selection_revision}">
+              <button type="submit" class="secondary">
+                Resume {escape(session.display_name or "Conversation")}
+              </button>
+            </form>
+            <span class="session-preview">{self._session_preview(session)}</span>
+          </li>"""
+            for session in sessions
+            if session.session_id != displayed.session_id
+        )
+        session_list = (
+            f'<section aria-labelledby="sessions-heading">'
+            f'<h2 id="sessions-heading">Other conversations</h2>'
+            f'<ul>{session_list_items}</ul></section>'
+            if session_list_items
+            else ""
+        )
+        new_session_form = f"""
+          <section aria-labelledby="new-session-heading">
+            <h2 id="new-session-heading">New conversation</h2>
+            <form action="/sessions/new" method="post">
+              <input type="hidden" name="_csrf_token"
+                value="{escape(csrf_token, quote=True)}">
+              <label for="display_name">Name (optional)</label>
+              <input type="text" id="display_name" name="display_name">
+              <button type="submit">Start</button>
+            </form>
+          </section>
+        """
         return f"""
           <header><p class="eyebrow">Conversation</p><h1>Simon</h1></header>
+          {session_header}
           {notice_markup}
           <div aria-live="polite">{conversation}</div>{error_markup}
           {active_proposal}
@@ -1459,6 +1689,10 @@ class ReckoningWebApplication:
                 value="{escape(csrf_token, quote=True)}">
               <input type="hidden" name="operation_id"
                 value="{escape(fresh_operation_id(), quote=True)}">
+              <input type="hidden" name="session_id"
+                value="{escape(displayed.session_id, quote=True)}">
+              <input type="hidden" name="expected_revision"
+                value="{revision}">
               {target_fields}
               <label for="message">Your message</label>
               <textarea id="message" name="message" required
@@ -1470,6 +1704,8 @@ class ReckoningWebApplication:
               </div>
             </form>
           </div>
+          {session_list}
+          {new_session_form}
         """
 
     def _pending_decision_inputs(self) -> tuple[OperationRecord, ...]:

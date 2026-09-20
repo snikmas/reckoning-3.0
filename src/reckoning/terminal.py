@@ -6,7 +6,7 @@ from pathlib import Path
 
 from reckoning.application import create_local_application
 from reckoning.config import DEFAULT_PROVIDER_CREDENTIALS, RuntimeProviderSettings
-from reckoning.interfaces import create_local_interface_application
+from reckoning.interfaces import ChannelSession, ReckoningInterfaceApplication, create_local_interface_application
 from reckoning.operations import OperationError, load_installation_runtime
 from reckoning.provider_adapters import AdapterConfig
 
@@ -29,6 +29,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model")
     parser.add_argument("--base-url")
     return parser
+
+
+def _preview_text(messages: tuple[object, ...]) -> str:
+    if not messages:
+        return "No messages yet."
+    lines: list[str] = []
+    for message in messages[-4:]:
+        role = "You" if getattr(message, "role", "") == "user" else "Simon"
+        lines.append(f"{role}: {getattr(message, 'content', '')}")
+    return "\n".join(lines)
+
+
+def _ensure_terminal_session(interface: ReckoningInterfaceApplication) -> ChannelSession:
+    selected = interface.selected_channel_session("terminal")
+    if selected is not None:
+        return selected
+    session = interface.create_channel_session(
+        "terminal",
+        display_name="Terminal",
+        origin="first-use",
+    )
+    interface.select_channel_session(
+        "terminal",
+        session.session_id,
+        expected_selection_revision=0,
+    )
+    return session
+
+
+def _print_session_preview(session: ChannelSession, output: Callable[[str], None]) -> None:
+    name = session.display_name or "Current conversation"
+    output(f"{name}:")
+    output(_preview_text(session.messages))
 
 
 def main(
@@ -80,8 +113,13 @@ def main(
 
     output(
         f"Reckoning Terminal with {runtime.persona.name}. "
-        "Type /exit to leave."
+        "Type /exit to leave, /new [name] for a new conversation, or /resume to show the current session."
     )
+    current_session: ChannelSession | None = interface.selected_channel_session("terminal")
+    if current_session is not None and current_session.messages:
+        output(f"Resuming {current_session.display_name or 'Current conversation'}.")
+        _print_session_preview(current_session, output)
+
     while True:
         try:
             text = line_reader("You: ").strip()
@@ -90,13 +128,47 @@ def main(
             break
         if text.casefold() in {"/exit", "/quit"}:
             break
+        if text.casefold() == "/resume":
+            current_session = interface.selected_channel_session("terminal")
+            if current_session is None:
+                output("No active session. Send a message to start one.")
+            else:
+                _print_session_preview(current_session, output)
+            continue
+        if text.casefold().startswith("/new"):
+            parts = text.split(None, 1)
+            name = parts[1].strip() if len(parts) > 1 else None
+            current_session = interface.create_channel_session(
+                "terminal",
+                display_name=name,
+            )
+            interface.select_channel_session(
+                "terminal",
+                current_session.session_id,
+                expected_selection_revision=0,
+            )
+            output(
+                f"Started {current_session.display_name or 'a new conversation'}."
+            )
+            continue
         if not text:
             continue
         try:
-            reply = interface.send_channel_message("terminal", text)
+            if current_session is None:
+                current_session = _ensure_terminal_session(interface)
+            expected_revision = interface.session_revision(
+                "terminal", current_session.session_id
+            )
+            reply = interface.send_channel_message(
+                "terminal",
+                text,
+                session_id=current_session.session_id,
+                expected_session_revision=expected_revision,
+            )
         except (RuntimeError, ValueError) as error:
             output(f"Could not answer: {error}")
             continue
+        current_session = interface.selected_channel_session("terminal") or current_session
         for notice in reply.notices:
             output(f"Notice: {notice}")
         output(f"{runtime.persona.name}: {reply.text}")
