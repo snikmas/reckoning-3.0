@@ -20,11 +20,22 @@ TARGET = DecisionTarget(
 
 def test_unambiguous_confirmation_binds_to_the_displayed_target() -> None:
     for message in (
-        "Yes, confirm that exact version",
+        "confirm",
         "Confirm this version.",
-        "Looks right — confirm it",
+        "I confirm this version",
+        "I confirm this version!",
+        "  Confirm this version  ",
     ):
         assert interpret_decision_message(message, TARGET) == ConfirmDecision(TARGET)
+
+
+def test_multilingual_confirmation_phrases_bind_to_the_target() -> None:
+    assert interpret_decision_message(
+        "подтверждаю эту версию", TARGET
+    ) == ConfirmDecision(TARGET)
+    assert interpret_decision_message(
+        "确认这个版本", TARGET
+    ) == ConfirmDecision(TARGET)
 
 
 def test_conversational_correction_extracts_the_new_meaning() -> None:
@@ -53,7 +64,7 @@ def test_correction_with_several_records_asks_which_one() -> None:
 
 
 def test_ambiguous_assent_asks_for_clarification() -> None:
-    for message in ("Yes", "ok", "sounds good", "Sure."):
+    for message in ("Yes", "ok", "sounds good", "Sure.", "да", "好"):
         reply = interpret_decision_message(message, TARGET)
         assert isinstance(reply, ClarifyDecision), message
         assert "confirm" in reply.prompt
@@ -63,6 +74,23 @@ def test_negated_confirmation_never_confirms() -> None:
     reply = interpret_decision_message("Don't confirm this yet.", TARGET)
 
     assert isinstance(reply, ClarifyDecision)
+
+
+def test_questions_and_indirect_confirmations_never_mutate() -> None:
+    for message in (
+        "What happens if I confirm?",
+        "Can you explain confirmation?",
+        "What does confirm mean?",
+        'He said "confirm"',
+        "She told me to confirm",
+        "I would confirm if I were sure",
+        "Maybe confirm later",
+        "не подтверждай",
+        "不要确认",
+        "确认是什么意思？",
+    ):
+        reply = interpret_decision_message(message, TARGET)
+        assert not isinstance(reply, (ConfirmDecision, CorrectDecision)), message
 
 
 def test_unrelated_conversation_is_left_to_the_responder() -> None:
@@ -76,6 +104,6 @@ def test_unrelated_conversation_is_left_to_the_responder() -> None:
 
 def test_no_target_means_no_decision_action() -> None:
     assert isinstance(
-        interpret_decision_message("Yes, confirm that exact version", None),
+        interpret_decision_message("I confirm this version", None),
         NotDecisionRelated,
     )

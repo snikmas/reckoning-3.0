@@ -44,19 +44,44 @@ class NotDecisionRelated:
 
 DecisionReply = ConfirmDecision | CorrectDecision | ClarifyDecision | NotDecisionRelated
 
-_NEGATION_MARKERS = ("n't", "not ", "never")
-_CORRECTION_MARKERS = ("correct", "change", "actually")
-_ASSENT_PHRASES = (
-    "yes",
-    "yes.",
-    "ok",
-    "okay",
-    "sure",
-    "sounds good",
-    "looks good",
-    "agreed",
-    "fine",
+# Exact normalized phrases that confer consent. They must be the whole message
+# (after controlled punctuation/case normalization), not a substring.
+_CONFIRM_PHRASES = frozenset(
+    {
+        "confirm",
+        "i confirm this version",
+        "confirm this version",
+        "подтверждаю эту версию",
+        "确认这个版本",
+    }
 )
+
+# Phrases that show assent but are not explicit consent. They ask for the
+# documented confirmation phrase instead of mutating.
+_ASSENT_PHRASES = frozenset(
+    {
+        "yes",
+        "ok",
+        "okay",
+        "sure",
+        "sounds good",
+        "looks good",
+        "agreed",
+        "fine",
+        "да",
+        "好",
+    }
+)
+
+_CORRECTION_MARKERS = ("correct", "change", "actually")
+
+
+def _normalize_confirmation(text: str) -> str:
+    """Strip surrounding whitespace, casefold, and trailing sentence punctuation."""
+    normalized = text.strip().casefold()
+    while normalized and normalized[-1] in ".!?":
+        normalized = normalized[:-1]
+    return normalized.strip()
 
 
 def interpret_decision_message(
@@ -65,13 +90,17 @@ def interpret_decision_message(
     message = text.strip()
     if not message or target is None:
         return NotDecisionRelated()
-    normalized = message.casefold()
 
-    has_confirm = "confirm" in normalized
-    negated = any(marker in normalized for marker in _NEGATION_MARKERS)
-    has_correction = normalized.split()[0].rstrip(",.").startswith("no") or any(
-        marker in normalized for marker in _CORRECTION_MARKERS
-    )
+    # Questions are never mutations.
+    if message.rstrip().endswith("?"):
+        return NotDecisionRelated()
+
+    normalized = _normalize_confirmation(message)
+    has_correction = (
+        normalized.split()[0].rstrip(",.").startswith("no")
+        if normalized
+        else False
+    ) or any(marker in normalized for marker in _CORRECTION_MARKERS)
 
     if has_correction:
         meaning = _extract_correction(message)
@@ -83,9 +112,14 @@ def interpret_decision_message(
                 "Open the decision and edit the exact record."
             )
         return CorrectDecision(target, target.record_ids[0], meaning)
-    if has_confirm and not negated:
+
+    confirmed = normalized in _CONFIRM_PHRASES
+    if confirmed:
         return ConfirmDecision(target)
-    if has_confirm or normalized.rstrip(".!") in _ASSENT_PHRASES:
+
+    # Any remaining mention of confirmation, or bare assent, asks for the
+    # explicit documented phrase instead of mutating.
+    if "confirm" in normalized or normalized in _ASSENT_PHRASES:
         return ClarifyDecision(_clarification(target))
     return NotDecisionRelated()
 
