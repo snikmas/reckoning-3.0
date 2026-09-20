@@ -19,6 +19,7 @@ from reckoning.operations import (
     diagnose,
     migrate_transfer,
     release_readiness,
+    repair_processing_grant,
     restore_transfer,
 )
 from reckoning.presentation import (
@@ -675,6 +676,13 @@ def _run_operation(command: str, rest: Sequence[str]) -> int:
     arguments = parser.parse_args(rest)
     try:
         if command == "doctor":
+            if arguments.repair:
+                for line in repair_processing_grant(
+                    arguments.data_dir,
+                    server_data_dir=arguments.server_data_dir,
+                ):
+                    print(line)
+                return 0
             if arguments.release_evidence is not None:
                 return _print_release_readiness(arguments.release_evidence)
             render_doctor(
@@ -739,6 +747,14 @@ def _operation_parser(command: str) -> argparse.ArgumentParser:
             "--release-evidence",
             type=Path,
             help="Report public-release gates from an evidence file.",
+        )
+        parser.add_argument(
+            "--repair",
+            action="store_true",
+            help=(
+                "Create the missing initial processing grant for the active "
+                "cloud destination."
+            ),
         )
         parser.add_argument(
             "--ping",

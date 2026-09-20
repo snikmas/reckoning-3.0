@@ -6,7 +6,7 @@ import shutil
 import stat
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory, mkdtemp
@@ -45,6 +45,14 @@ from reckoning.personas import (
     PersonaDefinition,
     PersonaService,
 )
+from reckoning.processing import (
+    JsonFileProcessingGrantRepository,
+    ProcessingDestination,
+    ensure_initial_processing_grant,
+    provider_destination,
+)
+from reckoning.provider_adapters import AdapterConfig
+from reckoning.provider_registry import find_provider
 
 TRANSFER_FORMAT = "reckoning-encrypted-transfer"
 TRANSFER_VERSION = 1
@@ -82,7 +90,7 @@ class InstallationRuntime:
     persona: PersonaSettings
     application_placement: PlacementState
     interface_placement: PlacementPolicy
-    routes: tuple["SourceStateRoute", ...]
+    routes: tuple[SourceStateRoute, ...]
     node_availability: NodeAvailabilitySource
 
     def root_for(self, category: StateCategory) -> Path:
@@ -245,7 +253,7 @@ def setup_instance(
     all_entries = tuple(file_entries) + tuple(profile_entries or ())
     _check_core_continuity_loop()
     selected_persona = persona or DEFAULT_PERSONAS[0]
-    created_at = datetime.now(timezone.utc)
+    created_at = datetime.now(UTC)
     roots = {
         "local": "local-data-dir",
         "server": str(server_root) if server_root else None,
@@ -464,6 +472,7 @@ def diagnose(
     outcome = runtime.interface_placement.current_outcome()
     local_health = runtime.node_availability.is_available("local")
     server_health = runtime.node_availability.is_available("server")
+    grant_lines = _processing_grant_diagnosis(instance, runtime)
     return (
         f"status: {'healthy' if outcome.status == 'available' else 'degraded'}",
         f"instance: {instance.get('instance_type', 'unknown')}",
@@ -471,7 +480,105 @@ def diagnose(
         f"local node: {'available' if local_health else 'offline'}",
         f"server node: {'available' if server_health else 'offline'}",
         f"placement detail: {outcome.notice}",
+        *grant_lines,
         f"valid state files: {len(files)}",
+    )
+
+
+def _optional_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _active_processing_destination(
+    instance: dict[str, Any], runtime: InstallationRuntime
+) -> tuple[ProcessingDestination, Path] | None:
+    activation = instance.get("activation")
+    if not isinstance(activation, dict):
+        return None
+    provider_name = str(activation.get("provider", "fake")).strip().casefold()
+    try:
+        definition = find_provider(provider_name)
+    except KeyError:
+        return None
+    base_url = _optional_text(activation.get("base_url")) or definition.base_url
+    model = (
+        _optional_text(activation.get("model"))
+        or definition.recommended_model
+        or "deterministic-fake"
+    )
+    destination = provider_destination(
+        provider_name,
+        AdapterConfig(base_url=base_url, model=model),
+    )
+    if destination.kind != "cloud":
+        return None
+    grant_path = runtime.state_path(
+        "confirmed-state", "processing-grants.json"
+    )
+    return destination, grant_path
+
+
+def _processing_grant_diagnosis(
+    instance: dict[str, Any], runtime: InstallationRuntime
+) -> tuple[str, ...]:
+    active = _active_processing_destination(instance, runtime)
+    if active is None:
+        return ()
+    destination, grant_path = active
+    grant = JsonFileProcessingGrantRepository(grant_path).get(destination.id)
+    if grant is None:
+        return (
+            (
+                "processing grant: missing for "
+                f"{destination.id}; run `reckoning doctor --repair`"
+            ),
+        )
+    return (
+        (
+            f"processing grant: present for {destination.id} "
+            f"({len(grant.allowed_categories)} categories)"
+        ),
+    )
+
+
+def repair_processing_grant(
+    data_dir: Path, *, server_data_dir: Path | None = None
+) -> tuple[str, ...]:
+    """Create the initial full-category grant for the active cloud destination.
+
+    The repair is idempotent: an existing grant is left unchanged.
+    """
+    try:
+        runtime = load_installation_runtime(
+            data_dir, server_data_dir=server_data_dir
+        )
+        instance = read_json(data_dir / "instance.json", default={})
+    except (OperationError, RuntimeError, ValueError) as error:
+        raise OperationError(
+            f"cannot repair processing grant: {error}"
+        ) from error
+    active = _active_processing_destination(instance, runtime)
+    if active is None:
+        return ("processing grant: no cloud destination is active",)
+    destination, grant_path = active
+    ensured = ensure_initial_processing_grant(
+        JsonFileProcessingGrantRepository(grant_path),
+        destination,
+        changed_at=datetime.now(UTC),
+    )
+    if ensured is None:
+        return ("processing grant: no cloud destination is active",)
+    grant, created = ensured
+    categories = ", ".join(grant.allowed_categories)
+    return (
+        (
+            f"processing grant: {'created' if created else 'present'} "
+            f"for {destination.id}"
+        ),
+        f"allowed categories: {categories}",
     )
 
 
@@ -516,7 +623,7 @@ def create_transfer(
         "format": TRANSFER_FORMAT,
         "format_version": TRANSFER_VERSION,
         "transfer_kind": kind,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
         "logical_roots": [name for name, _ in roots],
         "files": entries,
     }
@@ -590,7 +697,7 @@ def migrate_transfer(
         **payload,
         "format_version": TRANSFER_VERSION,
         "transfer_kind": "migration",
-        "migrated_at": datetime.now(timezone.utc).isoformat(),
+        "migrated_at": datetime.now(UTC).isoformat(),
     }
     _write_encrypted_payload(output, migrated, passphrase)
     return source_version, TRANSFER_VERSION, len(files)
