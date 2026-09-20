@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from collections.abc import Sequence
 from hmac import compare_digest
 from html import escape
@@ -108,6 +109,12 @@ def local_browser_origins(port: int) -> tuple[str, ...]:
     )
 
 
+# A rendered proposal review context stays valid for one hour. After that the
+# user must re-open the current proposal before consenting.
+_PRESENTATION_TTL_SECONDS = 3600.0
+_PRESENTATION_RECEIPTS_PER_SESSION = 8
+
+
 class ReckoningWebApplication:
     """A thin WSGI adapter for the Reckoning application boundary."""
 
@@ -130,6 +137,13 @@ class ReckoningWebApplication:
             urlsplit(origin).netloc.casefold() for origin in self._allowed_origins
         )
         self._browser_sessions: dict[str, str] = {}
+        # Server-side evidence that a browser session was shown a specific
+        # proposal revision: csrf token -> presentation token ->
+        # (reckoning_id, version, issued_at). Client-submitted target fields
+        # alone never prove presentation.
+        self._proposal_presentations: dict[
+            str, dict[str, tuple[str, int, float]]
+        ] = {}
 
     def __call__(
         self, environ: WSGIEnvironment, start_response: StartResponse
@@ -264,8 +278,12 @@ class ReckoningWebApplication:
                 extra_headers=response_headers,
             )
         if method == "POST" and path == "/messages":
-            message = self._read_message(environ)
-            decision_reply = self._interpret_decision_reply(message)
+            fields = self._read_form(environ)
+            message = fields.get("message", [""])[0]
+            operation_id = fields.get("operation_id", [""])[0] or None
+            decision_reply = self._interpret_decision_reply(
+                message, fields, csrf_token
+            )
             if decision_reply is not None:
                 return self._apply_decision_reply(
                     decision_reply,
@@ -273,6 +291,7 @@ class ReckoningWebApplication:
                     start_response,
                     csrf_token=csrf_token,
                     response_headers=response_headers,
+                    operation_id=operation_id,
                 )
             try:
                 self._interfaces.send_channel_message("web", message)
@@ -350,8 +369,46 @@ class ReckoningWebApplication:
             )
         return None
 
-    def _interpret_decision_reply(self, message: str) -> DecisionReply | None:
-        """Resolve a conversation reply against the one active proposal."""
+    def _issue_presentation(self, csrf_token: str, reckoning: Reckoning) -> str:
+        """Record that this session was shown reckoning id/version; return its token."""
+        receipts = self._proposal_presentations.setdefault(csrf_token, {})
+        now = time.monotonic()
+        expired = [
+            token
+            for token, (_, _, issued_at) in receipts.items()
+            if now - issued_at > _PRESENTATION_TTL_SECONDS
+        ]
+        for token in expired:
+            del receipts[token]
+        while len(receipts) >= _PRESENTATION_RECEIPTS_PER_SESSION:
+            oldest = min(receipts, key=lambda token: receipts[token][2])
+            del receipts[oldest]
+        token = token_urlsafe(16)
+        receipts[token] = (reckoning.id, reckoning.version, now)
+        return token
+
+    def _presentation_receipt(
+        self, csrf_token: str, token: str
+    ) -> tuple[str, int] | None:
+        """Return the server-recorded (reckoning_id, version) for a token."""
+        receipt = self._proposal_presentations.get(csrf_token, {}).get(token)
+        if receipt is None:
+            return None
+        reckoning_id, version, issued_at = receipt
+        if time.monotonic() - issued_at > _PRESENTATION_TTL_SECONDS:
+            return None
+        return reckoning_id, version
+
+    def _interpret_decision_reply(
+        self, message: str, fields: dict[str, list[str]], csrf_token: str
+    ) -> DecisionReply | None:
+        """Resolve a conversation reply against the one active proposal.
+
+        Consent requires a server-issued presentation token proving this
+        session was rendered the proposal summary. Client-supplied fields are
+        never evidence of presentation; a stale, expired, or missing token
+        never confers consent.
+        """
         list_reckonings = getattr(self._application, "list_reckonings", None)
         if not callable(list_reckonings):
             return None
@@ -368,9 +425,37 @@ class ReckoningWebApplication:
                 "Home, then confirm or correct it there."
             )
         reckoning = proposed[0]
+
+        token = fields.get("decision_presentation_token", [""])[0]
+        bound = False
+        bound_version = reckoning.version
+        if token:
+            receipt = self._presentation_receipt(csrf_token, token)
+            if receipt is None:
+                return ClarifyDecision(
+                    "Your review context is missing or expired. Open the "
+                    "decision again and review the current proposal before "
+                    "confirming or correcting it."
+                )
+            target_id, target_version = receipt
+            if target_id != reckoning.id or target_version != reckoning.version:
+                # A completed operation resolves to its saved result before a
+                # retry is reinterpreted against current proposal state. The
+                # application still verifies the payload digest, so a changed
+                # payload under the same operation id conflicts there.
+                operation_id = fields.get("operation_id", [""])[0]
+                if not self._completed_operation_for(operation_id, reckoning.id):
+                    return ClarifyDecision(
+                        f"The proposal changed from revision {target_version} to "
+                        f"revision {reckoning.version}. Please review the current "
+                        "version before confirming or correcting it."
+                    )
+                bound_version = target_version
+            bound = True
+
         target = DecisionTarget(
             reckoning_id=reckoning.id,
-            version=reckoning.version,
+            version=bound_version,
             conflict=reckoning.draft.conflict,
             record_ids=tuple(
                 record.record_id for record in reckoning.current_records
@@ -379,6 +464,11 @@ class ReckoningWebApplication:
         reply = interpret_decision_message(message, target)
         if isinstance(reply, NotDecisionRelated):
             return None
+        if isinstance(reply, (ConfirmDecision, CorrectDecision)) and not bound:
+            return ClarifyDecision(
+                "Open the decision and review the proposal before confirming or "
+                "correcting it."
+            )
         return reply
 
     def _apply_decision_reply(
@@ -389,6 +479,7 @@ class ReckoningWebApplication:
         *,
         csrf_token: str,
         response_headers: tuple[tuple[str, str], ...],
+        operation_id: str | None = None,
     ) -> list[bytes]:
         assert self._interfaces is not None
         if isinstance(reply, ClarifyDecision):
@@ -399,12 +490,25 @@ class ReckoningWebApplication:
             )
             return [b""]
         assert isinstance(reply, (ConfirmDecision, CorrectDecision))
+        if operation_id is None:
+            return self._html_response(
+                start_response,
+                "400 Bad Request",
+                self._render_interface_area(
+                    "decision",
+                    error="Operation identity is required for confirmation or correction.",
+                    csrf_token=csrf_token,
+                    decision=self._safe_decision(reply.target.reckoning_id),
+                ),
+                extra_headers=response_headers,
+            )
         target = reply.target
         try:
             if isinstance(reply, ConfirmDecision):
                 outcome = self._application.confirm_reckoning(
                     target.reckoning_id,
                     expected_revision=target.version,
+                    operation_id=operation_id,
                 )
                 note = (
                     f'Confirmed "{target.conflict}" exactly as shown '
@@ -416,6 +520,7 @@ class ReckoningWebApplication:
                     reply.record_id,
                     reply.meaning,
                     expected_revision=target.version,
+                    operation_id=operation_id,
                 )
                 note = (
                     "Corrected the proposal. Revision "
@@ -491,6 +596,22 @@ class ReckoningWebApplication:
             )
         fields = self._read_form(environ)
         operation_id = fields.get("operation_id", [""])[0]
+        if action_name != "view" and not operation_id:
+            return self._html_response(
+                start_response,
+                "400 Bad Request",
+                self._render_interface_area(
+                    "simon" if action_name == "create" else "decision",
+                    error="Operation identity is required for this decision action.",
+                    csrf_token=csrf_token,
+                    pending_text=fields.get("situation", fields.get("message", [""]))[0]
+                    if action_name == "create"
+                    else "",
+                    pending_record_id=record_id,
+                    decision=self._safe_decision(reckoning_id),
+                ),
+                extra_headers=response_headers,
+            )
         pending_text = ""
         try:
             if action_name == "create":
@@ -589,6 +710,20 @@ class ReckoningWebApplication:
                 "simon", error="Unknown decision action.", csrf_token=csrf_token
             ),
             extra_headers=response_headers,
+        )
+
+    def _completed_operation_for(self, operation_id: str, reckoning_id: str) -> bool:
+        """True when operation_id completed a mutation on this reckoning."""
+        if not operation_id:
+            return False
+        inspect_operation = getattr(self._application, "inspect_operation", None)
+        if not callable(inspect_operation):
+            return False
+        record = inspect_operation(operation_id)
+        return (
+            record is not None
+            and record.status == "completed"
+            and record.result_id == reckoning_id
         )
 
     def _safe_decision(self, reckoning_id: str) -> Reckoning | None:
@@ -1300,7 +1435,7 @@ class ReckoningWebApplication:
             render_pending_input_card(operation, csrf_token)
             for operation in self._pending_decision_inputs()
         )
-        active_proposal = self._active_proposal_link()
+        active_proposal, target_fields = self._active_proposal_state(csrf_token)
         return f"""
           <header><p class="eyebrow">Conversation</p><h1>Simon</h1></header>
           <div aria-live="polite">{conversation}</div>{error_markup}
@@ -1313,6 +1448,7 @@ class ReckoningWebApplication:
                 value="{escape(csrf_token, quote=True)}">
               <input type="hidden" name="operation_id"
                 value="{escape(fresh_operation_id(), quote=True)}">
+              {target_fields}
               <label for="message">Your message</label>
               <textarea id="message" name="message" required
                 >{escape(pending_text)}</textarea>
@@ -1331,30 +1467,38 @@ class ReckoningWebApplication:
             return ()
         return pending()
 
-    def _active_proposal_link(self) -> str:
+    def _active_proposal_state(self, csrf_token: str) -> tuple[str, str]:
+        """Return (summary HTML, composer binding field) for one proposal.
+
+        Rendering the summary issues a server-side presentation receipt; the
+        composer carries only the opaque token.
+        """
         list_reckonings = getattr(self._application, "list_reckonings", None)
         if not callable(list_reckonings):
-            return ""
+            return "", ""
         proposed = tuple(
             reckoning
             for reckoning in list_reckonings()
             if reckoning.status == "proposed"
         )
-        if not proposed:
-            return ""
-        links = "".join(
-            f'<li><a href="/decisions/{escape(reckoning.id, quote=True)}">'
-            f"{escape(reckoning.draft.conflict)}</a> · revision "
-            f"{reckoning.version}</li>"
-            for reckoning in proposed
-        )
-        return (
+        if len(proposed) != 1:
+            return "", ""
+        reckoning = proposed[0]
+        summary = (
             '<section class="card" aria-labelledby="active-proposal">'
             '<h2 id="active-proposal">Waiting for your review</h2>'
-            "<p>Reply 'confirm' to confirm the proposal exactly as shown, or "
-            "tell me the correction. You can also open it and edit directly.</p>"
-            f"<ul>{links}</ul></section>"
+            f'<p>Reply <code>confirm</code> to confirm <strong>'
+            f'{escape(reckoning.draft.conflict)}</strong> (revision '
+            f'{reckoning.version}) exactly as shown, or tell me the correction. '
+            f'You can also <a href="/decisions/{escape(reckoning.id, quote=True)}">'
+            "open it</a> and edit directly.</p></section>"
         )
+        presentation_token = self._issue_presentation(csrf_token, reckoning)
+        target_fields = (
+            f'<input type="hidden" name="decision_presentation_token" '
+            f'value="{escape(presentation_token, quote=True)}">'
+        )
+        return summary, target_fields
 
 
     def _render_inspector(

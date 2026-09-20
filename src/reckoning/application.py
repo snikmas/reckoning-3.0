@@ -638,6 +638,12 @@ class ReckoningApplication:
         """Failed proposal operations whose received input is still outstanding."""
         return self._dependencies.reckoning_repository.list_pending_operations()
 
+    def inspect_operation(self, operation_id: str) -> OperationRecord | None:
+        """Return the stored replay record for an operation id, if any."""
+        if not operation_id:
+            return None
+        return self._dependencies.reckoning_repository.lookup_operation(operation_id)
+
     def start_reckoning(
         self, text: str, *, operation_id: str | None = None
     ) -> Reckoning:
