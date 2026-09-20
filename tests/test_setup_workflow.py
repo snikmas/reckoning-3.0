@@ -9,13 +9,22 @@ from __future__ import annotations
 
 import json
 import stat
+from datetime import UTC
 from pathlib import Path
 
 import pytest
 
 from reckoning.config import ProviderCredentialStore
-from reckoning.operations import OperationError, setup_instance
+from reckoning.operations import (
+    OperationError,
+    load_installation_runtime,
+    setup_instance,
+)
 from reckoning.personal_context import JsonFilePersonalContextRepository
+from reckoning.processing import (
+    PROCESSING_CATEGORIES,
+    JsonFileProcessingGrantRepository,
+)
 from reckoning.provider_adapters import AdapterConfig, urlopen_transport
 from reckoning.setup_workflow import (
     MenuOption,
@@ -2080,3 +2089,269 @@ def test_installed_state_migration_preserves_choices_and_authorization(
     assert [item.original_text for item in versions] == [
         "I study computer science."
     ]
+
+
+
+def _grant_repository(data_dir: Path, server_data_dir: Path | None = None):
+    runtime = load_installation_runtime(data_dir, server_data_dir=server_data_dir)
+    return JsonFileProcessingGrantRepository(
+        runtime.state_path("confirmed-state", "processing-grants.json")
+    )
+
+
+def test_fresh_cloud_activation_creates_a_full_category_grant(
+    tmp_path: Path,
+) -> None:
+    transport, _ = chat_transport()
+    outcome, _ = run_workflow(
+        tmp_path,
+        list(DEEPSEEK_ANSWERS),
+        services=offline_services(transport=transport),
+    )
+
+    assert outcome.status == "activated"
+    assert outcome.provider_id == "deepseek"
+    repository = _grant_repository(tmp_path / "data")
+    grant = repository.get("deepseek@https://api.deepseek.com")
+    assert grant is not None
+    assert grant.version == 1
+    assert grant.allowed_categories == PROCESSING_CATEGORIES
+
+
+def test_fresh_cloud_activation_stores_grant_beside_confirmed_state_on_a_server(
+    tmp_path: Path,
+) -> None:
+    server_dir = tmp_path / "server"
+    transport, _ = chat_transport()
+    answers = [
+        ("provider", "deepseek"),
+        ("provider-key-source", "new"),
+        ("provider-key", "sk-test-deepseek"),
+        ("provider-model", "recommended"),
+        ("provider-verify-consent", "y"),
+        ("persona-live-sample", "n"),
+        ("connectors", "skip"),
+        ("persona", "simon"),
+        ("persona-accept", "y"),
+        ("profile", "skip"),
+        ("review-action", "placement"),
+        ("placement", "personal-server"),
+        ("server-data-dir", str(server_dir)),
+        ("review-action", "continue"),
+        ("first-message", "Help me plan the semester."),
+        ("first-message-action", "accept"),
+    ]
+
+    outcome, _ = run_workflow(
+        tmp_path,
+        answers,
+        services=offline_services(transport=transport),
+    )
+
+    assert outcome.status == "activated"
+    repository = _grant_repository(tmp_path / "data", server_data_dir=server_dir)
+    grant = repository.get("deepseek@https://api.deepseek.com")
+    assert grant is not None
+    assert grant.allowed_categories == PROCESSING_CATEGORIES
+    assert (server_dir / "confirmed-state" / "processing-grants.json").exists()
+
+
+def test_fake_activation_creates_no_processing_grant(tmp_path: Path) -> None:
+    outcome, _ = run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
+
+    assert outcome.status == "activated"
+    assert outcome.provider_id == "fake"
+    repository = _grant_repository(tmp_path / "data")
+    assert repository._path.exists() is False
+
+
+def test_activation_failure_rolls_back_the_new_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ui = ScriptedUI(list(GUIDED_FAKE_ANSWERS))
+    workflow = SetupWorkflow(
+        paths=make_paths(tmp_path),
+        ui=ui,
+        services=offline_services(),
+    )
+
+    def fail_reopen() -> None:
+        raise OperationError("simulated reopen failure")
+
+    monkeypatch.setattr(workflow, "_prove_reopen", fail_reopen)
+    with pytest.raises(OperationError, match="Activation failed"):
+        workflow.run()
+
+    assert not (tmp_path / "data").exists()
+    assert not (tmp_path / "data" / "confirmed-state" / "processing-grants.json").exists()
+
+
+def test_provider_change_creates_a_grant_for_the_new_destination(
+    tmp_path: Path,
+) -> None:
+    transport, _ = chat_transport()
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
+
+    run_workflow(
+        tmp_path,
+        [
+            ("status-action", "edit"),
+            ("edit-section", "provider"),
+            ("provider", "deepseek"),
+            ("provider-key-source", "new"),
+            ("provider-key", "sk-edited"),
+            ("provider-model", "recommended"),
+            ("provider-verify-consent", "y"),
+            ("persona-live-sample", "n"),
+            ("status-action", "exit"),
+        ],
+        services=offline_services(transport=transport),
+    )
+
+    repository = _grant_repository(tmp_path / "data")
+    assert repository.get("deepseek@https://api.deepseek.com") is not None
+
+
+def test_provider_change_keeps_previous_destination_grants(
+    tmp_path: Path,
+) -> None:
+    transport, _ = chat_transport()
+    run_workflow(
+        tmp_path,
+        list(DEEPSEEK_ANSWERS),
+        services=offline_services(transport=transport),
+    )
+    first_repository = _grant_repository(tmp_path / "data")
+    first_grant = first_repository.get("deepseek@https://api.deepseek.com")
+    assert first_grant is not None
+
+    run_workflow(
+        tmp_path,
+        [
+            ("status-action", "edit"),
+            ("edit-section", "provider"),
+            ("provider", "fake"),
+            ("status-action", "exit"),
+        ],
+        services=offline_services(transport=transport),
+    )
+
+    repository = _grant_repository(tmp_path / "data")
+    assert repository.get("deepseek@https://api.deepseek.com") == first_grant
+
+
+def test_provider_change_preserves_a_narrowed_grant_for_the_same_destination(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime
+
+    from reckoning.processing import ProcessingDestination, ProcessingScope
+
+    transport, _ = chat_transport()
+    run_workflow(
+        tmp_path,
+        list(DEEPSEEK_ANSWERS),
+        services=offline_services(transport=transport),
+    )
+    repository = _grant_repository(tmp_path / "data")
+    destination = ProcessingDestination(
+        "deepseek", "https://api.deepseek.com", "cloud"
+    )
+    ProcessingScope(repository, destination).change(
+        ("current-request",),
+        changed_at=datetime.now(UTC),
+        expected_version=1,
+    )
+
+    run_workflow(
+        tmp_path,
+        [
+            ("status-action", "edit"),
+            ("edit-section", "provider"),
+            ("provider", "deepseek"),
+            ("provider-key-source", "saved"),
+            ("provider-model", "recommended"),
+            ("provider-verify-consent", "y"),
+            ("persona-live-sample", "n"),
+            ("status-action", "exit"),
+        ],
+        services=offline_services(transport=transport),
+    )
+
+    grant = _grant_repository(tmp_path / "data").get(destination.id)
+    assert grant is not None
+    assert grant.allowed_categories == ("current-request",)
+
+
+def test_provider_change_failure_restores_the_grant_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reckoning.config import RuntimeProviderSettings
+
+    transport, _ = chat_transport()
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
+    original_grant_path = _grant_repository(tmp_path / "data")._path
+    original_grant_bytes = (
+        original_grant_path.read_bytes() if original_grant_path.exists() else None
+    )
+    original_instance = (tmp_path / "data" / "instance.json").read_bytes()
+
+    original_load = RuntimeProviderSettings.load.__func__
+    load_calls = 0
+
+    def fail_commit_reopen(cls, *args: object, **kwargs: object):
+        nonlocal load_calls
+        load_calls += 1
+        if load_calls == 2:
+            raise ValueError("simulated provider reopen failure")
+        return original_load(cls, *args, **kwargs)
+
+    monkeypatch.setattr(
+        RuntimeProviderSettings,
+        "load",
+        classmethod(fail_commit_reopen),
+    )
+
+    with pytest.raises(OperationError, match="rolled back"):
+        run_workflow(
+            tmp_path,
+            [
+                ("status-action", "edit"),
+                ("edit-section", "provider"),
+                ("provider", "deepseek"),
+                ("provider-key-source", "new"),
+                ("provider-key", "sk-edited"),
+                ("provider-model", "recommended"),
+                ("provider-verify-consent", "y"),
+                ("persona-live-sample", "n"),
+            ],
+            services=offline_services(transport=transport),
+        )
+
+    assert (tmp_path / "data" / "instance.json").read_bytes() == original_instance
+    if original_grant_bytes is None:
+        assert not original_grant_path.exists()
+    else:
+        assert original_grant_path.read_bytes() == original_grant_bytes
+
+
+def test_migration_cannot_leave_a_grant_without_an_activation_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the activation marker fails to commit, the grant is rolled back too."""
+    _legacy_installation(tmp_path)
+    _flaky_replace(monkeypatch, 4)  # activation marker is the last commit write
+
+    workflow = SetupWorkflow(
+        paths=make_paths(tmp_path),
+        ui=ScriptedUI([("migrate", "migrate"), ("migrate-confirm", "y")]),
+        services=offline_services(),
+    )
+    with pytest.raises(OperationError, match="Migration failed"):
+        workflow.run()
+
+    assert not (
+        tmp_path / "data" / "confirmed-state" / "processing-grants.json"
+    ).exists()
+    instance = json.loads((tmp_path / "data" / "instance.json").read_text())
+    assert "activation" not in instance

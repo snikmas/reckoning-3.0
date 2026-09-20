@@ -103,7 +103,9 @@ possible paid charge, and then sends one small fixed, non-personal test
 request. The key never echoes to the terminal. If verification fails, setup
 offers Retry, Edit, Back, Save for later (the credential stays inactive), or
 Exit. A searchable model screen follows, with the recommended model
-preselected and manual entry under Advanced.
+preselected and manual entry under Advanced. Successful verification creates
+the initial processing grant for that provider destination automatically; the
+grant covers all categories and can be narrowed or revoked later.
 
 Keys are saved in `~/.config/reckoning/provider.json` with owner-only
 permissions. The file can hold one key per provider plus the default-provider
@@ -143,9 +145,13 @@ Run:
 reckoning doctor
 ```
 
-The report covers the instance configuration and JSON state files, rendered as
-a table with a fix pointer for each problem. The default report makes no
-network calls; add `--ping` to verify the saved provider key live.
+The report covers installation configuration, JSON state validation, and runtime
+placement availability, with a fix pointer for each problem. A healthy report
+is not complete SQLite recovery or product-acceptance evidence. The default
+report makes no network calls; add `--ping` to verify the saved provider key live.
+If the active cloud destination is missing its processing grant, `reckoning doctor`
+reports the destination and suggests `reckoning doctor --repair`, which creates
+the missing full-category grant idempotently without changing narrowed grants.
 
 ## Develop and test
 

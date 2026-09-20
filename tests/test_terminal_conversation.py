@@ -6,7 +6,11 @@ persist through the interface repository, not just echo in the process.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Self
+
+import pytest
 
 from reckoning.command import main as command_main
 from reckoning.interfaces import JsonFileInterfaceRepository
@@ -90,3 +94,86 @@ def test_terminal_exits_without_a_durable_session_when_nothing_is_sent(
         runtime.state_path("confirmed-state", "interfaces.json")
     ).load()
     assert not any(session.channel == "terminal" for session in state.sessions)
+
+
+
+def test_terminal_message_works_after_cloud_setup_with_synthetic_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "data"
+    credentials = tmp_path / "provider.json"
+    telegram = tmp_path / "telegram.json"
+    draft = tmp_path / "setup-draft.json"
+
+    calls: list[object] = []
+
+    class FakeResponse:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "model": "deepseek-chat",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Synthetic cloud answer.",
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 4,
+                        "completion_tokens": 3,
+                        "total_tokens": 7,
+                    },
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request: object, timeout: float) -> FakeResponse:
+        calls.append(request)
+        return FakeResponse()
+
+    monkeypatch.setattr("reckoning.provider_adapters.urlopen", fake_urlopen)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek")
+
+    setup_code = command_main(
+        [
+            "setup",
+            "--non-interactive",
+            "--data-dir",
+            str(data_dir),
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-chat",
+            "--credentials",
+            str(credentials),
+            "--telegram-config",
+            str(telegram),
+            "--draft-path",
+            str(draft),
+        ]
+    )
+    assert setup_code == 0
+
+    replies = iter(["What should I focus on today?", "/exit"])
+    outputs: list[str] = []
+
+    terminal_code = terminal_main(
+        ["--data-dir", str(data_dir), "--credentials", str(credentials)],
+        line_reader=lambda prompt: next(replies),
+        output=outputs.append,
+    )
+
+    assert terminal_code == 0
+    assert any(
+        line.startswith("Simon: ") and "Synthetic cloud answer." in line
+        for line in outputs
+    )
+    assert not any("Could not answer" in line for line in outputs)
+    assert len(calls) == 3  # verification, first conversation, terminal message

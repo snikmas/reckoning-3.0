@@ -187,11 +187,13 @@ Each source category has its own subdirectory under the assigned node root.
 Setup writes `instance.json` and runs a disposable continuity check with the
 deterministic fake provider; the check adds no synthetic records to the new
 instance. Activation then proves the selected provider with a real completion,
-persists the accepted first conversation, and re-opens the installed state
-before reporting completion — a disposable proof store is never treated as the
-installation. Failures name the failing step, a safe cause, and the next
-actions; `reckoning doctor` reports health, and `--debug` keeps tracebacks
-available locally.
+persists the accepted first conversation, creates the initial full-category
+processing grant for the active cloud destination, and re-opens the installed
+state before reporting completion — a disposable proof store is never treated
+as the installation. Fake and local providers do not receive a processing
+grant. Failures name the failing step, a safe cause, and the next actions;
+`reckoning doctor` reports health, and `--debug` keeps tracebacks available
+locally.
 
 Setup builds the local and optional server roots in sibling staging
 directories. It moves them into place only after every required file is ready.
@@ -269,8 +271,19 @@ separate from setup repair.
 reckoning doctor
 ```
 
-The command validates each JSON state file and renders the report as a table with a fix pointer per problem. The default report makes no network calls; `reckoning doctor --ping` adds a live check of the saved provider key. It reports `healthy` only when the
-instance configuration exists and every state file contains a JSON object.
+The command checks installation configuration, JSON state files, and runtime
+placement availability, with a fix pointer for each problem. The default report
+makes no network calls; `reckoning doctor --ping` adds a live provider check.
+
+`reckoning doctor --repair` creates the missing full-category processing grant
+for the currently activated cloud destination, but only when no grant already
+exists. It preserves narrowed or revoked grants, makes no provider call, and
+reads no API-key value. The command prints the destination and the granted
+categories, then exits.
+
+The installation also contains transactional SQLite state. A healthy doctor
+report is not proof of a complete database recovery or an accepted product
+journey. Use the backup/restore checks and dated stage evidence for those claims.
 
 ## Create an encrypted backup
 
