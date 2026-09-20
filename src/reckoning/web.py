@@ -1419,12 +1419,22 @@ class ReckoningWebApplication:
     ) -> str:
         assert self._interfaces is not None
         messages = self._interfaces.channel_session("web")
+        notices = self._interfaces.channel_notices("web")
         conversation = "".join(
             '<article class="message">'
             f'<strong>{"You" if message.role == "user" else "Simon"}</strong>'
             f"<p>{escape(message.content)}</p></article>"
             for message in messages
         ) or '<p class="empty">Send Simon the first message.</p>'
+        notice_markup = ""
+        if notices:
+            notice_items = "".join(
+                f'<li>{escape(notice)}</li>' for notice in notices
+            )
+            notice_markup = (
+                '<section class="status-notices" aria-label="Status notices">'
+                f'<ul>{notice_items}</ul></section>'
+            )
         error_markup = f'<p class="error">{escape(error)}</p>' if error else ""
         profile_review = (
             self._render_profile_review(csrf_token)
@@ -1438,6 +1448,7 @@ class ReckoningWebApplication:
         active_proposal, target_fields = self._active_proposal_state(csrf_token)
         return f"""
           <header><p class="eyebrow">Conversation</p><h1>Simon</h1></header>
+          {notice_markup}
           <div aria-live="polite">{conversation}</div>{error_markup}
           {active_proposal}
           {pending_cards}

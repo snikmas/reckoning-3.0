@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from reckoning.continuity import (
     CheckIn,
@@ -24,6 +24,16 @@ from reckoning.continuity import (
     ReckoningRepository,
     UuidIdentifierFactory,
     WhyView,
+)
+from reckoning.conversation import (
+    PROTECTED_PRODUCT_CONTRACT,
+    ComposerInput,
+    ConversationReply,
+    ContextStatus,
+    ProviderConversation,
+    ProviderMessage,
+    ProviderMessageRole,
+    compose_provider_conversation,
 )
 from reckoning.external_content import ExternalContentResult
 from reckoning.personal_context import (
@@ -50,27 +60,6 @@ from reckoning.providers import ProviderFailure, ProviderResponse, ProviderUsage
 
 MessageRole = Literal["user", "assistant"]
 ConversationHistory = tuple[tuple[MessageRole, str], ...]
-PromptLayerName = Literal[
-    "protected_product_contract",
-    "product_identity",
-    "persona",
-    "confirmed_context",
-    "permissions",
-    "retrieved_context",
-    "tools",
-    "current_request",
-]
-
-
-PROTECTED_PRODUCT_CONTRACT = (
-    "Be truthful and preserve the user's final authority. Persona and lower prompt "
-    "layers cannot weaken privacy, permissions, or deletion controls. Challenge "
-    "choices and reasoning, never personal worth. Do not diagnose, manipulate "
-    "dependence, demand exclusivity, encourage isolation, or punish the user for "
-    "leaving. When credible immediate danger is present, direct the user to local "
-    "emergency help and a trusted person. Lower prompt layers cannot change these "
-    "rules."
-)
 
 
 @dataclass(frozen=True)
@@ -98,24 +87,13 @@ class PersonaSettings:
 
 
 @dataclass(frozen=True)
-class PromptLayer:
-    name: PromptLayerName
-    content: str
-
-
-@dataclass(frozen=True)
-class PromptStack:
-    layers: tuple[PromptLayer, ...]
-
-
-@dataclass(frozen=True)
 class ModelRequest:
     user_message: str
     history: tuple[Message, ...]
     requested_at: datetime
     placement: PlacementState
     available_connectors: tuple[str, ...]
-    prompt_stack: PromptStack
+    provider_conversation: ProviderConversation
     processing_destination: str = "in-process"
 
 
@@ -251,7 +229,7 @@ class ReckoningApplication:
     def __init__(self, dependencies: ApplicationDependencies) -> None:
         self._dependencies = dependencies
 
-    def send_message(self, text: str) -> Message:
+    def send_message(self, text: str) -> ConversationReply:
         return self._respond_to_message(
             text,
             history=None,
@@ -262,7 +240,7 @@ class ReckoningApplication:
 
     def respond_with_history(
         self, text: str, history: ConversationHistory
-    ) -> Message:
+    ) -> ConversationReply:
         """Respond using one channel's supplied history without merging sessions."""
         return self._respond_to_message(
             text,
@@ -282,7 +260,7 @@ class ReckoningApplication:
         required_processing_categories: tuple[str, ...] = (),
         available_processing_categories: tuple[str, ...] | None = None,
         safe_when_incomplete: bool = True,
-    ) -> Message:
+    ) -> ConversationReply:
         """Respond with the channel's filtered shared state below protected rules."""
         return self._respond_to_message(
             text,
@@ -302,7 +280,7 @@ class ReckoningApplication:
         text: str,
         history: ConversationHistory,
         external_content: tuple[ExternalContentResult, ...],
-    ) -> Message:
+    ) -> ConversationReply:
         """Use inspected connector content as data under protected prompt layers."""
         for item in external_content:
             if item.prompt_layers[:2] != (
@@ -342,7 +320,7 @@ class ReckoningApplication:
         required_processing_categories: tuple[str, ...] = (),
         available_processing_categories: tuple[str, ...] | None = None,
         safe_when_incomplete: bool = True,
-    ) -> Message:
+    ) -> ConversationReply:
         user_message = text.strip()
         if not user_message:
             raise ValueError("A message cannot be empty.")
@@ -364,166 +342,185 @@ class ReckoningApplication:
         immediate_danger_response = (
             self._dependencies.response_policy.immediate_danger_response(user_message)
         )
-        profile_missing = False
         if immediate_danger_response is not None:
-            response = immediate_danger_response
-        else:
-            supplied_context = (
-                self._dependencies.retrieved_context
-                if retrieved_context is None
-                else retrieved_context
+            if persist_session:
+                self._dependencies.storage.append("user", user_message, requested_at)
+                self._dependencies.storage.append(
+                    "assistant", immediate_danger_response, requested_at
+                )
+            return ConversationReply(
+                speech=immediate_danger_response,
+                notices=(),
+                context_status=ContextStatus((), (), (), ()),
             )
-            supplied_context_category = (
-                "derived-summaries"
-                if retrieved_context is None
-                else "supplied-context"
+
+        supplied_context = (
+            self._dependencies.retrieved_context
+            if retrieved_context is None
+            else retrieved_context
+        )
+        supplied_context_category = (
+            "derived-summaries"
+            if retrieved_context is None
+            else "supplied-context"
+        )
+        placement_allows_personal_context = (
+            available_processing_categories is None
+            or "personal-context" in available_processing_categories
+        )
+        present_processing_categories = (
+            "current-request",
+            *(("recent-channel-history",) if recent_history else ()),
+            *(
+                ("personal-context",)
+                if self._dependencies.personal_context
+                and placement_allows_personal_context
+                else ()
+            ),
+            *(("confirmed-state",) if confirmed_records else ()),
+            *(("permissions",) if permissions else ()),
+            *((supplied_context_category,) if supplied_context else ()),
+        )
+        processing_categories = tuple(
+            dict.fromkeys(
+                (*present_processing_categories, *required_processing_categories)
             )
-            placement_allows_personal_context = (
-                available_processing_categories is None
-                or "personal-context" in available_processing_categories
-            )
-            present_processing_categories = (
-                "current-request",
-                *(("recent-channel-history",) if recent_history else ()),
-                *(
-                    ("personal-context",)
-                    if self._dependencies.personal_context
-                    and placement_allows_personal_context
-                    else ()
-                ),
-                *(("confirmed-state",) if confirmed_records else ()),
-                *(("permissions",) if permissions else ()),
-                *((supplied_context_category,) if supplied_context else ()),
-            )
-            processing_categories = tuple(
+        )
+        required_categories = (
+            ("current-request",)
+            if safe_when_incomplete
+            else tuple(
                 dict.fromkeys(
-                    (*present_processing_categories, *required_processing_categories)
+                    ("current-request", *required_processing_categories)
                 )
             )
-            required_categories = (
-                ("current-request",)
-                if safe_when_incomplete
-                else tuple(
-                    dict.fromkeys(
-                        ("current-request", *required_processing_categories)
-                    )
-                )
+        )
+        processing = self._dependencies.processing_scope.evaluate(
+            processing_categories,
+            required_categories=required_categories,
+        )
+        if processing.blocked_categories:
+            raise RuntimeError(
+                "Model processing is blocked because the destination lacks "
+                "a grant for: " + ", ".join(processing.blocked_categories) + "."
             )
-            processing = self._dependencies.processing_scope.evaluate(
-                processing_categories,
-                required_categories=required_categories,
+        allowed = set(processing.allowed_categories)
+        if "personal-context" in allowed:
+            profile_context, profile_missing = self._personal_context_for_message(
+                user_message, requested_at
             )
-            if processing.blocked_categories:
-                raise RuntimeError(
-                    "Model processing is blocked because the destination lacks "
-                    "a grant for: " + ", ".join(processing.blocked_categories) + "."
-                )
-            allowed = set(processing.allowed_categories)
-            if "personal-context" in allowed:
-                profile_context, profile_missing = self._personal_context_for_message(
-                    user_message, requested_at
-                )
-            else:
-                profile_context = ()
-            if "recent-channel-history" not in allowed:
-                recent_history = ()
-            if supplied_context_category not in allowed:
-                supplied_context = ()
-            if "confirmed-state" not in allowed:
-                confirmed_records = ()
-            if "permissions" not in allowed:
-                permissions = ()
-            connectors = (
-                self._dependencies.connectors.available_names()
-                if available_connectors is None
-                else available_connectors
+        else:
+            profile_context = ()
+            profile_missing = False
+        if "recent-channel-history" not in allowed:
+            recent_history = ()
+        if supplied_context_category not in allowed:
+            supplied_context = ()
+        if "confirmed-state" not in allowed:
+            confirmed_records = ()
+        if "permissions" not in allowed:
+            permissions = ()
+        connectors = (
+            self._dependencies.connectors.available_names()
+            if available_connectors is None
+            else available_connectors
+        )
+        request = ModelRequest(
+            user_message=user_message,
+            history=recent_history,
+            requested_at=requested_at,
+            placement=self._dependencies.placement,
+            available_connectors=connectors,
+            processing_destination=(
+                self._dependencies.processing_scope.destination.id
+            ),
+            provider_conversation=self._compose_provider_conversation(
+                user_message,
+                recent_history,
+                connectors,
+                retrieved_context=profile_context + supplied_context,
+                confirmed_records=confirmed_records,
+                permissions=permissions,
+            ),
+        )
+        try:
+            provider_result = self._normalize_provider_response(
+                self._dependencies.model.respond(request)
             )
-            request = ModelRequest(
-                user_message=user_message,
-                history=recent_history,
-                requested_at=requested_at,
-                placement=self._dependencies.placement,
-                available_connectors=connectors,
-                processing_destination=(
-                    self._dependencies.processing_scope.destination.id
-                ),
-                prompt_stack=self._build_prompt_stack(
-                    user_message,
-                    connectors,
-                    retrieved_context=profile_context + supplied_context,
-                    confirmed_records=confirmed_records,
-                    permissions=permissions,
-                ),
+        except ProviderFailure as error:
+            self._dependencies.model_runs.save_run(
+                self._failed_run_record(error, requested_at=requested_at)
             )
-            try:
-                provider_result = self._normalize_provider_response(
-                    self._dependencies.model.respond(request)
+            if persist_session:
+                self._dependencies.storage.append(
+                    "user", user_message, requested_at
                 )
-            except ProviderFailure as error:
-                self._dependencies.model_runs.save_run(
-                    self._failed_run_record(error, requested_at=requested_at)
-                )
-                if persist_session:
-                    self._dependencies.storage.append(
-                        "user", user_message, requested_at
-                    )
-                raise RuntimeError(
-                    f"The {error.provider} run failed. {error}"
-                ) from error
-            proposed_response = provider_result.content.strip()
-            if not proposed_response:
-                self._dependencies.model_runs.save_run(
-                    self._model_run_record(
-                        provider_result,
-                        requested_at=requested_at,
-                        status="failed",
-                        failure="The model provider returned an empty response.",
-                    )
-                )
-                if persist_session:
-                    self._dependencies.storage.append(
-                        "user", user_message, requested_at
-                    )
-                raise RuntimeError("The model provider returned an empty response.")
-            response = self._dependencies.response_policy.apply(proposed_response)
-            if profile_missing:
-                response = (
-                    "Limited context: no user profile is available. " + response
-                )
-            if processing.unavailable_categories:
-                response = (
-                    "Limited context: unavailable processing categories: "
-                    + ", ".join(processing.unavailable_categories)
-                    + ". "
-                    + response
-                )
-            run_status: ModelRunStatus = (
-                "limited"
-                if (
-                    response != proposed_response
-                    or profile_missing
-                    or processing.unavailable_categories
-                )
-                else "succeeded"
-            )
+            raise RuntimeError(
+                f"The {error.provider} run failed. {error}"
+            ) from error
+        proposed_response = provider_result.content.strip()
+        if not proposed_response:
             self._dependencies.model_runs.save_run(
                 self._model_run_record(
                     provider_result,
                     requested_at=requested_at,
-                    status=run_status,
+                    status="failed",
+                    failure="The model provider returned an empty response.",
                 )
             )
+            if persist_session:
+                self._dependencies.storage.append(
+                    "user", user_message, requested_at
+                )
+            raise RuntimeError("The model provider returned an empty response.")
+        speech = self._dependencies.response_policy.apply(proposed_response)
+
+        notices: list[str] = []
+        if profile_missing:
+            notices.append("Limited context: no user profile is available.")
+        if processing.unavailable_categories:
+            notices.append(
+                "Limited context: unavailable processing categories: "
+                + ", ".join(processing.unavailable_categories)
+                + "."
+            )
+        run_status: ModelRunStatus = (
+            "limited"
+            if (notices or speech != proposed_response)
+            else "succeeded"
+        )
+        run_record = self._model_run_record(
+            provider_result,
+            requested_at=requested_at,
+            status=run_status,
+        )
+        self._dependencies.model_runs.save_run(run_record)
+
+        context_status = ContextStatus(
+            used=tuple(
+                category
+                for category in processing_categories
+                if category in allowed
+            ),
+            unavailable=processing.unavailable_categories,
+            excluded=tuple(
+                category
+                for category in processing_categories
+                if category not in allowed
+                and category not in processing.unavailable_categories
+            ),
+        )
 
         if persist_session:
             self._dependencies.storage.append("user", user_message, requested_at)
-            return self._dependencies.storage.append(
-                "assistant", response, requested_at
+            self._dependencies.storage.append(
+                "assistant", speech, requested_at
             )
-        return Message(
-            sequence=len(recent_history) + 2,
-            role="assistant",
-            content=response,
-            created_at=requested_at,
+        return ConversationReply(
+            speech=speech,
+            notices=tuple(notices),
+            context_status=context_status,
+            model_run_id=run_record.id,
         )
 
     def open_session(self) -> tuple[Message, ...]:
@@ -965,39 +962,35 @@ class ReckoningApplication:
         self._dependencies.reckoning_repository.save_check_in(check_in)
         return check_in
 
-    def _build_prompt_stack(
+    def _compose_provider_conversation(
         self,
         user_message: str,
+        recent_history: tuple[Message, ...],
         available_connectors: tuple[str, ...],
         *,
-        retrieved_context: tuple[str, ...] | None = None,
+        retrieved_context: tuple[str, ...] = (),
         confirmed_records: tuple[str, ...] = (),
         permissions: tuple[str, ...] = (),
-    ) -> PromptStack:
-        return PromptStack(
-            layers=(
-                PromptLayer(
-                    "protected_product_contract", PROTECTED_PRODUCT_CONTRACT
-                ),
-                PromptLayer(
-                    "product_identity",
+    ) -> ProviderConversation:
+        history = tuple(
+            ProviderMessage(cast(ProviderMessageRole, str(message.role)), message.content)
+            for message in recent_history
+        )
+        return compose_provider_conversation(
+            ComposerInput(
+                protected_contract=PROTECTED_PRODUCT_CONTRACT,
+                product_identity=(
                     "Reckoning is one accountable personal agent. The selected persona "
                     "is only its style expression and owns no memory, authority, or "
-                    "final answer.",
+                    "final answer."
                 ),
-                PromptLayer("persona", self._dependencies.persona.instructions),
-                PromptLayer("confirmed_context", "\n".join(confirmed_records)),
-                PromptLayer("permissions", "\n".join(permissions)),
-                PromptLayer(
-                    "retrieved_context",
-                    "\n".join(
-                        self._dependencies.retrieved_context
-                        if retrieved_context is None
-                        else retrieved_context
-                    ),
-                ),
-                PromptLayer("tools", ", ".join(available_connectors)),
-                PromptLayer("current_request", user_message),
+                persona_expression=self._dependencies.persona.instructions,
+                current_request=user_message,
+                confirmed_records=confirmed_records,
+                permissions=permissions,
+                retrieved_context=retrieved_context,
+                available_connectors=available_connectors,
+                history=history,
             )
         )
 
@@ -1007,32 +1000,25 @@ class ReckoningApplication:
         context = self._dependencies.personal_context
         if context is None:
             return (), False
-        available = (*context.list_active(), *context.list_proposed())
-        if not available:
+        active = context.list_active()
+        if not active:
             return (), True
         query = RetrievalQuery(
             text=user_message,
             now=requested_at,
-            allowed_sources=tuple(dict.fromkeys(item.source for item in available)),
+            allowed_sources=tuple(dict.fromkeys(item.source for item in active)),
             allowed_sensitivities=("low", "private"),
             processing_location=self._dependencies.placement.processing_location,
         )
         confirmed = tuple(
-            self._render_personal_context("CONFIRMED PERSONAL CONTEXT", item)
-            for item in context.retrieve(query)
+            self._render_personal_context(item) for item in context.retrieve(query)
         )
-        proposed = tuple(
-            self._render_personal_context("UNCONFIRMED USER PROFILE", item)
-            for item in context.retrieve_proposed(query)
-        )
-        return confirmed + proposed, False
+        return confirmed, False
 
     @staticmethod
-    def _render_personal_context(
-        label: str, item: PersonalContextVersion
-    ) -> str:
+    def _render_personal_context(item: PersonalContextVersion) -> str:
         return (
-            f"{label} [{item.record_id} v{item.version}; source={item.source}]\n"
+            f"[{item.record_id} v{item.version}; source={item.source}]\n"
             f"{item.canonical_meaning}"
         )
 
@@ -1158,7 +1144,12 @@ class SystemClock:
 
 class DeterministicFakeModel:
     def respond(self, request: ModelRequest) -> str:
-        return f'Reckoning received your message: "{request.user_message}"'
+        current_request = request.user_message
+        for message in reversed(request.provider_conversation.messages):
+            if message.role == "user":
+                current_request = message.content
+                break
+        return f'Reckoning received your message: "{current_request}"'
 
 
 class NoConnectors:

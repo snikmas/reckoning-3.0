@@ -485,21 +485,31 @@ class _ProviderSetupResponder:
         self._transport = transport
 
     def respond(self, text: str) -> str:
+        from reckoning.conversation import (
+            PROTECTED_PRODUCT_CONTRACT,
+            ComposerInput,
+            compose_provider_conversation,
+        )
         from reckoning.personas import SelectedPersona
 
-        contract = (
-            "Be truthful and preserve the user's final authority. "
-            "Challenge choices and reasoning, never personal worth."
+        conversation = compose_provider_conversation(
+            ComposerInput(
+                protected_contract=PROTECTED_PRODUCT_CONTRACT,
+                product_identity=(
+                    "Reckoning is one accountable personal agent. The selected "
+                    "persona is only its style expression."
+                ),
+                persona_expression=SelectedPersona(self._persona).prompt_instructions,
+                current_request=text.strip(),
+            )
         )
-        identity = (
-            "Reckoning is one accountable personal agent. The selected "
-            "persona is only its style expression."
+        messages = tuple(
+            (message.role, message.content)
+            for message in conversation.messages
         )
-        persona = SelectedPersona(self._persona).prompt_instructions
-        system = f"{contract}\n\n{identity}\n\n{persona}"
         completion = self._adapter.complete(
             self._config,
-            (("system", system), ("user", text.strip())),
+            messages,
             transport=self._transport,
         )
         return completion.content

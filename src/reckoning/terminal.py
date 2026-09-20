@@ -97,6 +97,8 @@ def main(
         except (RuntimeError, ValueError) as error:
             output(f"Could not answer: {error}")
             continue
+        for notice in reply.notices:
+            output(f"Notice: {notice}")
         output(f"{runtime.persona.name}: {reply.text}")
     output("Reckoning stopped.")
     return 0

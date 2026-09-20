@@ -1476,7 +1476,7 @@ def test_keyless_local_provider_remains_active_in_the_installed_runtime(
         placement=runtime.application_placement,
     )
     answer = application.send_message("Use the installed local provider.")
-    assert "Local runtime answer." in answer.content
+    assert "Local runtime answer." in answer.speech
     assert calls[-1].full_url == "http://127.0.0.1:11434/v1/chat/completions"
 
 

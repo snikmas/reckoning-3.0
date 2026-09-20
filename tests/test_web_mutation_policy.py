@@ -11,6 +11,7 @@ import pytest
 
 from reckoning.interfaces import (
     ChannelRequest,
+    ChannelResponse,
     InMemoryInterfaceRepository,
     PlacementPolicy,
     ReckoningInterfaceApplication,
@@ -29,11 +30,11 @@ class RecordingResponder:
         self.response = response
         self.requests: list[ChannelRequest] = []
 
-    def respond(self, request: ChannelRequest) -> str:
+    def respond(self, request: ChannelRequest) -> ChannelResponse:
         self.requests.append(request)
         if self.response == "raise":
             raise RuntimeError("Provider unavailable")
-        return self.response
+        return ChannelResponse(speech=self.response, notices=())
 
 
 def test_allowed_origins_are_exact_and_canonical() -> None:

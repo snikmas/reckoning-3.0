@@ -33,6 +33,7 @@ from reckoning.interfaces import (
     ApplicationChannelResponder,
     ChannelMessage,
     ChannelRequest,
+    ChannelResponse,
     ChannelSession,
     InMemoryInterfaceRepository,
     InterfaceState,
@@ -61,9 +62,9 @@ class RecordingResponder:
         self.response = response
         self.requests: list[ChannelRequest] = []
 
-    def respond(self, request: ChannelRequest) -> str:
+    def respond(self, request: ChannelRequest) -> ChannelResponse:
         self.requests.append(request)
-        return self.response
+        return ChannelResponse(speech=self.response, notices=())
 
 
 class ActivityInspectingResponder:
@@ -71,10 +72,10 @@ class ActivityInspectingResponder:
         self._repository = repository
         self.activity_during_response = ""
 
-    def respond(self, request: ChannelRequest) -> str:
+    def respond(self, request: ChannelRequest) -> ChannelResponse:
         del request
         self.activity_during_response = self._repository.load().activity
-        return "I considered the current trade-off."
+        return ChannelResponse(speech="I considered the current trade-off.", notices=())
 
 
 class FixedClock:
@@ -937,19 +938,17 @@ def test_real_channel_boundary_passes_shared_context_below_protected_layers() ->
 
     interface.send_channel_message("telegram", "What should I do?", session_id="42")
 
-    layers = model.requests[0].prompt_stack.layers
-    assert [layer.name for layer in layers] == [
-        "protected_product_contract",
-        "product_identity",
-        "persona",
-        "confirmed_context",
-        "permissions",
-        "retrieved_context",
-        "tools",
-        "current_request",
+    messages = model.requests[0].provider_conversation.messages
+    assert [message.role for message in messages] == [
+        "system",
+        "system",
+        "system",
+        "user",
+        "system",
+        "user",
     ]
-    assert layers[3].content == "decision d-1: keep the smaller proof"
-    assert layers[4].content == "calendar.read"
+    assert "decision d-1: keep the smaller proof" in messages[3].content
+    assert "calendar.read" in messages[4].content
 
 
 def test_hybrid_placement_prevents_private_copy_and_declares_limited_mode(
@@ -999,7 +998,7 @@ def test_hybrid_placement_prevents_private_copy_and_declares_limited_mode(
         )
 
     assert limited.placement.status == "limited"
-    assert limited.text.startswith("Limited mode:")
+    assert any(notice.startswith("Limited mode:") for notice in limited.notices)
     assert responder.requests[0].available_categories == ("public-research",)
     assert interface.status("web").placement == interface.status("telegram").placement
     assert interface.visual_state() == "degraded"
@@ -1019,7 +1018,7 @@ def test_real_channel_defaults_enforce_placement_and_withhold_unavailable_contex
     assert reply.placement.status == "limited"
     assert responder.requests[0].available_categories == ()
     assert responder.requests[0].confirmed_records == ()
-    assert reply.text.startswith("Limited mode:")
+    assert any(notice.startswith("Limited mode:") for notice in reply.notices)
 
 
 def test_hybrid_remote_run_withholds_all_local_context_categories(

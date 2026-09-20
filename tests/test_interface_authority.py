@@ -8,7 +8,9 @@ import threading
 
 import pytest
 
+from reckoning.conversation import ContextStatus, ConversationReply
 from reckoning.interfaces import (
+    ChannelResponse,
     InterfaceProjectionConflict,
     InterfaceSessionConflict,
     JsonFileInterfaceRepository,
@@ -30,9 +32,9 @@ class StubResponder:
         self.response = response
         self.requests: list[object] = []
 
-    def respond(self, request: object) -> str:
+    def respond(self, request: object) -> ChannelResponse:
         self.requests.append(request)
-        return self.response
+        return ChannelResponse(speech=self.response, notices=())
 
 
 class StubMessageApplication:
@@ -43,13 +45,13 @@ class StubMessageApplication:
         confirmed_records: tuple[str, ...],
         permissions: tuple[str, ...],
         **kwargs: object,
-    ) -> object:
+    ) -> ConversationReply:
         del text, history, confirmed_records, permissions, kwargs
-
-        class Response:
-            content = "Synthetic reply."
-
-        return Response()
+        return ConversationReply(
+            speech="Synthetic reply.",
+            notices=(),
+            context_status=ContextStatus((), (), ()),
+        )
 
 
 def _interface(tmp_path: Path) -> ReckoningInterfaceApplication:

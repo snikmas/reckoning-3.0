@@ -13,6 +13,7 @@ from urllib.error import HTTPError
 import pytest
 
 from reckoning.interfaces import (
+    ChannelResponse,
     InMemoryInterfaceRepository,
     InterfaceState,
     PlacementPolicy,
@@ -41,9 +42,9 @@ PASSPHRASE = "correct-horse-battery-staple"
 
 
 class FixedResponder:
-    def respond(self, request: object) -> str:
+    def respond(self, request: object) -> ChannelResponse:
         del request
-        return "Use the smaller proof first."
+        return ChannelResponse(speech="Use the smaller proof first.", notices=())
 
 
 def telegram_application() -> TelegramWebhookApplication:

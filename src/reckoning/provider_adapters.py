@@ -1073,25 +1073,24 @@ class RuntimeAdapterModelProvider:
         self._timer = timer
 
     def respond(self, request: object) -> ProviderResponse:
-        history = tuple(
-            (
-                str(getattr(message, "role")),
-                str(getattr(message, "content")),
+        provider_conversation = getattr(request, "provider_conversation", None)
+        if provider_conversation is not None:
+            messages = tuple(
+                (str(getattr(message, "role", "user")), str(getattr(message, "content", "")))
+                for message in getattr(provider_conversation, "messages", ())
             )
-            for message in getattr(request, "history", ())
-        )
-        prompt_stack = getattr(request, "prompt_stack", None)
-        layers = getattr(prompt_stack, "layers", ())
-        system_content = "\n\n".join(
-            f"[{getattr(layer, 'name', 'instruction')}]\n"
-            f"{getattr(layer, 'content', '')}"
-            for layer in layers
-            if getattr(layer, "name", "") != "current_request"
-        )
-        messages = (("system", system_content), *history, (
-            "user",
-            str(getattr(request, "user_message", "")),
-        ))
+        else:
+            history = tuple(
+                (
+                    str(getattr(message, "role")),
+                    str(getattr(message, "content")),
+                )
+                for message in getattr(request, "history", ())
+            )
+            messages = (("system", ""), *history, (
+                "user",
+                str(getattr(request, "user_message", "")),
+            ))
         try:
             completion = self._adapter.complete(
                 self._config,

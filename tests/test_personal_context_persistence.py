@@ -66,9 +66,9 @@ def _build_application(path: Path, model: RecordingModel) -> ReckoningApplicatio
 def _retrieved_context(model: RecordingModel) -> str:
     request = model.requests[-1]
     return next(
-        layer.content
-        for layer in request.prompt_stack.layers
-        if layer.name == "retrieved_context"
+        message.content
+        for message in request.provider_conversation.messages
+        if message.role == "user" and "[RETRIEVED CONTEXT]" in message.content
     )
 
 
@@ -129,11 +129,12 @@ def test_deletion_remains_authoritative_after_another_application_writes(
     already_running_application = _build_application(path, stale_model)
 
     deleting_application.delete_personal_context("delete-me")
-    already_running_application.correct_profile_proposal(
+    corrected = already_running_application.correct_profile_proposal(
         "keep-me",
         "I currently study database transactions.",
         language="en",
     )
+    already_running_application.confirm_profile_proposal(corrected.record_id)
     already_running_application.send_message(
         "What is my private study note and what am I studying?"
     )

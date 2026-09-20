@@ -189,7 +189,10 @@ def test_each_context_route_is_filtered_before_real_adapter_transport(
     assert "SYNTHETIC CONFIRMED STATE" not in first_payload
     assert "synthetic.permission" not in first_payload
     assert "SYNTHETIC SUPPLIED CONTEXT" not in first_payload
-    assert limited.content.startswith("Limited context: unavailable processing categories:")
+    assert any(
+        notice.startswith("Limited context: unavailable processing categories:")
+        for notice in limited.notices
+    )
 
     application.change_processing_scope(
         (

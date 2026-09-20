@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from uuid import uuid4
+
+from reckoning.conversation import ContextStatus, ConversationReply
 
 
 
@@ -147,6 +150,21 @@ class ChannelSession:
 
 
 @dataclass(frozen=True)
+class ChannelTurn:
+    turn_id: str
+    channel: ChannelName
+    session_id: str
+    user_speech: str
+    assistant_speech: str | None
+    state: Literal["pending", "completed", "failed"]
+    created_at: datetime
+    completed_at: datetime | None
+    notices: tuple[str, ...] = ()
+    context_status: ContextStatus | None = None
+    model_run_id: str | None = None
+
+
+@dataclass(frozen=True)
 class RunReceipt:
     id: str
     occurred_at: datetime
@@ -254,6 +272,41 @@ class InterfaceRepository(Protocol):
         returning_user: bool = False,
     ) -> ChannelSession: ...
 
+    def reserve_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        user_speech: str,
+        turn_id: str,
+        *,
+        expected_revision: int,
+    ) -> ChannelTurn: ...
+
+    def complete_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        turn_id: str,
+        assistant_speech: str,
+        *,
+        notices: tuple[str, ...] = (),
+        context_status: ContextStatus | None = None,
+        model_run_id: str | None = None,
+    ) -> ChannelTurn: ...
+
+    def fail_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        turn_id: str,
+    ) -> ChannelTurn: ...
+
+    def list_turns(
+        self,
+        channel: ChannelName,
+        session_id: str = "",
+    ) -> tuple[ChannelTurn, ...]: ...
+
     def set_activity(
         self,
         activity: ActivityState,
@@ -294,6 +347,7 @@ class InMemoryInterfaceRepository:
         self._approval_revisions: dict[str, int] = {
             approval_id: 1 for approval_id in self._state.pending_approvals
         }
+        self._turns: list[ChannelTurn] = []
 
     def load(self) -> InterfaceState:
         return self._state
@@ -364,6 +418,120 @@ class InMemoryInterfaceRepository:
         )
         self._session_revisions[(channel, session_id)] = actual + 1
         return ChannelSession(channel, session_id, combined)
+
+    def reserve_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        user_speech: str,
+        turn_id: str,
+        *,
+        expected_revision: int,
+    ) -> ChannelTurn:
+        actual = self.session_revision(channel, session_id)
+        if actual != expected_revision:
+            raise InterfaceSessionConflict(
+                channel, session_id, expected_revision, actual
+            )
+        turn = ChannelTurn(
+            turn_id=turn_id,
+            channel=channel,
+            session_id=session_id,
+            user_speech=user_speech,
+            assistant_speech=None,
+            state="pending",
+            created_at=datetime.now(timezone.utc),
+            completed_at=None,
+        )
+        self._turns.append(turn)
+        self._session_revisions[(channel, session_id)] = actual + 1
+        return turn
+
+    def complete_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        turn_id: str,
+        assistant_speech: str,
+        *,
+        notices: tuple[str, ...] = (),
+        context_status: ContextStatus | None = None,
+        model_run_id: str | None = None,
+    ) -> ChannelTurn:
+        for index, turn in enumerate(self._turns):
+            if turn.turn_id == turn_id:
+                completed = replace(
+                    turn,
+                    assistant_speech=assistant_speech,
+                    state="completed",
+                    completed_at=datetime.now(timezone.utc),
+                    notices=notices,
+                    context_status=context_status,
+                    model_run_id=model_run_id,
+                )
+                self._turns[index] = completed
+                self._append_speech_to_session(
+                    channel, session_id, turn.user_speech, assistant_speech
+                )
+                return completed
+        raise KeyError(f"Unknown turn: {turn_id}")
+
+    def _append_speech_to_session(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        user_speech: str,
+        assistant_speech: str,
+    ) -> None:
+        existing = _find_session(self._state, channel, session_id)
+        combined = existing.messages + (
+            ChannelMessage("user", user_speech),
+            ChannelMessage("assistant", assistant_speech),
+        )
+        sessions = tuple(
+            session
+            for session in self._state.sessions
+            if not (
+                session.channel == channel and session.session_id == session_id
+            )
+        ) + (ChannelSession(channel, session_id, combined),)
+        self._state = replace(
+            self._state,
+            sessions=sessions,
+            returning_user=True,
+        )
+        self._session_revisions[(channel, session_id)] = (
+            self._session_revisions.get((channel, session_id), 0) + 1
+        )
+
+    def fail_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        turn_id: str,
+    ) -> ChannelTurn:
+        del channel, session_id
+        for index, turn in enumerate(self._turns):
+            if turn.turn_id == turn_id:
+                failed = replace(
+                    turn,
+                    state="failed",
+                    completed_at=datetime.now(timezone.utc),
+                )
+                self._turns[index] = failed
+                return failed
+        raise KeyError(f"Unknown turn: {turn_id}")
+
+    def list_turns(
+        self,
+        channel: ChannelName,
+        session_id: str = "",
+    ) -> tuple[ChannelTurn, ...]:
+        return tuple(
+            turn
+            for turn in self._turns
+            if turn.channel == channel and turn.session_id == session_id
+        )
 
     def set_activity(
         self,
@@ -502,6 +670,59 @@ class JsonFileInterfaceRepository:
             returning_user=returning_user,
         )
 
+    def reserve_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        user_speech: str,
+        turn_id: str,
+        *,
+        expected_revision: int,
+    ) -> ChannelTurn:
+        return self._delegate.reserve_turn(
+            channel,
+            session_id,
+            user_speech,
+            turn_id,
+            expected_revision=expected_revision,
+        )
+
+    def complete_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        turn_id: str,
+        assistant_speech: str,
+        *,
+        notices: tuple[str, ...] = (),
+        context_status: ContextStatus | None = None,
+        model_run_id: str | None = None,
+    ) -> ChannelTurn:
+        return self._delegate.complete_turn(
+            channel,
+            session_id,
+            turn_id,
+            assistant_speech,
+            notices=notices,
+            context_status=context_status,
+            model_run_id=model_run_id,
+        )
+
+    def fail_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        turn_id: str,
+    ) -> ChannelTurn:
+        return self._delegate.fail_turn(channel, session_id, turn_id)
+
+    def list_turns(
+        self,
+        channel: ChannelName,
+        session_id: str = "",
+    ) -> tuple[ChannelTurn, ...]:
+        return self._delegate.list_turns(channel, session_id)
+
     def set_activity(
         self,
         activity: ActivityState,
@@ -558,8 +779,16 @@ class ChannelRequest:
     safe_when_incomplete: bool = True
 
 
+@dataclass(frozen=True)
+class ChannelResponse:
+    speech: str
+    notices: tuple[str, ...]
+    context_status: ContextStatus | None = None
+    model_run_id: str | None = None
+
+
 class ChannelResponder(Protocol):
-    def respond(self, request: ChannelRequest) -> str: ...
+    def respond(self, request: ChannelRequest) -> ChannelResponse: ...
 
 
 class MessageApplication(Protocol):
@@ -573,7 +802,7 @@ class MessageApplication(Protocol):
         required_processing_categories: tuple[str, ...] = (),
         available_processing_categories: tuple[str, ...] | None = None,
         safe_when_incomplete: bool = True,
-    ) -> object: ...
+    ) -> ConversationReply: ...
 
 
 class ApplicationChannelResponder:
@@ -582,11 +811,11 @@ class ApplicationChannelResponder:
     def __init__(self, application: MessageApplication) -> None:
         self._application = application
 
-    def respond(self, request: ChannelRequest) -> str:
+    def respond(self, request: ChannelRequest) -> ChannelResponse:
         history = tuple(
             (message.role, message.content) for message in request.recent_history
         )
-        response = self._application.respond_with_channel_context(
+        reply = self._application.respond_with_channel_context(
             request.text,
             history,
             request.confirmed_records,
@@ -597,15 +826,20 @@ class ApplicationChannelResponder:
             ),
             safe_when_incomplete=request.safe_when_incomplete,
         )
-        content = getattr(response, "content", None)
-        if not isinstance(content, str):
-            raise RuntimeError("The conversation boundary returned an invalid message.")
-        return content
+        if not isinstance(reply, ConversationReply):
+            raise RuntimeError("The conversation boundary returned an invalid reply.")
+        return ChannelResponse(
+            speech=reply.speech,
+            notices=reply.notices,
+            context_status=reply.context_status,
+            model_run_id=reply.model_run_id,
+        )
 
 
 @dataclass(frozen=True)
 class ChannelReply:
     text: str
+    notices: tuple[str, ...]
     placement: PlacementOutcome
 
 
@@ -762,6 +996,8 @@ class ReckoningInterfaceApplication:
             raise ValueError("A message cannot be empty.")
         state = self._repository.load()
         expected_revision = self._repository.session_revision(channel, session_id)
+        turn_id: str | None = None
+        placement: PlacementOutcome | None = None
         self._repository.set_activity(
             "listening", channel=channel, session_id=session_id
         )
@@ -796,7 +1032,15 @@ class ReckoningInterfaceApplication:
             self._repository.set_activity(
                 "reasoning", channel=channel, session_id=session_id
             )
-            response = self._responder.respond(
+            turn_id = str(uuid4())
+            self._repository.reserve_turn(
+                channel,
+                session_id,
+                message,
+                turn_id,
+                expected_revision=expected_revision,
+            )
+            channel_response = self._responder.respond(
                 ChannelRequest(
                     channel=channel,
                     text=message,
@@ -814,24 +1058,33 @@ class ReckoningInterfaceApplication:
                     ),
                     safe_when_incomplete=safe_when_incomplete,
                 )
-            ).strip()
-            if not response:
+            )
+            speech = channel_response.speech.strip()
+            if not speech:
                 raise RuntimeError("The responder returned an empty response.")
+            notices = list(channel_response.notices)
             if placement.status == "limited":
-                response = f"{placement.notice} {response}"
+                notices.append(placement.notice)
 
-            self._repository.append_completed_turn(
+            self._repository.complete_turn(
                 channel,
                 session_id,
-                message,
-                response,
-                expected_revision=expected_revision,
+                turn_id,
+                speech,
+                notices=tuple(notices),
+                context_status=channel_response.context_status,
+                model_run_id=channel_response.model_run_id,
             )
             self._repository.set_activity(
                 "idle", channel=channel, session_id=session_id
             )
-            return ChannelReply(response, placement)
+            return ChannelReply(speech, tuple(notices), placement)
         except Exception:
+            if turn_id is not None and placement is not None and placement.status != "blocked":
+                try:
+                    self._repository.fail_turn(channel, session_id, turn_id)
+                except Exception:
+                    pass
             self._repository.set_activity(
                 "idle", channel=channel, session_id=session_id
             )
@@ -844,6 +1097,18 @@ class ReckoningInterfaceApplication:
         session_id: str = "",
     ) -> tuple[ChannelMessage, ...]:
         return self._session(self._repository.load(), channel, session_id).messages
+
+    def channel_notices(
+        self,
+        channel: ChannelName,
+        *,
+        session_id: str = "",
+    ) -> tuple[str, ...]:
+        turns = self._repository.list_turns(channel, session_id)
+        for turn in reversed(turns):
+            if turn.state == "completed":
+                return turn.notices
+        return ()
 
     def record_channel_exchange(
         self,

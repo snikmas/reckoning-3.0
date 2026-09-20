@@ -9,10 +9,12 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Literal, cast
 
+from reckoning.conversation import ContextStatus, split_legacy_notice_prefix
 from reckoning.interfaces import (
     ChannelMessage,
     ChannelName,
     ChannelSession,
+    ChannelTurn,
     InterfaceProjectionConflict,
     InterfaceSessionConflict,
     InterfaceState,
@@ -36,7 +38,7 @@ from reckoning.store_migration import (
 )
 
 
-INTERFACE_SCHEMA_VERSION = "1"
+INTERFACE_SCHEMA_VERSION = "2"
 
 _PROJECTIONS = (
     "returning_user",
@@ -172,6 +174,222 @@ class SQLiteInterfaceRepository:
                 connection.rollback()
                 raise
         return ChannelSession(channel, session_id, messages)
+
+    def reserve_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        user_speech: str,
+        turn_id: str,
+        *,
+        expected_revision: int,
+    ) -> ChannelTurn:
+        with closing(connect_database(self._path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                actual = _session_revision(connection, channel, session_id)
+                if actual != expected_revision:
+                    raise InterfaceSessionConflict(
+                        channel, session_id, expected_revision, actual
+                    )
+                if actual == 0:
+                    connection.execute(
+                        """
+                        INSERT INTO interface_sessions (channel, session_id, revision)
+                        VALUES (?, ?, 1)
+                        """,
+                        (channel, session_id),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE interface_sessions SET revision = revision + 1
+                        WHERE channel = ? AND session_id = ?
+                        """,
+                        (channel, session_id),
+                    )
+                position = int(
+                    connection.execute(
+                        """
+                        SELECT COALESCE(MAX(position), -1) + 1
+                        FROM interface_turns
+                        WHERE channel = ? AND session_id = ?
+                        """,
+                        (channel, session_id),
+                    ).fetchone()[0]
+                )
+                created_at = datetime.now().astimezone().isoformat()
+                connection.execute(
+                    """
+                    INSERT INTO interface_turns (
+                        turn_id, channel, session_id, position, user_speech,
+                        assistant_speech, state, created_at, completed_at,
+                        notices_json, context_status_json, model_run_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        turn_id,
+                        channel,
+                        session_id,
+                        position,
+                        user_speech,
+                        None,
+                        "pending",
+                        created_at,
+                        None,
+                        json.dumps([]),
+                        None,
+                        None,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return ChannelTurn(
+            turn_id=turn_id,
+            channel=channel,
+            session_id=session_id,
+            user_speech=user_speech,
+            assistant_speech=None,
+            state="pending",
+            created_at=datetime.fromisoformat(created_at),
+            completed_at=None,
+        )
+
+    def complete_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        turn_id: str,
+        assistant_speech: str,
+        *,
+        notices: tuple[str, ...] = (),
+        context_status: ContextStatus | None = None,
+        model_run_id: str | None = None,
+    ) -> ChannelTurn:
+        with closing(connect_database(self._path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                completed_at = datetime.now().astimezone().isoformat()
+                context_status_data = None
+                if context_status is not None:
+                    context_status_data = json.dumps(
+                        {
+                            "used": list(context_status.used),
+                            "unavailable": list(context_status.unavailable),
+                            "excluded": list(context_status.excluded),
+                            "truncated": list(context_status.truncated),
+                        }
+                    )
+                connection.execute(
+                    """
+                    UPDATE interface_turns SET
+                        assistant_speech = ?,
+                        state = 'completed',
+                        completed_at = ?,
+                        notices_json = ?,
+                        context_status_json = ?,
+                        model_run_id = ?
+                    WHERE turn_id = ?
+                    """,
+                    (
+                        assistant_speech,
+                        completed_at,
+                        json.dumps(list(notices)),
+                        context_status_data,
+                        model_run_id,
+                        turn_id,
+                    ),
+                )
+                if connection.total_changes == 0:
+                    raise KeyError(f"Unknown turn: {turn_id}")
+                row = connection.execute(
+                    "SELECT user_speech FROM interface_turns WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                user_speech = str(row[0]) if row is not None else ""
+                _append_speech_messages(
+                    connection,
+                    channel,
+                    session_id,
+                    user_speech=user_speech,
+                    assistant_speech=assistant_speech,
+                )
+                _set_returning_user(connection)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return ChannelTurn(
+            turn_id=turn_id,
+            channel=channel,
+            session_id=session_id,
+            user_speech="",
+            assistant_speech=assistant_speech,
+            state="completed",
+            created_at=datetime.now(),
+            completed_at=datetime.fromisoformat(completed_at),
+            notices=notices,
+            context_status=context_status,
+            model_run_id=model_run_id,
+        )
+
+    def fail_turn(
+        self,
+        channel: ChannelName,
+        session_id: str,
+        turn_id: str,
+    ) -> ChannelTurn:
+        with closing(connect_database(self._path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                completed_at = datetime.now().astimezone().isoformat()
+                connection.execute(
+                    """
+                    UPDATE interface_turns SET
+                        state = 'failed',
+                        completed_at = ?
+                    WHERE turn_id = ?
+                    """,
+                    (completed_at, turn_id),
+                )
+                if connection.total_changes == 0:
+                    raise KeyError(f"Unknown turn: {turn_id}")
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return ChannelTurn(
+            turn_id=turn_id,
+            channel=channel,
+            session_id=session_id,
+            user_speech="",
+            assistant_speech=None,
+            state="failed",
+            created_at=datetime.now(),
+            completed_at=datetime.fromisoformat(completed_at),
+        )
+
+    def list_turns(
+        self,
+        channel: ChannelName,
+        session_id: str = "",
+    ) -> tuple[ChannelTurn, ...]:
+        with closing(connect_database(self._path)) as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    turn_id, channel, session_id, user_speech, assistant_speech,
+                    state, created_at, completed_at, notices_json,
+                    context_status_json, model_run_id
+                FROM interface_turns
+                WHERE channel = ? AND session_id = ?
+                ORDER BY position
+                """,
+                (channel, session_id),
+            ).fetchall()
+        return tuple(_turn_from_row(row) for row in rows)
 
     def set_activity(
         self,
@@ -358,13 +576,16 @@ class SQLiteInterfaceRepository:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 current_version = metadata(connection, "interfaces_schema_version")
-                if current_version is not None and not _tables_exist(connection):
+                if (
+                    current_version == INTERFACE_SCHEMA_VERSION
+                    and not _tables_exist(connection)
+                ):
                     raise RuntimeError(
                         "Interface schema authority has incomplete tables."
                     )
                 _create_schema(connection)
                 current_version = metadata(connection, "interfaces_schema_version")
-                if current_version not in (None, INTERFACE_SCHEMA_VERSION):
+                if current_version not in (None, "1", INTERFACE_SCHEMA_VERSION):
                     raise RuntimeError("Unsupported interface storage schema.")
                 if current_version is None:
                     if _record_count(connection):
@@ -384,6 +605,13 @@ class SQLiteInterfaceRepository:
                         connection,
                         "interfaces_legacy_sha256",
                         legacy_digest or "not-required",
+                    )
+                elif current_version == "1":
+                    _migrate_v1_to_v2(connection)
+                    set_metadata(
+                        connection,
+                        "interfaces_schema_version",
+                        INTERFACE_SCHEMA_VERSION,
                     )
                 connection.commit()
             except BaseException:
@@ -481,6 +709,25 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS interface_turns (
+            turn_id TEXT PRIMARY KEY,
+            channel TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            user_speech TEXT NOT NULL,
+            assistant_speech TEXT,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            notices_json TEXT NOT NULL,
+            context_status_json TEXT,
+            model_run_id TEXT,
+            UNIQUE (channel, session_id, position)
+        )
+        """
+    )
 
 
 def _tables_exist(connection: sqlite3.Connection) -> bool:
@@ -494,6 +741,7 @@ def _tables_exist(connection: sqlite3.Connection) -> bool:
             "interface_pending_approvals",
             "interface_receipts",
             "interface_failures",
+            "interface_turns",
         )
     )
 
@@ -509,6 +757,7 @@ def _any_table_exists(connection: sqlite3.Connection) -> bool:
             "interface_pending_approvals",
             "interface_receipts",
             "interface_failures",
+            "interface_turns",
         )
     )
 
@@ -545,6 +794,153 @@ def _store_ready(path: Path) -> bool:
             connection.close()
     except sqlite3.Error:
         return False
+
+
+def _append_speech_messages(
+    connection: sqlite3.Connection,
+    channel: ChannelName,
+    session_id: str,
+    *,
+    user_speech: str | None = None,
+    assistant_speech: str | None = None,
+) -> None:
+    start = int(
+        connection.execute(
+            """
+            SELECT COALESCE(MAX(position), -1) + 1
+            FROM interface_session_messages
+            WHERE channel = ? AND session_id = ?
+            """,
+            (channel, session_id),
+        ).fetchone()[0]
+    )
+    messages: list[tuple[str, str]] = []
+    if user_speech is not None:
+        messages.append(("user", user_speech))
+    if assistant_speech is not None:
+        messages.append(("assistant", assistant_speech))
+    for offset, (role, content) in enumerate(messages):
+        connection.execute(
+            """
+            INSERT INTO interface_session_messages (
+                channel, session_id, position, role, content
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (channel, session_id, start + offset, role, content),
+        )
+
+
+def _turn_from_row(row: tuple[Any, ...]) -> ChannelTurn:
+    (
+        turn_id,
+        channel,
+        session_id,
+        user_speech,
+        assistant_speech,
+        state,
+        created_at,
+        completed_at,
+        notices_json,
+        context_status_json,
+        model_run_id,
+    ) = row
+    context_status = None
+    if context_status_json is not None:
+        data = json.loads(context_status_json)
+        context_status = ContextStatus(
+            used=tuple(data.get("used", [])),
+            unavailable=tuple(data.get("unavailable", [])),
+            excluded=tuple(data.get("excluded", [])),
+            truncated=tuple(data.get("truncated", [])),
+        )
+    return ChannelTurn(
+        turn_id=str(turn_id),
+        channel=cast(ChannelName, str(channel)),
+        session_id=str(session_id),
+        user_speech=str(user_speech),
+        assistant_speech=str(assistant_speech) if assistant_speech is not None else None,
+        state=cast(Literal["pending", "completed", "failed"], str(state)),
+        created_at=datetime.fromisoformat(str(created_at)),
+        completed_at=(
+            datetime.fromisoformat(str(completed_at))
+            if completed_at is not None
+            else None
+        ),
+        notices=tuple(str(item) for item in json.loads(str(notices_json))),
+        context_status=context_status,
+        model_run_id=str(model_run_id) if model_run_id is not None else None,
+    )
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    messages = connection.execute(
+        """
+        SELECT channel, session_id, position, role, content
+        FROM interface_session_messages
+        ORDER BY channel, session_id, position
+        """
+    ).fetchall()
+    turns: dict[tuple[str, str, int], dict[str, object]] = {}
+    for channel, session_id, position, role, content in messages:
+        key = (channel, session_id, position // 2)
+        if key not in turns:
+            turns[key] = {
+                "channel": channel,
+                "session_id": session_id,
+                "position": position // 2,
+                "user_speech": "",
+                "assistant_speech": None,
+            }
+        if role == "user":
+            turns[key]["user_speech"] = content
+        elif role == "assistant":
+            speech, notices = split_legacy_notice_prefix(content)
+            turns[key]["assistant_speech"] = speech
+            turns[key]["notices"] = notices
+    now = datetime.now().astimezone().isoformat()
+    for turn in turns.values():
+        assistant_speech: str | None = cast(str | None, turn.get("assistant_speech"))
+        notices = cast(tuple[str, ...], turn.get("notices", ()))
+        turn_channel = cast(str, turn["channel"])
+        turn_session_id = cast(str, turn["session_id"])
+        turn_position = cast(int, turn["position"])
+        connection.execute(
+            """
+            INSERT INTO interface_turns (
+                turn_id, channel, session_id, position, user_speech,
+                assistant_speech, state, created_at, completed_at,
+                notices_json, context_status_json, model_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"legacy-{turn_channel}-{turn_session_id}-{turn_position}",
+                turn_channel,
+                turn_session_id,
+                turn_position,
+                turn["user_speech"],
+                assistant_speech,
+                "completed" if assistant_speech else "pending",
+                now,
+                now if assistant_speech else None,
+                json.dumps(list(notices)),
+                None,
+                None,
+            ),
+        )
+        if assistant_speech is not None:
+            connection.execute(
+                """
+                UPDATE interface_session_messages
+                SET content = ?
+                WHERE channel = ? AND session_id = ? AND position = ? AND role = 'assistant'
+                """,
+                (
+                    assistant_speech,
+                    turn_channel,
+                    turn_session_id,
+                    turn_position * 2 + 1,
+                ),
+            )
 
 
 def _merge_state(connection: sqlite3.Connection, state: InterfaceState) -> None:

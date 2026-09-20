@@ -202,10 +202,12 @@ def test_selected_style_stays_below_every_named_protected_boundary() -> None:
     application.send_message("Help me reason about this choice.")
 
     assert model.request is not None
-    protected, identity, persona, *_ = model.request.prompt_stack.layers
-    assert protected.name == "protected_product_contract"
-    assert identity.name == "product_identity"
-    assert persona.name == "persona"
+    messages = model.request.provider_conversation.messages
+    assert messages[0].role == "system"
+    assert messages[1].role == "system"
+    assert messages[2].role == "system"
+    protected = messages[0]
+    persona = messages[2]
     assert persona.content == selected.prompt_instructions
     normalized_contract = protected.content.casefold()
     for required_boundary in (
@@ -269,8 +271,9 @@ def test_installed_original_persona_governs_prompt_after_restart_without_owning_
     response = application.send_message("Challenge this weak plan.")
 
     assert len(model.requests) == 1
-    protected, identity, persona, *_ = model.requests[0].prompt_stack.layers
-    assert identity.content == (
+    messages = model.requests[0].provider_conversation.messages
+    protected, persona = messages[0], messages[2]
+    assert messages[1].content == (
         "Reckoning is one accountable personal agent. The selected persona is "
         "only its style expression and owns no memory, authority, or final answer."
     )
@@ -279,17 +282,17 @@ def test_installed_original_persona_governs_prompt_after_restart_without_owning_
         "Use reserved warmth. Use dry humor sparingly. Allow uncomfortable challenge "
         "to the user's reasoning. On sensitive topics, focus on practical next steps."
     )
-    assert protected.name == "protected_product_contract"
-    assert response.content.startswith("That request crosses a protected boundary.")
+    assert protected.role == "system"
+    assert response.speech.startswith("That request crosses a protected boundary.")
 
     danger = application.send_message(
         "I am in immediate danger and might hurt myself right now."
     )
 
     assert len(model.requests) == 1
-    assert "contact local emergency services now" in danger.content
-    assert "trusted person nearby" in danger.content
-    assert "not a clinician" in danger.content
+    assert "contact local emergency services now" in danger.speech
+    assert "trusted person nearby" in danger.speech
+    assert "not a clinician" in danger.speech
 
 
 @pytest.mark.parametrize(

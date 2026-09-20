@@ -94,7 +94,7 @@ def test_orcarouter_uses_same_boundary_and_records_billable_units() -> None:
 
     response = application.send_message("Compare these options.")
 
-    assert response.content == "Choose the smaller proof."
+    assert response.speech == "Choose the smaller proof."
     assert seen_authorization == "Bearer secret-value"
     assert application.inspect_model_runs()[0].__dict__ == {
         "id": "run-1",
@@ -138,7 +138,7 @@ def test_deepseek_remains_selectable_for_the_existing_real_run_gate() -> None:
 
     response = application.send_message("Compare these options.")
 
-    assert response.content == "Keep the smaller proof."
+    assert response.speech == "Keep the smaller proof."
     assert application.inspect_model_runs()[0].provider == "deepseek"
 
 
@@ -235,5 +235,5 @@ def test_protected_boundary_records_a_limited_run() -> None:
 
     response = application.send_message("Challenge this choice.")
 
-    assert response.content.startswith("That request crosses a protected boundary")
+    assert response.speech.startswith("That request crosses a protected boundary")
     assert application.inspect_model_runs()[0].status == "limited"
