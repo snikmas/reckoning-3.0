@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from reckoning.config import DEFAULT_PROVIDER_CREDENTIALS, ProviderCredentialStore
+from reckoning.conversation_evaluation import run_evaluation
 from reckoning.json_store import read_json
 from reckoning.operations import (
     PASSPHRASE_ENV,
@@ -64,6 +65,10 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             (
                 "reckoning gateway",
                 "Run every configured channel (Telegram today).",
+            ),
+            (
+                "reckoning evaluate",
+                "Run versioned conversation-quality scenarios.",
             ),
         ),
     ),
@@ -124,6 +129,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if command == "gateway":
         return _run_gateway(rest)
+    if command == "evaluate":
+        return _run_evaluate(rest)
     if command == "reset":
         return _run_reset(rest)
     if command in _COMMAND_DESCRIPTIONS:
@@ -184,6 +191,86 @@ def _run_gateway(rest: Sequence[str]) -> int:
         return run_gateway(rest, prog="reckoning gateway")
     with record_gateway_runtime(_gateway_data_dir(rest)):
         return run_gateway(rest, prog="reckoning gateway")
+
+
+def _run_evaluate(rest: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="reckoning evaluate",
+        description=(
+            "Run a versioned scenario set against the ordinary application "
+            "interface and append evaluation records to a JSONL file."
+        ),
+    )
+    parser.add_argument(
+        "--scenario-set",
+        type=Path,
+        required=True,
+        help="Path to the scenario-set JSON file.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="JSONL file to append records to.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("fake", "live"),
+        default="fake",
+        help="Execution kind. Fake mode is the default and makes no network calls.",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Equivalent to --mode live.",
+    )
+    parser.add_argument(
+        "--provider",
+        help="Live provider id (e.g. deepseek).",
+    )
+    parser.add_argument(
+        "--model",
+        help="Live model id.",
+    )
+    parser.add_argument(
+        "--route",
+        help="Live route id.",
+    )
+    parser.add_argument(
+        "--max-calls",
+        type=int,
+        help="Bounded authorized call budget for live mode.",
+    )
+    parser.add_argument(
+        "--max-cost",
+        type=float,
+        help=(
+            "Bounded authorized cost ceiling for live mode, in USD, "
+            "estimated against the versioned price basis. Requires --max-calls."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        default="full-stage-2",
+        help="Scenario profile to run (full-stage-2 or early-web).",
+    )
+    arguments = parser.parse_args(rest)
+    mode = "live" if arguments.live else arguments.mode
+    try:
+        return run_evaluation(
+            arguments.scenario_set,
+            arguments.output,
+            mode=mode,  # type: ignore[arg-type]
+            profile=arguments.profile,
+            live_provider=arguments.provider,
+            live_model=arguments.model,
+            live_route=arguments.route,
+            max_calls=arguments.max_calls,
+            max_cost=arguments.max_cost,
+        )
+    except ValueError as error:
+        print(f"evaluate failed: {error}", file=sys.stderr)
+        return 2
 
 
 def _setup_parser(prog: str) -> argparse.ArgumentParser:

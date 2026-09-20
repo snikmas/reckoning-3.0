@@ -191,6 +191,51 @@ def test_correction_replay_after_restart_does_not_duplicate(tmp_path: Path) -> N
     assert restarted.inspect_reckoning(decision.id).version == corrected.version
 
 
+def test_confirmation_replay_with_changed_expected_revision_conflicts(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "confirmed-state" / "continuity.json"
+    first = build_application(state_path, "first")
+    decision = first.start_reckoning("Competing commitments.", operation_id="op-7")
+    first.confirm_reckoning(
+        decision.id, expected_revision=decision.version, operation_id="op-8"
+    )
+
+    restarted = build_application(state_path, "second")
+    with pytest.raises(ReckoningOperationConflict):
+        restarted.confirm_reckoning(
+            decision.id,
+            expected_revision=decision.version + 1,
+            operation_id="op-8",
+        )
+
+
+def test_correction_replay_with_changed_expected_revision_conflicts(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "confirmed-state" / "continuity.json"
+    first = build_application(state_path, "first")
+    decision = first.start_reckoning("Competing commitments.")
+    record_id = decision.current_records[0].record_id
+    first.correct_personal_record(
+        decision.id,
+        record_id,
+        "Protect exam preparation.",
+        expected_revision=decision.version,
+        operation_id="op-9",
+    )
+
+    restarted = build_application(state_path, "second")
+    with pytest.raises(ReckoningOperationConflict):
+        restarted.correct_personal_record(
+            decision.id,
+            record_id,
+            "Protect exam preparation.",
+            expected_revision=decision.version + 1,
+            operation_id="op-9",
+        )
+
+
 def test_failed_operation_rejects_a_different_payload_on_retry(tmp_path: Path) -> None:
     state_path = tmp_path / "confirmed-state" / "continuity.json"
     failing = build_application(
@@ -202,3 +247,24 @@ def test_failed_operation_rejects_a_different_payload_on_retry(tmp_path: Path) -
     restarted = build_application(state_path, "second")
     with pytest.raises(ReckoningOperationConflict):
         restarted.start_reckoning("Edited situation text.", operation_id="op-6")
+
+
+def test_concurrent_identical_confirmations_produce_one_domain_effect(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "confirmed-state" / "continuity.json"
+    first = build_application(state_path, "first")
+    decision = first.start_reckoning("Competing commitments.")
+
+    second = build_application(state_path, "second")
+
+    confirmed_first = first.confirm_reckoning(
+        decision.id, expected_revision=decision.version, operation_id="op-concurrent"
+    )
+    confirmed_second = second.confirm_reckoning(
+        decision.id, expected_revision=decision.version, operation_id="op-concurrent"
+    )
+
+    assert confirmed_first.version == confirmed_second.version
+    assert first.inspect_reckoning(decision.id).version == confirmed_first.version
+    assert second.inspect_reckoning(decision.id).version == confirmed_first.version

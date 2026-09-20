@@ -427,6 +427,101 @@ def test_replay_after_a_saved_mutation_returns_the_same_decision(
     assert len(browser.parse(page).decision_links) == 1
 
 
+def test_conversational_correction_replay_creates_one_record_version(
+    tmp_path: Path,
+) -> None:
+    """A completed conversational correction replay is safe; re-binding is not."""
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    decision_location = propose_via_composer(browser, SITUATION)
+    composer = _simon_composer(browser)
+    correction = composer.submission(message=f"No, correct it: {CORRECTED_MEANING}")
+
+    status, _, _ = browser.post("/messages", correction)
+    assert status == "303 See Other"
+    status, _, page = browser.get(decision_location)
+    assert b"Revision 2" in page
+
+    # Identical retry after a lost response resolves the completed operation.
+    status, _, _ = browser.post("/messages", correction)
+    assert status == "303 See Other"
+    status, _, page = browser.get(decision_location)
+    assert b"Revision 2" in page
+    assert b'class="status status-proposed"' in page
+
+    # Reusing the operation id with a fresh binding (changed expected version)
+    # conflicts instead of creating another mutation.
+    fresh_composer = _simon_composer(browser)
+    retry = {
+        **fresh_composer.submission(message=f"No, correct it: {CORRECTED_MEANING}"),
+        "operation_id": correction["operation_id"],
+    }
+    status, _, _ = browser.post("/messages", retry)
+    assert status == "409 Conflict"
+    status, _, page = browser.get(decision_location)
+    assert b"Revision 2" in page
+    assert b'class="status status-proposed"' in page
+
+    # After restart the old review context is expired; the identical
+    # submission is rejected without mutating, and a fresh binding with the
+    # old operation id still conflicts.
+    browser.web = build_web_app(data_dir)
+    browser.get("/simon")
+    status, headers, _ = browser.post("/messages", correction)
+    assert status == "303 See Other"
+    assert headers["Location"] == "/simon"
+    status, _, page = browser.get("/simon")
+    assert b"review context is missing or expired" in page
+    status, _, page = browser.get(decision_location)
+    assert b"Revision 2" in page
+    assert b'class="status status-proposed"' in page
+
+    replay = {
+        **_simon_composer(browser).submission(message=f"No, correct it: {CORRECTED_MEANING}"),
+        "operation_id": correction["operation_id"],
+    }
+    status, _, _ = browser.post("/messages", replay)
+    assert status == "409 Conflict"
+    status, _, page = browser.get(decision_location)
+    assert b"Revision 2" in page
+    assert b'class="status status-proposed"' in page
+
+
+def test_conversational_confirmation_replay_cannot_hit_a_later_proposal(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    first_location = propose_via_composer(browser, SITUATION)
+    first_composer = _simon_composer(browser)
+    first_confirmation = first_composer.submission(message="I confirm this version")
+
+    status, _, _ = browser.post("/messages", first_confirmation)
+    assert status == "303 See Other"
+    status, _, page = browser.get(first_location)
+    assert b'class="status status-confirmed"' in page
+
+    # A later proposal reused for the same operation id is rejected.
+    second_location = propose_via_composer(browser, "A different conflict now.")
+    second_composer = _simon_composer(browser)
+    reused = {
+        **second_composer.submission(message="I confirm this version"),
+        "operation_id": first_confirmation["operation_id"],
+    }
+    status, _, page = browser.post("/messages", reused)
+    assert status == "409 Conflict"
+    assert b"already completed with a different payload" in page
+
+    status, _, page = browser.get(second_location)
+    assert b'class="status status-proposed"' in page
+
+
 def test_failed_proposal_input_survives_restart_and_retries_once(
     tmp_path: Path,
 ) -> None:
@@ -470,6 +565,12 @@ def test_failed_proposal_input_survives_restart_and_retries_once(
     assert b"data-pending-operation" not in page
 
 
+def _simon_composer(browser: BrowserSession) -> ParsedForm:
+    status, _, page = browser.get("/simon")
+    assert status == "200 OK"
+    return browser.parse(page).form_by_action("/messages")
+
+
 def test_conversational_correction_and_confirmation(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     install(data_dir)
@@ -478,7 +579,8 @@ def test_conversational_correction_and_confirmation(tmp_path: Path) -> None:
 
     # Ambiguous assent asks for clarification instead of confirming.
     first_location = propose_via_composer(browser, SITUATION)
-    status, headers, _ = browser.post("/messages", {"message": "yes"})
+    composer = _simon_composer(browser)
+    status, headers, _ = browser.post("/messages", composer.submission(message="yes"))
     assert status == "303 See Other"
     assert headers["Location"] == "/simon"
     status, _, page = browser.get("/simon")
@@ -487,8 +589,10 @@ def test_conversational_correction_and_confirmation(tmp_path: Path) -> None:
     assert b'class="status status-proposed"' in page
 
     # Conversational correction produces an unconfirmed, visible revision.
+    composer = _simon_composer(browser)
     status, headers, _ = browser.post(
-        "/messages", {"message": f"No, correct it: {CORRECTED_MEANING}"}
+        "/messages",
+        composer.submission(message=f"No, correct it: {CORRECTED_MEANING}"),
     )
     assert status == "303 See Other"
     assert headers["Location"] == first_location
@@ -498,8 +602,9 @@ def test_conversational_correction_and_confirmation(tmp_path: Path) -> None:
     assert b'class="status status-proposed"' in page
 
     # An unambiguous conversational confirmation binds to the shown version.
+    composer = _simon_composer(browser)
     status, headers, _ = browser.post(
-        "/messages", {"message": "Yes, confirm that exact version"}
+        "/messages", composer.submission(message="I confirm this version")
     )
     assert status == "303 See Other"
     assert headers["Location"] == first_location
@@ -510,10 +615,193 @@ def test_conversational_correction_and_confirmation(tmp_path: Path) -> None:
     assert b"exactly as shown (revision 2)" in page
 
     # Casual conversation still works and never creates a decision.
+    composer = _simon_composer(browser)
     status, headers, _ = browser.post(
-        "/messages", {"message": "What should I focus on this week?"}
+        "/messages", composer.submission(message="What should I focus on this week?")
     )
     assert status == "303 See Other"
     assert headers["Location"] == "/simon"
     status, _, page = browser.get("/")
     assert len(browser.parse(page).decision_links) == 1
+
+
+def test_stale_composer_binding_asks_for_review_instead_of_confirming(
+    tmp_path: Path,
+) -> None:
+    """A composer rendered for revision N must not confirm revision N+1."""
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    decision_location = propose_via_composer(browser, SITUATION)
+    stale_composer = _simon_composer(browser)
+    assert stale_composer.fields["decision_presentation_token"]
+
+    # Another tab corrects the proposal to revision 2.
+    decision_page = browser.parse(browser.get(decision_location)[2])
+    correction = decision_page.forms_ending("/correct")[0]
+    status, _, _ = browser.post(
+        correction.action, correction.submission(meaning=CORRECTED_MEANING)
+    )
+    assert status == "303 See Other"
+
+    # The stale composer asks for a fresh review; it does not confirm.
+    status, headers, _ = browser.post(
+        "/messages", stale_composer.submission(message="I confirm this version")
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == "/simon"
+    status, _, page = browser.get("/simon")
+    assert b"changed from revision 1 to revision 2" in page
+
+    status, _, page = browser.get(decision_location)
+    assert b'class="status status-proposed"' in page
+
+
+def test_conversational_mutation_requires_a_rendered_proposal_binding(
+    tmp_path: Path,
+) -> None:
+    """A 'confirm' post with operation id but no target fields never mutates."""
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    propose_via_composer(browser, SITUATION)
+    browser.get("/simon")
+
+    status, headers, _ = browser.post(
+        "/messages",
+        {
+            "message": "I confirm this version",
+            "_csrf_token": browser.csrf_token,
+            "operation_id": "op-missing-binding",
+        },
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == "/simon"
+    status, _, page = browser.get("/simon")
+    assert b"Open the decision and review the proposal" in page
+
+
+def test_conversational_mutation_requires_operation_identity(
+    tmp_path: Path,
+) -> None:
+    """A 'confirm' post with a valid binding but no operation id never mutates."""
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    propose_via_composer(browser, SITUATION)
+    composer = _simon_composer(browser)
+
+    status, _, page = browser.post(
+        "/messages",
+        {
+            "message": "I confirm this version",
+            "_csrf_token": browser.csrf_token,
+            "decision_presentation_token": composer.fields[
+                "decision_presentation_token"
+            ],
+        },
+    )
+    assert status == "400 Bad Request"
+    assert b"Operation identity is required" in page
+
+
+def test_client_supplied_target_fields_are_not_presentation_evidence(
+    tmp_path: Path,
+) -> None:
+    """Echoing the current server proposal id/version never confers consent."""
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    decision_location = propose_via_composer(browser, SITUATION)
+    reckoning = web._application.inspect_reckoning(
+        decision_location.rsplit("/", 1)[-1]
+    )
+    browser.get("/simon")
+
+    # A client that read the current state and echoes it back without a
+    # server-issued presentation token gets a clarification, not a mutation.
+    status, headers, _ = browser.post(
+        "/messages",
+        {
+            "message": "I confirm this version",
+            "_csrf_token": browser.csrf_token,
+            "operation_id": "op-fabricated-binding",
+            "decision_target_id": reckoning.id,
+            "decision_target_version": str(reckoning.version),
+        },
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == "/simon"
+    status, _, page = browser.get("/simon")
+    assert b"Open the decision and review the proposal" in page
+    assert (
+        web._application.inspect_reckoning(reckoning.id).status == "proposed"
+    )
+
+
+def test_presentation_token_from_another_session_does_not_bind(
+    tmp_path: Path,
+) -> None:
+    """A valid presentation token is bound to the session that received it."""
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    first = BrowserSession(web)
+    second = BrowserSession(web)
+
+    propose_via_composer(first, SITUATION)
+    first_composer = _simon_composer(first)
+    second.get("/simon")
+
+    status, headers, _ = second.post(
+        "/messages",
+        {
+            "message": "I confirm this version",
+            "_csrf_token": second.csrf_token,
+            "operation_id": "op-borrowed-token",
+            "decision_presentation_token": first_composer.fields[
+                "decision_presentation_token"
+            ],
+        },
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == "/simon"
+    status, _, page = second.get("/simon")
+    assert b"review context is missing or expired" in page
+
+
+def test_unknown_presentation_token_asks_for_a_fresh_review(
+    tmp_path: Path,
+) -> None:
+    """An unknown or expired review context cannot silently select a proposal."""
+    data_dir = tmp_path / "data"
+    install(data_dir)
+    web = build_web_app(data_dir, reckoning_provider=ScriptedReckoningProvider())
+    browser = BrowserSession(web)
+
+    decision_location = propose_via_composer(browser, SITUATION)
+    browser.get("/simon")
+
+    status, headers, _ = browser.post(
+        "/messages",
+        {
+            "message": "I confirm this version",
+            "_csrf_token": browser.csrf_token,
+            "operation_id": "op-unknown-token",
+            "decision_presentation_token": "not-a-issued-token",
+        },
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == "/simon"
+    status, _, page = browser.get("/simon")
+    assert b"review context is missing or expired" in page
+    reckoning_id = decision_location.rsplit("/", 1)[-1]
+    assert web._application.inspect_reckoning(reckoning_id).status == "proposed"
