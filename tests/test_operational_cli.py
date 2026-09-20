@@ -6,7 +6,7 @@ import os
 import stat
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 from unittest import mock
@@ -26,9 +26,15 @@ from reckoning.operations import (
     setup_instance,
 )
 from reckoning.personas import PersonaDefinition
+from reckoning.processing import (
+    PROCESSING_CATEGORIES,
+    JsonFileProcessingGrantRepository,
+    ProcessingDestination,
+    ProcessingScope,
+)
 from reckoning.trials import (
-    JsonFileTrialRepository,
     REQUIRED_REAL_USE_METRICS,
+    JsonFileTrialRepository,
     TrialEvidence,
     TrialRecorder,
 )
@@ -44,10 +50,16 @@ class CliResult:
     stderr: str
 
 
-def run_cli(*arguments: str, passphrase: str | None = None) -> CliResult:
+def run_cli(
+    *arguments: str,
+    passphrase: str | None = None,
+    env: dict[str, str] | None = None,
+) -> CliResult:
     stdout = io.StringIO()
     stderr = io.StringIO()
-    environment = {PASSPHRASE_ENV: passphrase} if passphrase is not None else {}
+    environment = dict(env) if env is not None else {}
+    if passphrase is not None:
+        environment[PASSPHRASE_ENV] = passphrase
     with (
         mock.patch.dict(os.environ, environment),
         redirect_stdout(stdout),
@@ -577,7 +589,7 @@ def test_release_readiness_remains_blocked_until_every_required_gate_exists(
 ) -> None:
     evidence = tmp_path / "release-evidence.json"
     trial_path = tmp_path / "trials.json"
-    instant = datetime(2026, 9, 10, 9, 0, tzinfo=timezone.utc)
+    instant = datetime(2026, 9, 10, 9, 0, tzinfo=UTC)
     recorder = TrialRecorder(JsonFileTrialRepository(trial_path))
     trial = recorder.start(
         "release-trial", "first-slice", instant, assessed_revision="r1"
@@ -948,3 +960,172 @@ def test_setup_never_accepts_secrets_as_command_line_flags(tmp_path: Path) -> No
     assert "--api-key is not supported" in result.stderr
     assert "sk-flag-secret" not in result.stderr
     assert not (tmp_path / "flag-secret-instance").exists()
+
+
+
+def _seed_deepseek_installation(tmp_path: Path) -> Path:
+    from reckoning.personas import DEFAULT_PERSONAS
+
+    data_dir = tmp_path / "deepseek-instance"
+    simon = next(item for item in DEFAULT_PERSONAS if item.id == "simon")
+    setup_instance(
+        data_dir,
+        "local",
+        simon,
+        first_conversation=("Hello.", "Hello back."),
+        activation={
+            "status": "activated",
+            "setup_schema": 2,
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "base_url": None,
+            "protocol": "openai-chat-completions",
+            "context_window": None,
+            "header_env": {},
+            "demo": False,
+            "verified_at": "2026-09-01T00:00:00+00:00",
+            "activated_at": "2026-09-01T00:00:00+00:00",
+        },
+    )
+    store = ProviderCredentialStore()
+    store.set_key(
+        "deepseek",
+        "sk-test-deepseek",
+        model="deepseek-chat",
+        verified=True,
+        make_default=True,
+    )
+    store.save(tmp_path / "deepseek-cli" / "provider.json")
+    return data_dir
+
+
+def test_doctor_diagnoses_a_missing_processing_grant(tmp_path: Path) -> None:
+    data_dir = _seed_deepseek_installation(tmp_path)
+    runtime = load_installation_runtime(data_dir)
+    grant_path = runtime.state_path("confirmed-state", "processing-grants.json")
+    grant_path.unlink(missing_ok=True)
+
+    result = run_cli("doctor", "--data-dir", str(data_dir))
+
+    assert result.returncode == 0, result.stderr
+    assert "processing grant" in result.stdout
+    assert "missing" in result.stdout
+    assert "deepseek@https://api.deepseek.com" in result.stdout
+    assert "reckoning doctor --repair" in result.stdout
+
+
+def test_doctor_repair_creates_the_missing_grant(tmp_path: Path) -> None:
+    data_dir = _seed_deepseek_installation(tmp_path)
+    runtime = load_installation_runtime(data_dir)
+    grant_path = runtime.state_path("confirmed-state", "processing-grants.json")
+    grant_path.unlink(missing_ok=True)
+
+    result = run_cli("doctor", "--data-dir", str(data_dir), "--repair")
+
+    assert result.returncode == 0, result.stderr
+    assert "processing grant: created" in result.stdout
+    assert "deepseek@https://api.deepseek.com" in result.stdout
+    repository = JsonFileProcessingGrantRepository(grant_path)
+    grant = repository.get("deepseek@https://api.deepseek.com")
+    assert grant is not None
+    assert grant.allowed_categories == PROCESSING_CATEGORIES
+
+
+def test_doctor_repeated_repair_is_idempotent(tmp_path: Path) -> None:
+    data_dir = _seed_deepseek_installation(tmp_path)
+    runtime = load_installation_runtime(data_dir)
+    grant_path = runtime.state_path("confirmed-state", "processing-grants.json")
+    grant_path.unlink(missing_ok=True)
+
+    first = run_cli("doctor", "--data-dir", str(data_dir), "--repair")
+    assert first.returncode == 0, first.stderr
+    assert "processing grant: created" in first.stdout
+
+    repository = JsonFileProcessingGrantRepository(grant_path)
+    first_grant = repository.get("deepseek@https://api.deepseek.com")
+    assert first_grant is not None
+
+    second = run_cli("doctor", "--data-dir", str(data_dir), "--repair")
+    assert second.returncode == 0, second.stderr
+    assert "processing grant: present" in second.stdout
+    assert repository.get("deepseek@https://api.deepseek.com") == first_grant
+
+
+def test_doctor_repair_preserves_a_narrowed_grant(tmp_path: Path) -> None:
+    data_dir = _seed_deepseek_installation(tmp_path)
+    runtime = load_installation_runtime(data_dir)
+    grant_path = runtime.state_path("confirmed-state", "processing-grants.json")
+    repository = JsonFileProcessingGrantRepository(grant_path)
+    destination = ProcessingDestination(
+        "deepseek", "https://api.deepseek.com", "cloud"
+    )
+    # The seeded installation has no grant; create one and then narrow it.
+    from reckoning.processing import ensure_initial_processing_grant
+
+    ensure_initial_processing_grant(
+        repository, destination, changed_at=datetime.now(UTC)
+    )
+    ProcessingScope(repository, destination).change(
+        ("current-request",),
+        changed_at=datetime.now(UTC),
+        expected_version=1,
+    )
+
+    result = run_cli("doctor", "--data-dir", str(data_dir), "--repair")
+
+    assert result.returncode == 0, result.stderr
+    grant = repository.get(destination.id)
+    assert grant is not None
+    assert grant.allowed_categories == ("current-request",)
+
+
+def test_doctor_reports_no_grant_problem_for_fake_provider(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "fake-instance"
+    result = run_cli(
+        "setup",
+        "--non-interactive",
+        "--data-dir",
+        str(data_dir),
+        *isolated_setup_args(tmp_path, "fake-grant-cli"),
+    )
+    assert result.returncode == 0, result.stderr
+
+    health = run_cli("doctor", "--data-dir", str(data_dir))
+
+    assert health.returncode == 0, health.stderr
+    assert "processing grant" not in health.stdout
+
+
+def test_doctor_makes_no_provider_calls_when_diagnosing_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = _seed_deepseek_installation(tmp_path)
+    runtime = load_installation_runtime(data_dir)
+    grant_path = runtime.state_path("confirmed-state", "processing-grants.json")
+    grant_path.unlink(missing_ok=True)
+
+    def forbidden_network(request: object, timeout: float) -> bytes:
+        raise AssertionError("doctor grant diagnosis contacted the network")
+
+    monkeypatch.setattr("reckoning.providers.urlopen", forbidden_network)
+
+    result = run_cli("doctor", "--data-dir", str(data_dir))
+
+    assert result.returncode == 0, result.stderr
+    assert "processing grant" in result.stdout
+    assert "missing" in result.stdout
+
+
+def test_doctor_repair_handles_malformed_state_gracefully(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "malformed-instance"
+    data_dir.mkdir()
+    (data_dir / "instance.json").write_text("not json", encoding="utf-8")
+
+    result = run_cli("doctor", "--data-dir", str(data_dir), "--repair")
+
+    assert result.returncode == 2, result.stderr
+    assert "doctor failed" in result.stderr

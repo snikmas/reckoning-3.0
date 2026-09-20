@@ -26,6 +26,7 @@ from reckoning.config import (
 from reckoning.json_store import atomic_write_json, read_json
 from reckoning.operations import (
     OperationError,
+    _optional_absolute_root,
     load_installation_runtime,
     setup_instance,
 )
@@ -46,6 +47,12 @@ from reckoning.personas import (
     describe_persona,
     persona_from_data,
     persona_from_preset,
+)
+from reckoning.processing import (
+    JsonFileProcessingGrantRepository,
+    ensure_initial_processing_grant,
+    full_category_grant_payload,
+    provider_destination,
 )
 from reckoning.provider_adapters import (
     AdapterConfig,
@@ -1872,6 +1879,29 @@ class SetupWorkflow:
                 first_conversation=self._accepted,
                 activation=activation,
             )
+            runtime = load_installation_runtime(
+                self._paths.data_dir,
+                server_data_dir=(
+                    Path(self._draft.server_data_dir)
+                    if self._draft.server_data_dir
+                    else None
+                ),
+            )
+            grant_path = runtime.state_path(
+                "confirmed-state", "processing-grants.json"
+            )
+            destination = provider_destination(
+                provider_id,
+                AdapterConfig(
+                    base_url=self._draft.provider_base_url,
+                    model=model_name,
+                ),
+            )
+            ensure_initial_processing_grant(
+                JsonFileProcessingGrantRepository(grant_path),
+                destination,
+                changed_at=datetime.now(UTC),
+            )
             credential = self._store.credential_for(provider_id)
             if credential is not None:
                 self._store.providers[provider_id] = StoredCredential(
@@ -1980,6 +2010,22 @@ class SetupWorkflow:
             )
             session_path = runtime.state_path("confirmed-state", "interfaces.json")
             state = JsonFileInterfaceRepository(session_path).load()
+            destination = provider_destination(
+                provider.provider_name,
+                AdapterConfig(base_url=provider.base_url, model=provider.model),
+            )
+            if destination.kind == "cloud":
+                grant_path = runtime.state_path(
+                    "confirmed-state", "processing-grants.json"
+                )
+                grant = JsonFileProcessingGrantRepository(grant_path).get(
+                    destination.id
+                )
+                if grant is None:
+                    raise OperationError(
+                        "the processing grant for the active cloud destination "
+                        "is missing"
+                    )
         except (OperationError, RuntimeError, ValueError) as error:
             raise OperationError(
                 f"Activation failed at the reopen check: {error}."
@@ -1989,7 +2035,8 @@ class SetupWorkflow:
                 "Activation failed at the reopen check: the installed provider "
                 "does not match the verified provider."
             )
-        assert self._accepted is not None
+        if self._accepted is None:
+            return
         user_text, assistant_text = self._accepted
         web_sessions = [
             session
@@ -2307,10 +2354,18 @@ class SetupWorkflow:
         activation = instance.get("activation")
         if not isinstance(activation, dict):
             raise OperationError("The installation has no activation record.")
+        runtime = load_installation_runtime(
+            self._paths.data_dir,
+            server_data_dir=self._paths.server_data_dir,
+        )
+        grant_path = runtime.state_path(
+            "confirmed-state", "processing-grants.json"
+        )
         snapshots = (
             _FileSnapshot.capture(instance_path),
             _FileSnapshot.capture(self._paths.credentials_path),
             _FileSnapshot.capture(self._paths.telegram_config_path),
+            _FileSnapshot.capture(grant_path),
         )
         try:
             self._store.default_provider = (
@@ -2321,6 +2376,18 @@ class SetupWorkflow:
             if self._store.providers or self._paths.credentials_path.exists():
                 self._store.save(self._paths.credentials_path)
             self._update_telegram_provider(provider_id)
+            destination = provider_destination(
+                provider_id,
+                AdapterConfig(
+                    base_url=self._draft.provider_base_url,
+                    model=self._draft.provider_model,
+                ),
+            )
+            ensure_initial_processing_grant(
+                JsonFileProcessingGrantRepository(grant_path),
+                destination,
+                changed_at=datetime.now(UTC),
+            )
             atomic_write_json(
                 instance_path,
                 {
@@ -2347,6 +2414,7 @@ class SetupWorkflow:
                 raise OperationError(
                     "The installed provider does not match the verified provider."
                 )
+            self._prove_reopen()
         except (OSError, RuntimeError, ValueError) as error:
             rollback_errors: list[str] = []
             for snapshot in snapshots:
@@ -2510,7 +2578,7 @@ class SetupWorkflow:
 class MigrationWrite:
     """One validated file the migration will replace."""
 
-    kind: Literal["credentials", "telegram", "instance"]
+    kind: Literal["credentials", "telegram", "grant", "instance"]
     label: str
     path: Path
     payload: bytes
@@ -2561,6 +2629,15 @@ def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
     _inspect_personas(instance_path.parent)
     _inspect_runtime_state(paths, instance, roots)
 
+    server_root = (
+        _optional_absolute_root(roots.get("server"))
+        if placement != "local"
+        else None
+    )
+    runtime = load_installation_runtime(
+        paths.data_dir, server_data_dir=server_root
+    )
+
     provider_id = store.default_provider or "fake"
     try:
         definition = find_provider(provider_id)
@@ -2593,6 +2670,26 @@ def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
     }
     migrated = {**instance, "activation": activation}
 
+    grant_path = runtime.state_path(
+        "confirmed-state", "processing-grants.json"
+    )
+    destination = provider_destination(
+        provider_id,
+        AdapterConfig(base_url=base_url, model=model),
+    )
+    grant_payload: bytes | None = None
+    if destination.kind == "cloud":
+        existing_grant = JsonFileProcessingGrantRepository(
+            grant_path
+        ).get(destination.id)
+        if existing_grant is None:
+            grant_payload = _json_bytes(
+                full_category_grant_payload(
+                    destination,
+                    changed_at=datetime.now(UTC),
+                )
+            )
+
     writes: list[MigrationWrite] = []
     if credentials_payload is not None:
         writes.append(
@@ -2614,6 +2711,16 @@ def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
                 0o600,
             )
         )
+    if grant_payload is not None:
+        writes.append(
+            MigrationWrite(
+                "grant",
+                "processing grant",
+                grant_path,
+                grant_payload,
+                0o600,
+            )
+        )
     writes.append(
         MigrationWrite(
             "instance",
@@ -2630,11 +2737,18 @@ def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
         f"- primary provider: {provider_id}; model: {model}",
         "- provider credentials rewrite to schema v2 (backup kept)",
         "- Telegram connector rewrites to schema v2 (backup kept)",
+    ]
+    if grant_payload is not None:
+        preview.append(
+            f"- processing grant: {grant_path} gains a full-category grant "
+            f"for {destination.id}"
+        )
+    preview.append(
         (
             "- the activation record is written last so an interruption "
             "leaves a valid legacy or migrated installation"
         ),
-    ]
+    )
     return MigrationPlan(tuple(writes), tuple(preview))
 
 
@@ -2750,6 +2864,8 @@ def _validate_staged_migration(write: MigrationWrite, staged: Path) -> None:
         ProviderCredentialStore.load(staged)
     elif write.kind == "telegram":
         TelegramConnectorConfig.load(staged)
+    elif write.kind == "grant":
+        JsonFileProcessingGrantRepository(staged).get("")
     else:
         staged_instance = read_json(staged, default={})
         if "activation" not in staged_instance:
