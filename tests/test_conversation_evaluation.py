@@ -80,8 +80,7 @@ def _run_cli_evaluate(*arguments: str) -> subprocess.CompletedProcess[str]:
 def test_load_valid_scenario_set() -> None:
     scenario_set = load_scenario_set(
         Path(__file__).parents[1]
-        / "docs"
-        / "evaluations"
+        / "scenarios"
         / "stage2-conversation-v1.json"
     )
 
@@ -153,8 +152,7 @@ def test_fake_run_matches_expected_overall(tmp_path: Path) -> None:
     output = tmp_path / "out.jsonl"
     rc = run_evaluation(
         Path(__file__).parents[1]
-        / "docs"
-        / "evaluations"
+        / "scenarios"
         / "stage2-conversation-v1.json",
         output,
         mode="fake",
@@ -164,8 +162,7 @@ def test_fake_run_matches_expected_overall(tmp_path: Path) -> None:
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     scenario_set = load_scenario_set(
         Path(__file__).parents[1]
-        / "docs"
-        / "evaluations"
+        / "scenarios"
         / "stage2-conversation-v1.json"
     )
     expected_by_id = {s.id: s.expected_overall for s in scenario_set.scenarios}
@@ -557,8 +554,7 @@ def test_exit_code_nonzero_when_mandatory_fails(tmp_path: Path) -> None:
 def test_cli_evaluate_fake_runs_and_returns_nonzero() -> None:
     scenario_path = (
         Path(__file__).parents[1]
-        / "docs"
-        / "evaluations"
+        / "scenarios"
         / "stage2-conversation-v1.json"
     )
     output = Path("/tmp/reckoning-test-cli-evaluate.jsonl")
@@ -585,8 +581,7 @@ def test_cli_evaluate_fake_runs_and_returns_nonzero() -> None:
 def test_cli_evaluate_default_mode_is_fake() -> None:
     scenario_path = (
         Path(__file__).parents[1]
-        / "docs"
-        / "evaluations"
+        / "scenarios"
         / "stage2-conversation-v1.json"
     )
     output = Path("/tmp/reckoning-test-cli-evaluate-default.jsonl")
@@ -609,8 +604,7 @@ def test_cli_evaluate_live_without_authorization_is_unrun() -> None:
         path.unlink()
     scenario_path = (
         Path(__file__).parents[1]
-        / "docs"
-        / "evaluations"
+        / "scenarios"
         / "stage2-conversation-v1.json"
     )
     result = _run_cli_evaluate(
