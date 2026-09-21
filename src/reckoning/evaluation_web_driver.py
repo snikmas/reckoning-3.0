@@ -371,6 +371,7 @@ class WebEvaluationDriver:
         self._assistant_text: list[str] = []
         self._missing: list[str] = []
         self._composers_by_revision: dict[int, ParsedForm] = {}
+        self._state_transitions: list[dict[str, Any]] = []
 
     @property
     def application(self) -> ReckoningApplication:
@@ -379,8 +380,22 @@ class WebEvaluationDriver:
     def send_message(self, text: str) -> None:
         self._browser.get("/simon")
         composer = self._current_composer()
+        submission = composer.submission(message=text)
+        before_revision = (
+            self._last_reckoning.version if self._last_reckoning is not None else None
+        )
         status, headers, _ = self._browser.post(
-            "/messages", composer.submission(message=text)
+            "/messages", submission
+        )
+        if self._last_reckoning is not None:
+            self._last_reckoning = self.application.inspect_reckoning(
+                self._last_reckoning.id
+            )
+        self._record_state_transition(
+            "message",
+            submission,
+            before_revision=before_revision,
+            response_status=status,
         )
         self._observed.append(f"message status={status} redirect={headers.get('Location', '')}")
         if not status.startswith("303"):
@@ -400,8 +415,9 @@ class WebEvaluationDriver:
     def start_reckoning(self, text: str) -> None:
         self._browser.get("/simon")
         composer = self._current_composer()
+        submission = composer.submission(message=text)
         status, headers, _ = self._browser.post(
-            "/decisions", composer.submission(message=text)
+            "/decisions", submission
         )
         self._observed.append(f"reckon status={status} redirect={headers.get('Location', '')}")
         if status.startswith("303") and headers.get("Location", "").startswith("/decisions/"):
@@ -418,6 +434,12 @@ class WebEvaluationDriver:
         else:
             self._last_reckoning = None
             self._last_record_id = None
+        self._record_state_transition(
+            "reckon",
+            submission,
+            before_revision=None,
+            response_status=status,
+        )
 
     def correct_record(self, text: str) -> None:
         """Correct through the rendered /messages composer, not a direct form."""
@@ -428,9 +450,11 @@ class WebEvaluationDriver:
         if composer is None:
             self._observed.append("No rendered proposal composer found")
             return
+        before_revision = self._last_reckoning.version
+        submission = composer.submission(message=f"No, correct it: {text}")
         status, headers, _ = self._browser.post(
             "/messages",
-            composer.submission(message=f"No, correct it: {text}"),
+            submission,
         )
         self._observed.append(
             f"correct status={status} redirect={headers.get('Location', '')}"
@@ -446,6 +470,12 @@ class WebEvaluationDriver:
             self._observed.append(
                 "Correction not applied: the handler asked for review"
             )
+        self._record_state_transition(
+            "correct",
+            submission,
+            before_revision=before_revision,
+            response_status=status,
+        )
 
     def confirm_reckoning(self, expected_revision: int | None = None) -> None:
         """Confirm through the rendered /messages composer.
@@ -469,8 +499,10 @@ class WebEvaluationDriver:
             if composer is None:
                 self._observed.append("No rendered proposal composer found")
                 return
+        before_revision = self._last_reckoning.version
+        submission = composer.submission(message="I confirm this version")
         status, headers, _ = self._browser.post(
-            "/messages", composer.submission(message="I confirm this version")
+            "/messages", submission
         )
         self._observed.append(
             f"confirm status={status} redirect={headers.get('Location', '')}"
@@ -483,6 +515,50 @@ class WebEvaluationDriver:
                 f"Confirm rejected: status={status} "
                 f"redirect={headers.get('Location', '')}"
             )
+        self._record_state_transition(
+            "confirm",
+            submission,
+            before_revision=before_revision,
+            response_status=status,
+        )
+
+    def _record_state_transition(
+        self,
+        action: str,
+        submission: dict[str, str],
+        *,
+        before_revision: int | None,
+        response_status: str,
+    ) -> None:
+        operation_id = submission.get("operation_id", "")
+        receipt = self.application.inspect_operation(operation_id) if operation_id else None
+        receipt_evidence = None
+        if receipt is not None:
+            receipt_evidence = {
+                "operation_id": receipt.operation_id,
+                "status": receipt.status,
+                "result_id": receipt.result_id,
+                "kind": receipt.kind,
+                "target_id": receipt.target_id,
+                "displayed_revision": receipt.displayed_revision,
+            }
+        self._state_transitions.append(
+            {
+                "action": action,
+                "operation_id": operation_id,
+                "rendered_binding_present": bool(
+                    submission.get("decision_presentation_token")
+                ),
+                "before_revision": before_revision,
+                "after_revision": (
+                    self._last_reckoning.version
+                    if self._last_reckoning is not None
+                    else None
+                ),
+                "response_status": response_status,
+                "durable_receipt": receipt_evidence,
+            }
+        )
 
     def _composer_for_current_revision(self) -> ParsedForm | None:
         captured = self._capture_proposal_composer()
@@ -506,7 +582,7 @@ class WebEvaluationDriver:
         if match is None:
             return None
         revision = int(match.group(1))
-        self._composers_by_revision[revision] = composer
+        self._composers_by_revision.setdefault(revision, composer)
         return revision, composer
 
     def explain_reckoning(self) -> None:
@@ -557,6 +633,17 @@ class WebEvaluationDriver:
         confirmed = [r for r in reckonings if r.status == "confirmed"]
         proposed = [r for r in reckonings if r.status == "proposed"]
         last_reckoning = self._last_reckoning
+        current_record_keys = {
+            (record.record_id, record.version)
+            for record in (
+                last_reckoning.current_records if last_reckoning else ()
+            )
+        }
+        superseded_meanings = [
+            record.meaning
+            for record in (last_reckoning.record_versions if last_reckoning else ())
+            if (record.record_id, record.version) not in current_record_keys
+        ]
         evidence: dict[str, Any] = {
             "model_run_count": len(runs),
             "model_run_records": list(runs),
@@ -569,6 +656,20 @@ class WebEvaluationDriver:
             "last_reckoning_meanings": [
                 record.meaning for record in (last_reckoning.current_records if last_reckoning else ())
             ],
+            "superseded_reckoning_meanings": superseded_meanings,
+            "last_reckoning_record_versions": [
+                {
+                    "record_id": record.record_id,
+                    "version": record.version,
+                    "status": record.status,
+                    "meaning": record.meaning,
+                    "supersedes_version": record.supersedes_version,
+                }
+                for record in (
+                    last_reckoning.record_versions if last_reckoning else ()
+                )
+            ],
+            "state_transitions": list(self._state_transitions),
         }
         return "\n".join(self._observed), "\n".join(self._assistant_text), evidence
 

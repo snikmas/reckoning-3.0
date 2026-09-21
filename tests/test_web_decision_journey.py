@@ -639,6 +639,17 @@ def test_conversational_correction_and_confirmation(tmp_path: Path) -> None:
     status, _, page = browser.get(first_location)
     assert b'class="status status-proposed"' in page
 
+    # A question that contains "confirm" is not consent.
+    composer = _simon_composer(browser)
+    status, headers, _ = browser.post(
+        "/messages",
+        composer.submission(message="What happens if I confirm?"),
+    )
+    assert status == "303 See Other"
+    assert headers["Location"] == "/simon"
+    status, _, page = browser.get(first_location)
+    assert b'class="status status-proposed"' in page
+
     # Conversational correction produces an unconfirmed, visible revision.
     composer = _simon_composer(browser)
     status, headers, _ = browser.post(

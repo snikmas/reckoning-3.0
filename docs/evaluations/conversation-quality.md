@@ -9,11 +9,14 @@ network request, and uses no provider credentials.
 From the repository root, run:
 
 ```bash
-PYTHONPATH=src python -m reckoning evaluate \
+EVALUATION_OUTPUT="$(mktemp /tmp/reckoning-stage2-early-web.XXXXXX.jsonl)"
+PYTHONPATH=src .venv/bin/python -m reckoning evaluate \
   --scenario-set scenarios/stage2-conversation-v1.json \
   --mode fake \
   --profile early-web \
-  --output /tmp/reckoning-stage2-early-web.jsonl
+  --output "$EVALUATION_OUTPUT"
+EVALUATION_STATUS=$?
+printf 'exit=%s\njsonl=%s\n' "$EVALUATION_STATUS" "$EVALUATION_OUTPUT"
 ```
 
 Use a new output path for each independent run. The evaluator appends one JSON
@@ -30,11 +33,14 @@ human judgment remains incomplete.
 To include every Stage 2 scenario, run:
 
 ```bash
-PYTHONPATH=src python -m reckoning evaluate \
+EVALUATION_OUTPUT="$(mktemp /tmp/reckoning-stage2-full.XXXXXX.jsonl)"
+PYTHONPATH=src .venv/bin/python -m reckoning evaluate \
   --scenario-set scenarios/stage2-conversation-v1.json \
   --mode fake \
   --profile full-stage-2 \
-  --output /tmp/reckoning-stage2-full.jsonl
+  --output "$EVALUATION_OUTPUT"
+EVALUATION_STATUS=$?
+printf 'exit=%s\njsonl=%s\n' "$EVALUATION_STATUS" "$EVALUATION_OUTPUT"
 ```
 
 `early-web` selects the scenarios tagged for the current Web journey.
@@ -53,14 +59,41 @@ provider route, result, and limitations. It also records:
 
 The console summary separates product counts from detector counts. Product
 counts describe the application behavior under test. Detector counts describe
-deliberately good or bad fixtures that check whether an evaluator rule can
-distinguish known cases. A passing detector does not make a failing product
-scenario pass.
+deliberately bad fixtures that check whether an evaluator rule catches known
+failures. A correctly detected bad case remains `failed` in JSONL. Its unit
+test passes separately.
+
+Inspect the JSONL file after either command:
+
+```bash
+.venv/bin/python -c '
+import json
+import sys
+
+for line in open(sys.argv[1], encoding="utf-8"):
+    record = json.loads(line)
+    print(
+        record["scenario_id"],
+        record["scenario_tags"],
+        record["overall_status"],
+        record["rubric_results"],
+    )
+' "$EVALUATION_OUTPUT"
+```
+
+Mutation evidence records before and after revisions, whether the request used
+a rendered proposal binding, and any durable operation receipt. Use
+`scenario_tags` to keep product records separate from detector records.
 
 Fake mode cannot prove naturalness, user usefulness, live-provider quality,
 provider cost, or Stage 2 acceptance. Human-judgment dimensions remain
 `unrun`, and missing product journeys remain visible rather than falling back
 to a fake pass.
+
+Scenario schema version 2 names a versioned evaluator rule for each dimension.
+Runtime scoring reads the observed output, application-state evidence, and the
+named rule. Expected fake outcomes live only in evaluator tests; they are not
+part of the runtime `Scenario` type.
 
 ## Authorize a live run separately
 

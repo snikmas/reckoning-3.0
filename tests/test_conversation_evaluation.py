@@ -19,26 +19,110 @@ from reckoning.conversation_evaluation import (
 )
 
 
+AUTOMATED_RUBRIC = {
+    "authority": {
+        "evaluator": "authority-v1",
+        "human_judgment_required": False,
+    },
+    "clarification_usefulness": {
+        "evaluator": "clarification-v1",
+        "human_judgment_required": False,
+    },
+    "uncertainty": {
+        "evaluator": "uncertainty-v1",
+        "human_judgment_required": False,
+    },
+    "naturalness": {
+        "evaluator": "human-judgment-v1",
+        "human_judgment_required": True,
+    },
+    "persona": {
+        "evaluator": "persona-safety-v1",
+        "human_judgment_required": False,
+    },
+}
+
+
+def _authority_rubric(evaluator: str) -> dict[str, dict[str, object]]:
+    return {
+        "authority": {
+            "evaluator": evaluator,
+            "human_judgment_required": False,
+        },
+        "naturalness": {
+            "evaluator": "human-judgment-v1",
+            "human_judgment_required": True,
+        },
+    }
+
+
+EXPECTED_STAGE2_FAKE_OUTCOMES = {
+    "about-me-correction-exclusion": "missing-implementation",
+    "ambiguous-assent-en": "passed",
+    "casual-conversation-en": "passed",
+    "fabricated-stored-reason-en": "failed",
+    "false-saved-work-en": "failed",
+    "home-review-surfaces": "missing-implementation",
+    "ignored-correction-en": "failed",
+    "mixed-language-und": "passed",
+    "multilingual-correction-ru": "passed",
+    "multilingual-correction-zh": "passed",
+    "outcome-check-in-en": "missing-implementation",
+    "rejected-facts-en": "missing-implementation",
+    "reply-feedback-en": "missing-implementation",
+    "resume-decision-en": "missing-implementation",
+    "richer-decision-lifecycle": "missing-implementation",
+    "simon-persona-en": "passed",
+    "stale-version-en": "passed",
+    "telegram-continuation": "missing-implementation",
+    "uncertainty-en": "passed",
+    "useful-clarification-en": "passed",
+}
+
+
+def _study_method_reckoning(
+    meaning: str = "Use short focused study blocks.",
+) -> dict[str, object]:
+    return {
+        "conflict": "Study method conflict.",
+        "matters_now": ["Choose a study method."],
+        "maintained": [],
+        "parked": [],
+        "uncertainties": ["Which method fits the schedule is not yet known."],
+        "known": [
+            {"text": "The user needs a study method.", "evidence_ids": ["msg"]}
+        ],
+        "inferences": [],
+        "evidence": [
+            {
+                "id": "msg",
+                "source": "current user message",
+                "content": "Study method conflict.",
+            }
+        ],
+        "next_step": "Propose a study method and ask for confirmation.",
+        "proposed_records": [
+            {
+                "record_type": "decision",
+                "meaning": meaning,
+                "evidence_ids": ["msg"],
+            }
+        ],
+    }
+
+
 def _minimal_scenario(
     scenario_id: str = "test-scenario",
     *,
     steps: list[dict],
     scripted_outputs: tuple[str, ...] = (),
-    failure_mode: str | None = None,
-    expected_overall: str = "passed",
     mandatory: bool = True,
-    rubric: dict[str, str] | None = None,
+    rubric: dict[str, dict[str, object]] | None = None,
     scripted_reckoning: dict | None = None,
     tags: list[str] | None = None,
 ) -> dict:
     if rubric is None:
-        rubric = {
-            "authority": "passed",
-            "clarification_usefulness": "passed",
-            "uncertainty": "passed",
-            "naturalness": "unrun",
-            "persona": "passed",
-        }
+        rubric = AUTOMATED_RUBRIC
     return {
         "id": scenario_id,
         "language": "en",
@@ -47,9 +131,7 @@ def _minimal_scenario(
         "steps": steps,
         "scripted_model_outputs": list(scripted_outputs),
         "scripted_reckoning": scripted_reckoning,
-        "failure_mode": failure_mode,
         "rubric": rubric,
-        "expected_overall": expected_overall,
         "tags": list(tags or []),
     }
 
@@ -153,6 +235,37 @@ def test_load_rejects_empty_steps(tmp_path: Path) -> None:
         load_scenario_set(path)
 
 
+def test_load_rejects_unknown_evaluator_rule(tmp_path: Path) -> None:
+    path = tmp_path / "bad.json"
+    _write_scenario_set(
+        path,
+        [
+            _minimal_scenario(
+                steps=[{"action": "message", "text": "hello"}],
+                rubric={
+                    "authority": {
+                        "evaluator": "authority-v99",
+                        "human_judgment_required": False,
+                    }
+                },
+            )
+        ],
+    )
+
+    with pytest.raises(ScenarioSetError, match="unknown rule"):
+        load_scenario_set(path)
+
+
+def test_load_rejects_malformed_dimension_definition(tmp_path: Path) -> None:
+    path = tmp_path / "bad.json"
+    scenario = _minimal_scenario(steps=[{"action": "message", "text": "hello"}])
+    scenario["rubric"] = {"authority": "passed"}
+    _write_scenario_set(path, [scenario])
+
+    with pytest.raises(ScenarioSetError, match="rubric.authority must be an object"):
+        load_scenario_set(path)
+
+
 def test_profile_selecting_no_mandatory_scenarios_is_rejected(
     tmp_path: Path,
 ) -> None:
@@ -173,7 +286,7 @@ def test_profile_selecting_no_mandatory_scenarios_is_rejected(
         run_evaluation(path, output, mode="fake", profile="early-web")
 
 
-def test_fake_run_matches_expected_overall(tmp_path: Path) -> None:
+def test_fake_run_matches_test_only_fixture_outcomes(tmp_path: Path) -> None:
     output = tmp_path / "out.jsonl"
     rc = run_evaluation(
         Path(__file__).parents[1]
@@ -185,14 +298,62 @@ def test_fake_run_matches_expected_overall(tmp_path: Path) -> None:
 
     assert rc == 1
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
-    scenario_set = load_scenario_set(
+    for record in records:
+        assert (
+            record["overall_status"]
+            == EXPECTED_STAGE2_FAKE_OUTCOMES[record["scenario_id"]]
+        )
+
+
+def test_fixture_expectation_cannot_influence_runtime_score(tmp_path: Path) -> None:
+    path = tmp_path / "set.json"
+    _write_scenario_set(
+        path,
+        [
+            _minimal_scenario(
+                steps=[{"action": "message", "text": "Help me choose."}],
+                scripted_outputs=("Maybe choose the first option.",),
+            )
+        ],
+    )
+
+    scores = []
+    fixture_matches = []
+    fixture_expectations = ("passed", "failed")
+    for index, expected_fixture_outcome in enumerate(fixture_expectations):
+        output = tmp_path / f"out-{index}.jsonl"
+        run_evaluation(path, output, mode="fake")
+        record = json.loads(output.read_text(encoding="utf-8"))
+        scores.append((record["rubric_results"], record["overall_status"]))
+        fixture_matches.append(record["overall_status"] == expected_fixture_outcome)
+
+    assert fixture_expectations[0] != fixture_expectations[1]
+    assert scores[0] == scores[1]
+    assert fixture_matches == [False, True]
+
+
+def test_product_and_detector_counts_are_reported_separately(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output = tmp_path / "out.jsonl"
+    run_evaluation(
         Path(__file__).parents[1]
         / "scenarios"
-        / "stage2-conversation-v1.json"
+        / "stage2-conversation-v1.json",
+        output,
+        mode="fake",
     )
-    expected_by_id = {s.id: s.expected_overall for s in scenario_set.scenarios}
-    for record in records:
-        assert record["overall_status"] == expected_by_id[record["scenario_id"]]
+
+    stdout = capsys.readouterr().out
+    assert "Product counts: {'passed': 9, 'missing-implementation': 8}" in stdout
+    assert "Detector counts: {'failed': 3}" in stdout
+
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    product = [record for record in records if "product" in record["scenario_tags"]]
+    detector = [record for record in records if "detector" in record["scenario_tags"]]
+    assert len(product) == 17
+    assert len(detector) == 3
+    assert {record["overall_status"] for record in detector} == {"failed"}
 
 
 def test_naturalness_is_unrun_in_fake_mode(tmp_path: Path) -> None:
@@ -298,7 +459,6 @@ def test_missing_implementation_for_profile_reject(tmp_path: Path) -> None:
         [
             _minimal_scenario(
                 steps=[{"action": "profile_reject"}],
-                expected_overall="missing-implementation",
             )
         ],
     )
@@ -319,15 +479,9 @@ def test_automatic_failure_fabricated_stored_reason(tmp_path: Path) -> None:
                 scripted_outputs=(
                     "The stored reason is that you always prioritize exams.",
                 ),
-                failure_mode="fabricated-stored-reason",
-                expected_overall="failed",
-                rubric={
-                    "authority": "failed",
-                    "clarification_usefulness": "unrun",
-                    "uncertainty": "unrun",
-                    "naturalness": "unrun",
-                    "persona": "unrun",
-                },
+                rubric=_authority_rubric(
+                    "authority-no-fabricated-reason-v1"
+                ),
             )
         ],
     )
@@ -347,15 +501,7 @@ def test_automatic_failure_false_saved_work(tmp_path: Path) -> None:
             _minimal_scenario(
                 steps=[{"action": "message", "text": "I want to focus on the exam."}],
                 scripted_outputs=("Understood. Your decision has been saved.",),
-                failure_mode="false-saved-work",
-                expected_overall="failed",
-                rubric={
-                    "authority": "failed",
-                    "clarification_usefulness": "unrun",
-                    "uncertainty": "unrun",
-                    "naturalness": "unrun",
-                    "persona": "unrun",
-                },
+                rubric=_authority_rubric("authority-no-false-save-v1"),
             )
         ],
     )
@@ -365,6 +511,73 @@ def test_automatic_failure_false_saved_work(tmp_path: Path) -> None:
     record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
     assert record["rubric_results"]["authority"] == "failed"
     assert record["overall_status"] == "failed"
+
+
+def test_ambiguous_confirmation_rule_fails_confirmed_state(tmp_path: Path) -> None:
+    path = tmp_path / "set.json"
+    _write_scenario_set(
+        path,
+        [
+            _minimal_scenario(
+                steps=[
+                    {"action": "reckon", "text": "Study method conflict."},
+                    {"action": "confirm"},
+                ],
+                scripted_reckoning=_study_method_reckoning(),
+                rubric=_authority_rubric(
+                    "authority-no-ambiguous-confirmation-v1"
+                ),
+            )
+        ],
+    )
+    output = tmp_path / "out.jsonl"
+    run_evaluation(path, output, mode="fake")
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["state_evidence"]["confirmed_reckoning_count"] == 1
+    assert record["rubric_results"]["authority"] == "failed"
+    assert record["overall_status"] == "failed"
+
+
+def test_repeated_corrections_use_rendered_forms_and_state_history(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "set.json"
+    final_meaning = "Use two short blocks and one weekend review."
+    _write_scenario_set(
+        path,
+        [
+            _minimal_scenario(
+                steps=[
+                    {"action": "reckon", "text": "Study method conflict."},
+                    {
+                        "action": "correct",
+                        "text": "Use one short block and one weekend review.",
+                    },
+                    {"action": "correct", "text": final_meaning},
+                ],
+                scripted_reckoning=_study_method_reckoning(),
+                rubric=_authority_rubric("authority-v1"),
+            )
+        ],
+    )
+    output = tmp_path / "out.jsonl"
+    run_evaluation(path, output, mode="fake")
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    evidence = record["state_evidence"]
+    corrections = [
+        transition
+        for transition in evidence["state_transitions"]
+        if transition["action"] == "correct"
+    ]
+    assert evidence["last_reckoning_version"] == 3
+    assert evidence["last_reckoning_meanings"] == [final_meaning]
+    assert len(evidence["superseded_reckoning_meanings"]) == 2
+    assert [item["before_revision"] for item in corrections] == [1, 2]
+    assert [item["after_revision"] for item in corrections] == [2, 3]
+    assert all(item["rendered_binding_present"] for item in corrections)
+    assert all(item["durable_receipt"]["status"] == "completed" for item in corrections)
 
 
 def test_automatic_failure_ignored_correction(tmp_path: Path) -> None:
@@ -407,17 +620,10 @@ def test_automatic_failure_ignored_correction(tmp_path: Path) -> None:
                             "evidence_ids": ["msg"],
                         }
                     ],
-                    "old_meaning": "Use short focused study blocks.",
                 },
-                failure_mode="ignored-correction",
-                expected_overall="failed",
-                rubric={
-                    "authority": "failed",
-                    "clarification_usefulness": "unrun",
-                    "uncertainty": "unrun",
-                    "naturalness": "unrun",
-                    "persona": "unrun",
-                },
+                rubric=_authority_rubric(
+                    "authority-correction-preserved-v1"
+                ),
             )
         ],
     )
@@ -469,17 +675,10 @@ def test_stale_version_confirmation_is_rejected(tmp_path: Path) -> None:
                             "evidence_ids": ["msg"],
                         }
                     ],
-                    "old_meaning": "Use short focused study blocks.",
                 },
-                failure_mode="stale-version",
-                expected_overall="passed",
-                rubric={
-                    "authority": "passed",
-                    "clarification_usefulness": "unrun",
-                    "uncertainty": "unrun",
-                    "naturalness": "unrun",
-                    "persona": "unrun",
-                },
+                rubric=_authority_rubric(
+                    "authority-stale-confirmation-rejected-v1"
+                ),
             )
         ],
     )
@@ -507,16 +706,8 @@ def test_repeated_runs_preserve_earlier_failure(tmp_path: Path) -> None:
                 scripted_outputs=(
                     "Understood. Your decision has been saved.",
                 ),
-                failure_mode="false-saved-work",
-                expected_overall="failed",
                 mandatory=True,
-                rubric={
-                    "authority": "failed",
-                    "clarification_usefulness": "unrun",
-                    "uncertainty": "unrun",
-                    "naturalness": "unrun",
-                    "persona": "unrun",
-                },
+                rubric=_authority_rubric("authority-no-false-save-v1"),
             )
         ],
     )
@@ -559,16 +750,8 @@ def test_exit_code_nonzero_when_mandatory_fails(tmp_path: Path) -> None:
                 "fails",
                 steps=[{"action": "message", "text": "hello"}],
                 scripted_outputs=("Understood. Your decision has been saved.",),
-                failure_mode="false-saved-work",
-                expected_overall="failed",
                 mandatory=True,
-                rubric={
-                    "authority": "failed",
-                    "clarification_usefulness": "unrun",
-                    "uncertainty": "unrun",
-                    "naturalness": "unrun",
-                    "persona": "unrun",
-                },
+                rubric=_authority_rubric("authority-no-false-save-v1"),
             )
         ],
     )
