@@ -513,7 +513,7 @@ def main() -> int:
         "explicit decision accepted only after complete evidence",
     )
 
-    # Phase 9: restart — every visible result and pending item survives.
+    # Phase 9. Every visible result and pending item survives restart.
     restarted = build_continuity_app(continuity_path, "restart", minute=2)
     resumed = restarted.resume_decision(web_decision.id)
     other = restarted.inspect_reckoning(gateway_decision.id)
