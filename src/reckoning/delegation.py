@@ -271,6 +271,10 @@ class DelegationLimitExceeded(RuntimeError):
     pass
 
 
+class DelegationQuoteExceeded(RuntimeError):
+    pass
+
+
 class BoundedWorkerRuntime:
     """Host-owned capabilities; every external operation is gated before use."""
 
@@ -300,9 +304,11 @@ class BoundedWorkerRuntime:
             raise DelegationLimitExceeded("worker exceeded the cost limit")
         self.model_calls += 1
         response = self._model_gateway.execute(self._task.provider, prompt)
-        if response.cost > quote:
-            raise RuntimeError("The delegated model gateway exceeded its cost quote.")
         self.cost += response.cost
+        if response.cost > quote:
+            raise DelegationQuoteExceeded(
+                "delegated model gateway exceeded its cost quote"
+            )
         return response.content
 
     def use_tool(self, tool: str, payload: str) -> str:
@@ -484,6 +490,9 @@ class DelegationCoordinator:
                         tools_used=tuple(runtime.tools_used),
                     )
                 except DelegationLimitExceeded as error:
+                    violations = (str(error),)
+                    review_status = "limited"
+                except DelegationQuoteExceeded as error:
                     violations = (str(error),)
                     review_status = "limited"
                 except Exception:

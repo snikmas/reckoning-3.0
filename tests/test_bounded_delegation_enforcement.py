@@ -222,6 +222,37 @@ def test_exact_context_and_host_measured_receipt() -> None:
     assert outcome.receipt.result == "accepted"
 
 
+def test_quote_violation_records_actual_model_cost() -> None:
+    class Worker:
+        def execute(
+            self, task: Any, runtime: BoundedWorkerRuntime
+        ) -> DelegatedWorkerFinding:
+            runtime.call_model("check")
+            raise AssertionError("a quote violation must stop the worker")
+
+    class OverQuoteModel(ModelGateway):
+        def __init__(self) -> None:
+            super().__init__(Decimal("0.10"))
+
+        def execute(self, provider: str, prompt: str) -> DelegatedModelResponse:
+            self.calls.append((provider, prompt))
+            return DelegatedModelResponse("candidate", Decimal("0.20"))
+
+    reviewer = SimonReviewer(
+        AgentDisposition("limited", "Simon stopped the worker.", "Quote exceeded.")
+    )
+
+    outcome, _, model, _ = run(Worker(), reviewer, model=OverQuoteModel())
+
+    assert model.calls == [("fake-worker", "check")]
+    assert outcome.receipt.model_calls == 1
+    assert outcome.receipt.cost == Decimal("0.20")
+    assert outcome.receipt.policy_violations == (
+        "delegated model gateway exceeded its cost quote",
+    )
+    assert outcome.receipt.result == "limited"
+
+
 @pytest.mark.parametrize(
     ("attempt", "violation"),
     [
