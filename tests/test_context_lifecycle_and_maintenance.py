@@ -130,3 +130,54 @@ def test_maintenance_is_atomic_proposes_reviewable_patterns_and_respects_deletio
     assert maintenance_repository.results["run-1"].source_record_ids == ()
     assert maintenance_repository.results["run-1"].index == ()
     assert maintenance.may_consolidate(("fact-1",)) is False
+
+
+def test_permanent_deletion_removes_the_derived_summary_text(
+    tmp_path: Path,
+) -> None:
+    instant = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    context_repository, _ = build_context(tmp_path / "context.json", instant)
+    maintenance_repository = InMemoryMaintenanceRepository()
+    context = PersonalContextService(
+        context_repository, link_removers=(maintenance_repository,)
+    )
+    maintenance = MemoryMaintenanceService(
+        context_repository, maintenance_repository
+    )
+    maintenance.run(
+        "run-private",
+        instant,
+        lambda sources: "Mary studies Chinese on Wednesday.",
+    )
+
+    context.delete("fact-1", instant + timedelta(minutes=1))
+
+    assert maintenance_repository.results["run-private"].summary == ""
+
+
+def test_forgotten_context_is_excluded_from_summarization_and_maintenance(
+    tmp_path: Path,
+) -> None:
+    instant = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    context_repository, context = build_context(
+        tmp_path / "context.json", instant
+    )
+    context.forget("fact-1", instant + timedelta(minutes=1))
+    maintenance_repository = InMemoryMaintenanceRepository()
+    maintenance = MemoryMaintenanceService(
+        context_repository, maintenance_repository
+    )
+    summarized_sources: list[object] = []
+
+    def summarize(sources: object) -> str:
+        summarized_sources.append(sources)
+        return "No eligible context."
+
+    result = maintenance.run(
+        "run-after-forget", instant + timedelta(minutes=2), summarize
+    )
+
+    assert summarized_sources == [()]
+    assert result.source_record_ids == ()
+    assert result.index == ()
+    assert result.duplicate_groups == ()

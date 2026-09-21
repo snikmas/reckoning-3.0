@@ -844,7 +844,7 @@ class PersonalContextService:
         corrected = replace(
             current,
             version=current.version + 1,
-            status="proposed" if current.status == "proposed" else "active",
+            status=current.status,
             original_text=_required(original_text, "Correction wording"),
             language=_required(language, "Correction language"),
             canonical_meaning=_required(canonical_meaning, "Canonical meaning"),

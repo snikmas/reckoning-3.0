@@ -207,6 +207,46 @@ def test_stale_multilingual_correction_returns_an_explicit_revision_conflict(
     assert history.superseded == (proposal,)
 
 
+@pytest.mark.parametrize(
+    ("transition_name", "inactive_status"),
+    (("archive", "archived"), ("forget", "forgotten")),
+)
+def test_correcting_inactive_context_requires_explicit_recovery(
+    tmp_path: Path,
+    transition_name: str,
+    inactive_status: str,
+) -> None:
+    path = tmp_path / "personal-context" / "personal-context.json"
+    service = PersonalContextService(JsonFilePersonalContextRepository(path))
+    service.remember(
+        record_id="inactive-context",
+        original_text="I study Chinese on Tuesday.",
+        language="en",
+        canonical_meaning="Mary studies Chinese on Tuesday.",
+        source="direct user statement",
+        created_at=NOW,
+    )
+    transition = getattr(service, transition_name)
+    transition("inactive-context", NOW + timedelta(minutes=1))
+
+    corrected = service.correct(
+        "inactive-context",
+        original_text="I study Chinese on Wednesday.",
+        language="en",
+        canonical_meaning="Mary studies Chinese on Wednesday.",
+        corrected_at=NOW + timedelta(minutes=2),
+    )
+
+    assert corrected.status == inactive_status
+    assert service.list_active() == ()
+    restarted = PersonalContextService(JsonFilePersonalContextRepository(path))
+    assert restarted.inspect("inactive-context").current == corrected
+    recovered = restarted.recover(
+        "inactive-context", NOW + timedelta(minutes=3)
+    )
+    assert recovered.status == "active"
+
+
 def test_legacy_context_migrates_once_and_resumes_incomplete_initialization(
     tmp_path: Path,
 ) -> None:
