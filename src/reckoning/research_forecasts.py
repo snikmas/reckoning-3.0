@@ -205,6 +205,8 @@ class BoundedResearchService:
             raise ValueError("A research conclusion requires at least one source.")
         if any(source.scope != request.scope for source in sources):
             raise PermissionError("A source falls outside the research request scope.")
+        if any(source.cost_units < 0 for source in sources):
+            raise ValueError("A research source cost cannot be negative.")
         total_cost = sum(source.cost_units for source in sources)
         if total_cost > request.max_cost_units:
             raise PermissionError("The research request exceeded its cost limit.")
