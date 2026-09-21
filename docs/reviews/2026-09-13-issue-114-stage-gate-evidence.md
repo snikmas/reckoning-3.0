@@ -9,12 +9,14 @@ use credentials, paid providers, private data, or real Telegram delivery.
 ## Revision and working tree
 
 The implementation revision under test was
-`70cf1a7beb55ba93369d320c571e5cb089404e7f` on
+`d73f73242914f0bf655fac65462c8c981baf3fa5` on
 `codex/audit-followups-152-155`. It contains these repair commits:
 
 - `8a5b7f8` keeps connector revocation authoritative across instances.
 - `9f5e65f` records actual delegated model cost after a quote breach.
 - `70cf1a7` restores and modernizes the 16-phase #114 scenario.
+- `5305e26` restores the evidence report.
+- `d73f732` covers stale disconnection as well as stale revocation.
 
 The scenario reported a dirty working tree. The only dirty paths were this
 untracked evidence report and two preserved audit artifacts:
@@ -63,8 +65,8 @@ the tracked repository path without a temporary source rewrite.
 
 | Check | Result |
 | --- | --- |
-| Focused connector, recovery, interface, and delegation tests | 96 passed |
-| Full suite with `RECKONING_LIVE_SMOKE=0` | 862 passed, 15 skipped |
+| Focused connector, recovery, interface, and delegation tests | 97 passed |
+| Full suite with `RECKONING_LIVE_SMOKE=0` | 863 passed, 15 skipped |
 | Mypy on `src` | Passed on 48 source files |
 | Mypy on the restored scenario | Passed on 1 file |
 | Ruff `E4,E7,E9,F` on `src`, `tests`, and the scenario | Passed |
