@@ -79,7 +79,9 @@ class InMemoryMaintenanceRepository:
             result_id: MaintenanceResult(
                 id=result.id,
                 created_at=result.created_at,
-                summary=result.summary,
+                summary=(
+                    "" if record_id in result.source_record_ids else result.summary
+                ),
                 index=tuple(
                     item for item in result.index if item.record_id != record_id
                 ),
@@ -199,4 +201,6 @@ class MemoryMaintenanceService:
         current: dict[str, PersonalContextVersion] = {}
         for item in self._context.all_versions():
             current[item.record_id] = item
-        return tuple(current.values())
+        return tuple(
+            item for item in current.values() if item.status != "forgotten"
+        )
