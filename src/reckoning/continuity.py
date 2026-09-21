@@ -92,6 +92,26 @@ class ReckoningDraft:
             raise RuntimeError("A first reckoning must identify the conflict.")
         if not self.next_step.strip():
             raise RuntimeError("A first reckoning must end with a next step.")
+        has_meaningful_content = (
+            bool(self.questions)
+            or any(
+                item.strip()
+                for collection in (
+                    self.matters_now,
+                    self.maintained,
+                    self.parked,
+                    self.uncertainties,
+                )
+                for item in collection
+            )
+            or any(fact.text.strip() for fact in self.known)
+            or any(inference.text.strip() for inference in self.inferences)
+        )
+        if not has_meaningful_content:
+            raise RuntimeError(
+                "A first reckoning must contain meaningful content or a material "
+                "clarification question."
+            )
         evidence_ids = {evidence.id for evidence in self.evidence}
         if any(
             not proposal.meaning.strip()

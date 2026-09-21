@@ -157,3 +157,49 @@ def test_first_reckoning_rejects_more_than_three_initial_questions() -> None:
 
     with pytest.raises(RuntimeError, match="more than three"):
         application.start_reckoning(MESSY_INPUT)
+
+
+def test_first_reckoning_rejects_an_empty_result() -> None:
+    empty_draft = ReckoningDraft(
+        conflict="Several commitments compete for the user's attention.",
+        questions=(),
+        matters_now=(),
+        maintained=(),
+        parked=(),
+        uncertainties=(),
+        known=(),
+        inferences=(),
+        evidence=(),
+        next_step="Choose what to do next.",
+    )
+    application = build_application(empty_draft)
+
+    with pytest.raises(RuntimeError, match="meaningful content"):
+        application.start_reckoning(MESSY_INPUT)
+
+
+def test_first_reckoning_accepts_a_material_clarification_only_result() -> None:
+    clarification_draft = ReckoningDraft(
+        conflict="The nearest fixed consequence is not clear yet.",
+        questions=(
+            MaterialQuestion(
+                text="Which commitment has the nearest fixed deadline?",
+                effect_on_recommendation=(
+                    "The nearest fixed deadline determines what matters now."
+                ),
+            ),
+        ),
+        matters_now=(),
+        maintained=(),
+        parked=(),
+        uncertainties=(),
+        known=(),
+        inferences=(),
+        evidence=(),
+        next_step="Answer the deadline question before choosing a priority.",
+    )
+    application = build_application(clarification_draft)
+
+    reckoning = application.start_reckoning(MESSY_INPUT)
+
+    assert reckoning.draft == clarification_draft
