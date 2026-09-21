@@ -19,7 +19,6 @@ pipx install .        # or: uv tool install .
 reckoning setup       # guided first run, ending in a real first conversation
 reckoning             # talk to your agent in the terminal
 reckoning web         # open the web interface at http://127.0.0.1:8000
-reckoning gateway     # optional: run the messaging channels you configured
 ```
 
 If you cannot use pipx or uv, `python3 -m pip install .` works too, inside a
@@ -35,7 +34,8 @@ packages.
 | Run | `reckoning` | Start a Terminal conversation. |
 | Run | `reckoning web` | Run the local Web interface. |
 | Run | `reckoning gateway` | Run every configured channel (Telegram today). |
-| Setup | `reckoning setup` | Guided setup, plus status and editing on a configured installation. |
+| Run | `reckoning evaluate` | Run versioned conversation-quality scenarios. |
+| Setup | `reckoning setup` | Guided setup and the installation status hub. |
 | Setup | `reckoning doctor` | Report installation health and how to fix problems. |
 | Setup | `reckoning reset` | Remove installation state after an explicit preview. |
 | Data | `reckoning backup` | Create an encrypted recovery archive. |
@@ -51,6 +51,7 @@ packages.
 - **Check whether the installation is healthy** → `reckoning doctor`
 - **Check a provider key live, right now** → `reckoning doctor --ping`
 - **Talk over Telegram** → `reckoning gateway`
+- **Run repeatable conversation-quality checks** → [`reckoning evaluate`](docs/evaluations/conversation-quality.md)
 - **Remove an installation** → `reckoning reset`
 - **Protect the instance before maintenance** → `reckoning backup`
 - **Recover onto a clean machine** → `reckoning restore`

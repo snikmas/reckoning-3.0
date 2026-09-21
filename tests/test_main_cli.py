@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -12,6 +13,19 @@ import pytest
 
 import reckoning.command as command_module
 from reckoning.command import main
+
+
+README_COMMAND_ROW = re.compile(
+    r"^\| (?P<group>[^|]+?) \| `(?P<command>reckoning(?: [^`]+)?)` "
+    r"\| (?P<description>[^|]+?) \|$"
+)
+HELP_PANEL_TITLE = re.compile(
+    r"^\u256d\u2500+\s+(?P<group>[^\u2500]+?)\s+\u2500+\u256e$"
+)
+HELP_COMMAND_ROW = re.compile(
+    r"^\u2502\s{2}(?P<command>reckoning(?: [a-z][a-z-]*)?)\s{2,}"
+    r"(?P<description>\S.*?)\s+\u2502$"
+)
 
 
 def run_reckoning(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -39,6 +53,27 @@ def run_dispatcher(*arguments: str) -> tuple[int, str, str]:
     return returncode, stdout.getvalue(), stderr.getvalue()
 
 
+def readme_command_rows() -> list[tuple[str, str, str]]:
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    return [
+        (match["group"], match["command"], match["description"])
+        for line in readme.splitlines()
+        if (match := README_COMMAND_ROW.fullmatch(line))
+    ]
+
+
+def help_command_rows(output: str) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    group: str | None = None
+    for line in output.splitlines():
+        if match := HELP_PANEL_TITLE.fullmatch(line):
+            group = match["group"]
+        elif match := HELP_COMMAND_ROW.fullmatch(line):
+            assert group is not None
+            rows.append((group, match["command"], match["description"]))
+    return rows
+
+
 def test_installed_package_exposes_exactly_one_binary() -> None:
     pyproject = tomllib.loads(
         (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
@@ -60,6 +95,35 @@ def test_grouped_help_lists_the_whole_command_tree() -> None:
     data_section = stdout.split("Data")[1]
     for command in ("backup", "restore", "export", "migrate"):
         assert f"reckoning {command}" in data_section
+
+
+def test_readme_command_table_matches_public_help() -> None:
+    returncode, stdout, _ = run_dispatcher("--help")
+    readme_rows = readme_command_rows()
+    help_rows = help_command_rows(stdout)
+
+    assert returncode == 0
+    assert readme_rows
+    assert help_rows
+    assert readme_rows == help_rows
+
+
+def test_readme_quickstart_has_four_commands() -> None:
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    quickstart = readme.split("```bash", 1)[1].split("```", 1)[0]
+    command_lines = [line for line in quickstart.splitlines() if line]
+
+    assert len(command_lines) == 4
+    assert not any("reckoning gateway" in line for line in command_lines)
+
+
+def test_readme_evaluation_guide_link_resolves() -> None:
+    repository_root = Path(__file__).parents[1]
+    readme = (repository_root / "README.md").read_text(encoding="utf-8")
+    guide = Path("docs/evaluations/conversation-quality.md")
+
+    assert f"]({guide.as_posix()})" in readme
+    assert (repository_root / guide).is_file()
 
 
 def test_bare_reckoning_runs_terminal_and_web_is_an_explicit_command(
@@ -119,6 +183,7 @@ def test_every_subcommand_accepts_help() -> None:
         "setup",
         "reset",
         "gateway",
+        "evaluate",
         "doctor",
         "backup",
         "restore",
