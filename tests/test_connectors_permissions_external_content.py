@@ -75,7 +75,10 @@ def test_read_connector_lifecycle_never_implies_write_and_stops_after_revoke() -
     assert service.imported_items(connector.id) == ()
 
 
-def test_stale_connector_instance_cannot_reverse_revocation(tmp_path) -> None:
+@pytest.mark.parametrize("terminal_status", ["revoked", "disconnected"])
+def test_stale_connector_instance_cannot_reverse_terminal_status(
+    tmp_path, terminal_status: str
+) -> None:
     state_path = tmp_path / "connectors.json"
 
     class CountingConnector(FakeReadConnector):
@@ -96,13 +99,16 @@ def test_stale_connector_instance_cannot_reverse_revocation(tmp_path) -> None:
     stale_instance = ConnectorService(path=state_path)
     stale_instance.connect(stale_adapter, read_scope=("events:read",))
 
-    revoking_instance.revoke("calendar", revoked_at=NOW)
+    if terminal_status == "revoked":
+        revoking_instance.revoke("calendar", revoked_at=NOW)
+    else:
+        revoking_instance.disconnect("calendar", disconnected_at=NOW)
 
-    with pytest.raises(PermissionError, match="revoked"):
+    with pytest.raises(PermissionError, match=terminal_status):
         stale_instance.synchronize("calendar", synchronized_at=NOW)
 
     assert stale_adapter.synchronizations == 0
-    assert ConnectorService(path=state_path).health("calendar").status == "revoked"
+    assert ConnectorService(path=state_path).health("calendar").status == terminal_status
 
 
 class IdempotentWriteConnector:
