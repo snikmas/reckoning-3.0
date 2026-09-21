@@ -286,6 +286,20 @@ def test_profile_selecting_no_mandatory_scenarios_is_rejected(
         run_evaluation(path, output, mode="fake", profile="early-web")
 
 
+def test_unknown_profile_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "set.json"
+    _write_scenario_set(
+        path,
+        [_minimal_scenario(steps=[{"action": "message", "text": "hello"}])],
+    )
+    output = tmp_path / "out.jsonl"
+
+    with pytest.raises(ValueError, match="Unknown profile"):
+        run_evaluation(path, output, mode="fake", profile="unknown")
+
+    assert not output.exists()
+
+
 def test_fake_run_matches_test_only_fixture_outcomes(tmp_path: Path) -> None:
     output = tmp_path / "out.jsonl"
     rc = run_evaluation(
