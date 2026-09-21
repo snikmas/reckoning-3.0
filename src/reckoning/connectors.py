@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
 from types import MappingProxyType
-from collections.abc import Callable, Mapping
 from typing import Literal, Protocol
 from uuid import uuid4
 
@@ -126,36 +128,7 @@ class ConnectorService:
         self._content_boundary = content_boundary or ExternalContentBoundary()
         self._content_results: dict[tuple[str, str], ExternalContentResult] = {}
         if path is not None:
-            data = read_json(
-                path,
-                default={
-                    "schema_version": 1,
-                    "connections": [],
-                    "items": [],
-                    "health": [],
-                    "content_results": [],
-                },
-            )
-            if data.get("schema_version") != 1:
-                raise RuntimeError("Unsupported connector storage schema.")
-            self._connections = {
-                str(item["id"]): _connection_from_data(item)
-                for item in data["connections"]
-            }
-            self._items = {
-                (str(item["connector_id"]), str(item["external_id"])):
-                    _imported_item_from_data(item)
-                for item in data["items"]
-            }
-            self._health = {
-                str(item["connector_id"]): _health_from_data(item)
-                for item in data["health"]
-            }
-            self._content_results = {
-                (str(item["connector_id"]), str(item["external_id"])):
-                    _content_result_from_data(item)
-                for item in data.get("content_results", [])
-            }
+            self._reload()
 
     def connect(
         self, adapter: ReadConnector, *, read_scope: tuple[str, ...]
@@ -165,73 +138,78 @@ class ConnectorService:
         identity = adapter.verify_identity().strip()
         if not identity:
             raise RuntimeError("The connector did not verify an identity.")
-        connection = ConnectorConnection(
-            adapter.connector_id,
-            identity,
-            read_scope,
-            adapter.write_scopes,
-        )
-        self._connections[connection.id] = connection
-        self._adapters[connection.id] = adapter
-        self._health[connection.id] = ConnectorHealth(
-            connection.id, "healthy", None, "Identity verified; synchronization pending."
-        )
-        self._flush()
-        return connection
+        with self._storage_transaction():
+            connection = ConnectorConnection(
+                adapter.connector_id,
+                identity,
+                read_scope,
+                adapter.write_scopes,
+            )
+            self._connections[connection.id] = connection
+            self._adapters[connection.id] = adapter
+            self._health[connection.id] = ConnectorHealth(
+                connection.id,
+                "healthy",
+                None,
+                "Identity verified; synchronization pending.",
+            )
+            self._flush()
+            return connection
 
     def synchronize(
         self, connector_id: str, *, synchronized_at: datetime
     ) -> SynchronizationResult:
-        connection = self._connection(connector_id)
-        if connection.status != "connected":
-            raise PermissionError(f"Connector access is {connection.status}.")
-        adapter = self._adapters[connector_id]
-        try:
-            incoming = adapter.synchronize(connection.granted_read_scope)
-        except Exception as error:
+        with self._storage_transaction():
+            connection = self._connection(connector_id)
+            if connection.status != "connected":
+                raise PermissionError(f"Connector access is {connection.status}.")
+            adapter = self._adapters[connector_id]
+            try:
+                incoming = adapter.synchronize(connection.granted_read_scope)
+            except Exception as error:
+                self._health[connector_id] = ConnectorHealth(
+                    connector_id, "failed", synchronized_at, str(error)
+                )
+                self._flush()
+                raise
+            for item in incoming:
+                key = (connector_id, item.external_id)
+                existing = self._items.get(key)
+                if existing is not None and existing.deletion_state != "active":
+                    self._content_results.pop(key, None)
+                    continue
+                self._content_results[key] = self._content_boundary.inspect(
+                    UntrustedContent(item.external_id, item.provenance, item.content),
+                    protected_prompt_layers=(
+                        "protected_product_contract",
+                        "product_identity",
+                    ),
+                    allowed_tools=connection.granted_read_scope,
+                    permissions=tuple(
+                        f"connector:{connector_id}:{scope}"
+                        for scope in connection.granted_read_scope
+                    ),
+                )
+                if existing is None:
+                    self._items[key] = ImportedConnectorItem(
+                        connector_id,
+                        item.external_id,
+                        item.content,
+                        item.provenance,
+                    )
+                elif existing.deletion_state == "active":
+                    self._items[key] = replace(
+                        existing, content=item.content, provenance=item.provenance
+                    )
+            visible = self.imported_items(connector_id)
             self._health[connector_id] = ConnectorHealth(
-                connector_id, "failed", synchronized_at, str(error)
+                connector_id,
+                "healthy",
+                synchronized_at,
+                f"Synchronized {len(incoming)} source item(s).",
             )
             self._flush()
-            raise
-        for item in incoming:
-            key = (connector_id, item.external_id)
-            existing = self._items.get(key)
-            if existing is not None and existing.deletion_state != "active":
-                self._content_results.pop(key, None)
-                continue
-            self._content_results[key] = self._content_boundary.inspect(
-                UntrustedContent(item.external_id, item.provenance, item.content),
-                protected_prompt_layers=(
-                    "protected_product_contract",
-                    "product_identity",
-                ),
-                allowed_tools=connection.granted_read_scope,
-                permissions=tuple(
-                    f"connector:{connector_id}:{scope}"
-                    for scope in connection.granted_read_scope
-                ),
-            )
-            if existing is None:
-                self._items[key] = ImportedConnectorItem(
-                    connector_id,
-                    item.external_id,
-                    item.content,
-                    item.provenance,
-                )
-            elif existing.deletion_state == "active":
-                self._items[key] = replace(
-                    existing, content=item.content, provenance=item.provenance
-                )
-        visible = self.imported_items(connector_id)
-        self._health[connector_id] = ConnectorHealth(
-            connector_id,
-            "healthy",
-            synchronized_at,
-            f"Synchronized {len(incoming)} source item(s).",
-        )
-        self._flush()
-        return SynchronizationResult(connector_id, synchronized_at, visible)
+            return SynchronizationResult(connector_id, synchronized_at, visible)
 
     def imported_items(self, connector_id: str) -> tuple[ImportedConnectorItem, ...]:
         return tuple(
@@ -261,52 +239,109 @@ class ConnectorService:
             ) from error
 
     def revoke(self, connector_id: str, *, revoked_at: datetime) -> ConnectorConnection:
-        connection = replace(self._connection(connector_id), status="revoked")
-        self._connections[connector_id] = connection
-        self._health[connector_id] = ConnectorHealth(
-            connector_id, "revoked", revoked_at, "Future connector access is revoked."
-        )
-        self._flush()
-        return connection
+        with self._storage_transaction():
+            connection = replace(self._connection(connector_id), status="revoked")
+            self._connections[connector_id] = connection
+            self._health[connector_id] = ConnectorHealth(
+                connector_id,
+                "revoked",
+                revoked_at,
+                "Future connector access is revoked.",
+            )
+            self._flush()
+            return connection
 
     def disconnect(
         self, connector_id: str, *, disconnected_at: datetime
     ) -> ConnectorConnection:
-        connection = replace(self._connection(connector_id), status="disconnected")
-        self._connections[connector_id] = connection
-        self._health[connector_id] = ConnectorHealth(
-            connector_id,
-            "disconnected",
-            disconnected_at,
-            "The connector is disconnected and cannot be accessed.",
-        )
-        self._flush()
-        return connection
+        with self._storage_transaction():
+            connection = replace(self._connection(connector_id), status="disconnected")
+            self._connections[connector_id] = connection
+            self._health[connector_id] = ConnectorHealth(
+                connector_id,
+                "disconnected",
+                disconnected_at,
+                "The connector is disconnected and cannot be accessed.",
+            )
+            self._flush()
+            return connection
 
     def remove_imported_data(
         self, connector_id: str, *, mode: Literal["suppress", "delete"]
     ) -> tuple[ImportedConnectorItem, ...]:
-        self._connection(connector_id)
-        changed: list[ImportedConnectorItem] = []
-        for key, item in tuple(self._items.items()):
-            if key[0] != connector_id:
-                continue
-            updated = replace(
-                item,
-                content="" if mode == "delete" else item.content,
-                deletion_state="suppressed" if mode == "suppress" else "deleted",
-            )
-            self._items[key] = updated
-            self._content_results.pop(key, None)
-            changed.append(updated)
-        self._flush()
-        return tuple(changed)
+        with self._storage_transaction():
+            self._connection(connector_id)
+            changed: list[ImportedConnectorItem] = []
+            for key, item in tuple(self._items.items()):
+                if key[0] != connector_id:
+                    continue
+                updated = replace(
+                    item,
+                    content="" if mode == "delete" else item.content,
+                    deletion_state=(
+                        "suppressed" if mode == "suppress" else "deleted"
+                    ),
+                )
+                self._items[key] = updated
+                self._content_results.pop(key, None)
+                changed.append(updated)
+            self._flush()
+            return tuple(changed)
 
     def _connection(self, connector_id: str) -> ConnectorConnection:
         try:
             return self._connections[connector_id]
         except KeyError as error:
             raise KeyError(f"Unknown connector: {connector_id}") from error
+
+    @contextmanager
+    def _storage_transaction(self) -> Iterator[None]:
+        if self._path is None:
+            yield
+            return
+        lock_path = self._path.with_name(f"{self._path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                self._reload()
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _reload(self) -> None:
+        assert self._path is not None
+        data = read_json(
+            self._path,
+            default={
+                "schema_version": 1,
+                "connections": [],
+                "items": [],
+                "health": [],
+                "content_results": [],
+            },
+        )
+        if data.get("schema_version") != 1:
+            raise RuntimeError("Unsupported connector storage schema.")
+        self._connections = {
+            str(item["id"]): _connection_from_data(item)
+            for item in data["connections"]
+        }
+        self._items = {
+            (str(item["connector_id"]), str(item["external_id"])):
+                _imported_item_from_data(item)
+            for item in data["items"]
+        }
+        self._health = {
+            str(item["connector_id"]): _health_from_data(item)
+            for item in data["health"]
+        }
+        self._content_results = {
+            (str(item["connector_id"]), str(item["external_id"])):
+                _content_result_from_data(item)
+            for item in data.get("content_results", [])
+        }
 
     def _flush(self) -> None:
         if self._path is None:
