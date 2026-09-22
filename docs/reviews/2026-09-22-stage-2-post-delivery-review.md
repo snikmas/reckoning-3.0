@@ -44,8 +44,8 @@ and is repaired in this delivery.
 | Issue | Current delivery and ancestry | Standards | Spec verdict | Limits |
 | --- | --- | --- | --- | --- |
 | #124 | `f93aa22` plus repair `5333505`, both on `origin/main`; later consent and replay repairs are on `main` | Pass | Pass after #134/#135 and this rendered mobile repair | Real-language usefulness remains unrun |
-| #134 | `0b03c94` plus `35701fe`, merged by `d4925da`, are on `origin/main` | Pass | Pass | Body still says not implemented and has no closure evidence |
-| #135 | `0b03c94` plus `35701fe`, merged by `d4925da`, are on `origin/main` | Pass | Pass | Body still says not implemented and has no closure evidence |
+| #134 | `0b03c94` plus `35701fe`, merged by `d4925da`, are on `origin/main` | Pass | Pass | Body is stale; current evidence is in the review comment |
+| #135 | `0b03c94` plus `35701fe`, merged by `d4925da`, are on `origin/main` | Pass | Pass | Body is stale; current evidence is in the review comment |
 | #145 | `4bc7320` repaired by `1d9ea34`, both on `origin/main` | Pass | Pass | Telegram continuation remains owned by open #132 |
 | #146 | `4bc7320` repaired by `1d9ea34`, plus this rendered mobile repair | Pass | Pass | Unknown tokenizer uses the documented conservative estimate; live context quality is unrun |
 | #147 | `4bc7320` repaired by `1d9ea34`, both on `origin/main` | Pass | Pass within the documented language boundary | Comprehensive Russian, Chinese, and mixed-language danger detection remains explicitly unsupported; live language review is unrun |
@@ -98,8 +98,9 @@ What remains partial:
   but #137 lacks the acceptance-level JSONL assertions required to prove that
   every failed attempt and reserved spend remains inspectable after a
   mid-suite failure.
-- #137 has no final GitHub closure comment, and its body still says not
-  implemented.
+- #137 was closed without final acceptance evidence, and its body still says
+  not implemented. This review reopened it, applied the `partial` label, and
+  added a current evidence comment.
 
 The missing receipt and quote contract needs a product decision. Either retain
 the current versioned token-estimate model and revise the TODO wording, or add

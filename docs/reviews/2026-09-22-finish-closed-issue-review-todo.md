@@ -24,7 +24,9 @@ token-derived cost estimates and pre-call reservation, but it does not have the
 per-attempt quote, actual provider-reported cost, and violation receipt required
 by this TODO. Its issue body also permits acknowledged unknown-cost runs while
 this TODO requires a positive cost ceiling. The Stage 2 review records both
-alternatives without choosing a new product contract.
+alternatives without choosing a new product contract. Issue #137 was reopened
+and labeled `partial`; the final GitHub baseline is therefore 124 closed issues
+and 22 open issues, and the final matrix has 124 rows.
 
 This TODO finishes the retrospective review that started with 121 closed issues.
 The live repository now has 125 closed issues and 21 open issues. Local and

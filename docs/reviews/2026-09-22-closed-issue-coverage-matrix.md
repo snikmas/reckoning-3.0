@@ -2,10 +2,11 @@
 
 Review date: 2026-09-22
 
-Baseline at review start: local `main` = live `origin/main` = `4487ae3`.
-GitHub export: 125 closed issues and 21 open issues. The issue body is the
-source specification. Closure comments are evidence, not substitutes for the
-current code and tests.
+Frozen baseline at review start: local `main` = live `origin/main` = `4487ae3`,
+with 125 closed issues and 21 open issues. The final baseline has 124 closed
+issues and 22 open issues because the review reopened #137 as partial. The
+issue body is the source specification. Closure comments are evidence, not
+substitutes for the current code and tests.
 
 ## Evidence keys
 
@@ -93,7 +94,7 @@ Off-main prototype and historical evidence commits are named explicitly.
 | [#61](https://github.com/snikmas/reckoning-3.0/issues/61) 29: Install a public single-user Reckoning instance | evidence record; #61 | body; 4 closure/evidence comments | `9a36e7e`, `95a6ce3`; ancestor: yes | C2 + G | N/A or routed | Historical evidence only |
 | [#62](https://github.com/snikmas/reckoning-3.0/issues/62) 30: Select or author a persona within the protected contract | evidence record; #62 | body; 3 closure/evidence comments | `9a36e7e`, `95a6ce3`; ancestor: yes | C2 + G | N/A or routed | Historical evidence only |
 | [#63](https://github.com/snikmas/reckoning-3.0/issues/63) 31: Bootstrap Simon with a private user profile | implementation; #63 | body; 1 closure/evidence comment | cited `bef9040`; patch-equivalent `340f2de`; ancestor: yes | P: 36 passed + G | Pass | Pass |
-| [#64](https://github.com/snikmas/reckoning-3.0/issues/64) Add terminal setup and local Telegram polling | implementation; #64 | body; no final closure comment | patch-equivalent `667daea`; ancestor: yes | S: 346 passed, 8 skipped + G | Pass | Pass through current setup/gateway replacement; live Telegram unrun |
+| [#64](https://github.com/snikmas/reckoning-3.0/issues/64) Add terminal setup and local Telegram polling | implementation; #64 | body; current review evidence comment | patch-equivalent `667daea`; ancestor: yes | S: 346 passed, 8 skipped + G | Pass | Pass through current setup/gateway replacement; live Telegram unrun |
 | [#65](https://github.com/snikmas/reckoning-3.0/issues/65) Enter a model-provider API key during terminal setup | implementation; #68-#71 | body; 1 closure/evidence comment | patch-equivalent `b5e9890`; ancestor: yes | S: 346 passed, 8 skipped + G | Pass | Pass under current inactive-until-verified contract |
 | [#66](https://github.com/snikmas/reckoning-3.0/issues/66) Rework reckoning setup into a multi-provider interactive wizard | roll-up; #67-#71 | body; 1 closure/evidence comment | `336a391`, `dfed1e0`, `28c0faa`, `f4c9a4c`, `ca3c880`, `55033b1`; ancestor: yes | S: 346 passed, 8 skipped + G | Pass | Completed through children, then partly superseded |
 | [#67](https://github.com/snikmas/reckoning-3.0/issues/67) Connector section loop skeleton in setup, Telegram only selectable | superseded; #80 | body; 2 closure/evidence comments | `336a391`; ancestor: yes | S: 346 passed, 8 skipped + G | Pass | Historically delivered; current behavior governed by #80 |
@@ -144,11 +145,10 @@ Off-main prototype and historical evidence commits are named explicitly.
 | [#123](https://github.com/snikmas/reckoning-3.0/issues/123) S2-01: Prototype the ordinary web continuity journey | prototype; #123 | body; 5 closure/evidence comments | off-main prototype `450edfd`; no current-main implementation | prototype browser evidence; no current product gate | N/A or routed | Accepted only as prototype evidence |
 | [#124](https://github.com/snikmas/reckoning-3.0/issues/124) S2-02: Propose, correct, confirm, and reopen a web decision | implementation; #124 | body; 3 closure/evidence comments | `f93aa22`, repair `5333505`; #134/#135 repairs; ancestor: yes | T: 132 passed + Chromium + G | Pass | Pass |
 | [#127](https://github.com/snikmas/reckoning-3.0/issues/127) S2-05: Define and run versioned conversation quality evaluation | evidence record; #136/#137 | body; 3 closure/evidence comments | off-main `90b7a74`; replacements #136/#137 | E: 69 passed + fresh fake profiles + G | N/A or routed | Historical off-main attempt; current evaluator judged in #136/#137 |
-| [#134](https://github.com/snikmas/reckoning-3.0/issues/134) S2-R1: Require explicit consent bound to the displayed proposal | repair; #134 | body; no final closure comment | `0b03c94`, `35701fe`, merge `d4925da`; ancestor: yes | T: 132 passed + Chromium + G | Pass | Pass in code; GitHub closure evidence missing |
-| [#135](https://github.com/snikmas/reckoning-3.0/issues/135) S2-R2: Preserve conversational mutation identity across retry and restart | repair; #135 | body; no final closure comment | `0b03c94`, `35701fe`, merge `d4925da`; ancestor: yes | T: 132 passed + Chromium + G | Pass | Pass in code; GitHub closure evidence missing |
+| [#134](https://github.com/snikmas/reckoning-3.0/issues/134) S2-R1: Require explicit consent bound to the displayed proposal | repair; #134 | body; current review evidence comment | `0b03c94`, `35701fe`, merge `d4925da`; ancestor: yes | T: 132 passed + Chromium + G | Pass | Pass |
+| [#135](https://github.com/snikmas/reckoning-3.0/issues/135) S2-R2: Preserve conversational mutation identity across retry and restart | repair; #135 | body; current review evidence comment | `0b03c94`, `35701fe`, merge `d4925da`; ancestor: yes | T: 132 passed + Chromium + G | Pass | Pass |
 | [#136](https://github.com/snikmas/reckoning-3.0/issues/136) S2-E1: Integrate evaluation against the actual Stage 2 web journey | repair; #136 | body; 2 closure/evidence comments | `aab82a0`, `4bf73bb`; ancestor: yes | E: 69 passed + fresh fake profiles + G | Pass | Pass deterministic; human and live quality unrun |
-| [#137](https://github.com/snikmas/reckoning-3.0/issues/137) S2-E2: Implement bounded live evaluation with truthful results and spending | implementation; #137 | body; no final closure comment | `0b03c94`, merge `899742f`; ancestor: yes | E: 69 passed + fresh fake profiles + G | Pass | Partial; no per-attempt reported-cost/quote receipt and no final closure evidence |
-| [#138](https://github.com/snikmas/reckoning-3.0/issues/138) Create the processing grant automatically at provider activation | implementation; #138 | body; no final closure comment | `cc5ee00`, equivalent `f16c33f`; ancestor: yes | S: 346 passed, 8 skipped + G | Pass | Pass in code; GitHub closure evidence missing |
+| [#138](https://github.com/snikmas/reckoning-3.0/issues/138) Create the processing grant automatically at provider activation | implementation; #138 | body; current review evidence comment | `cc5ee00`, equivalent `f16c33f`; ancestor: yes | S: 346 passed, 8 skipped + G | Pass | Pass |
 | [#145](https://github.com/snikmas/reckoning-3.0/issues/145) S2-C2: Make conversation sessions visible and controllable | implementation; #145 | body; 2 closure/evidence comments | `4bc7320`, repair `1d9ea34`; ancestor: yes | T: 132 passed + Chromium + G | Pass | Pass |
 | [#146](https://github.com/snikmas/reckoning-3.0/issues/146) S2-C3: Bound model history and render replies for each channel | implementation; #146 | body; 2 closure/evidence comments | `4bc7320`, repair `1d9ea34`; current mobile repair; ancestor: yes | T: 132 passed + Chromium + G | Pass | Pass |
 | [#147](https://github.com/snikmas/reckoning-3.0/issues/147) S2-S1: Replace phrase-matching failures at protected conversation boundaries | implementation; #147 | body; 2 closure/evidence comments | `4bc7320`, repair `1d9ea34`; ancestor: yes | T: 132 passed + Chromium + G | Pass | Pass |
@@ -159,19 +159,28 @@ Off-main prototype and historical evidence commits are named explicitly.
 
 ## Reconciliation
 
-- Matrix rows: **125**. Live closed-issue count: **125**.
+- Matrix rows: **124**. Live closed-issue count: **124**.
 - Every closed issue number appears once. No open issue appears as accepted
   delivery.
 - Duplicate rows route to a canonical row. They are not collapsed into it.
 - Off-main #123 and #127 commits are named as prototype or historical evidence,
   not current delivery.
-- Every partial verdict has a disposition. The unresolved current issue is
-  #137's per-attempt spending receipt and quote contract.
+- Every partial verdict has a disposition. #137 was removed from the closed
+  matrix, reopened, and labeled `partial` because its per-attempt spending
+  receipt and quote contract remains unresolved.
 - Live providers, paid evaluation, live Telegram, macOS, WSL, private persona
   evaluation, and dated human language judgments remain explicitly unrun unless
   an older issue carries separate historical evidence.
 - #152, #153, #154, and #155 are the repair or decision records for the four
   Phase 2 findings.
+
+## Open issue moved out of the retrospective set
+
+[#137](https://github.com/snikmas/reckoning-3.0/issues/137) was part of the
+125-issue frozen export. The review found that current `main` lacks the required
+per-attempt provider-reported-cost receipt and quote-overrun evidence. The issue
+is now open with the `partial` label and a current evidence comment. Its full
+verdict remains in `2026-09-22-stage-2-post-delivery-review.md`.
 
 ## Final verification
 
