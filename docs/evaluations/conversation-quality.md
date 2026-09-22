@@ -57,6 +57,25 @@ provider route, result, and limitations. It also records:
 - observed output and application-state evidence;
 - rubric results, latency, and cost status.
 
+Live records also contain `attempt_receipts`. The evaluator writes one receipt
+for every outbound attempt, including retries and failed transports. Each
+receipt contains the call number, the reserved estimate, the completion status,
+the reported token usage, and the cost source. A transport failure keeps its
+reservation in the receipt because an unknown charge is not a refund.
+
+When an OpenAI-compatible response includes both `usage.cost` and
+`usage.cost_currency`, the evaluator records the amount as
+`actual_cost_amount`. The amount must be finite and non-negative. The currency
+must match the authorized price basis. Other responses keep the measured cost
+unavailable and record a versioned token estimate when the response reports
+usage. `provider_reported_cost_amount` and `estimated_cost_amount` remain
+separate in the scenario record.
+
+If the reported charge exceeds the reserved estimate, the receipt sets
+`quote_overrun` to `true`. The scenario fails its spending gate, and the shared
+run budget blocks the next outbound attempt. The JSONL evidence keeps the
+completed response and the spending violation together.
+
 The console summary separates product counts from detector counts. Product
 counts describe the application behavior under test. Detector counts describe
 deliberately bad fixtures that check whether an evaluator rule catches known
@@ -95,6 +114,9 @@ Runtime scoring reads the observed output, application-state evidence, and the
 named rule. Expected fake outcomes live only in evaluator tests; they are not
 part of the runtime `Scenario` type.
 
+The attempt receipts extend the JSONL evidence contract. They do not change the
+scenario schema version.
+
 ## Authorize a live run separately
 
 Live evaluation can send scenario content to a provider and may cost money. Do
@@ -107,3 +129,26 @@ either an enforceable `--max-cost` limit or
 `--acknowledge-unknown-cost`. Review `reckoning evaluate --help` for the exact
 flags. If authorization or budget data is incomplete, the evaluator records
 the live scenarios as `unrun` and does not silently use fake mode.
+
+After the product owner authorizes the provider, fixture processing, and budget,
+use an invocation with explicit limits. This example permits at most 30 calls
+and USD 0.15 against price basis `2026-09-20`:
+
+```bash
+EVALUATION_OUTPUT="$(mktemp /tmp/reckoning-stage2-live.XXXXXX.jsonl)"
+PYTHONPATH=src .venv/bin/python -m reckoning evaluate \
+  --scenario-set scenarios/stage2-conversation-v1.json \
+  --mode live \
+  --profile early-web \
+  --provider deepseek \
+  --model deepseek-flash \
+  --max-calls 30 \
+  --max-cost 0.15 \
+  --allow-processing \
+  --output "$EVALUATION_OUTPUT"
+```
+
+Do not run the example until the product owner confirms that the provider price
+basis is current and approves the USD 0.15 ceiling. A call-limited run without
+reliable pricing must use `--acknowledge-unknown-cost`. Such a run does not
+enforce a monetary ceiling.

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
@@ -20,10 +21,11 @@ from reckoning.evaluation_web_driver import (
 from reckoning.provider_adapters import urlopen_transport
 
 ExecutionKind = Literal["fake", "live"]
-ResultStatus = Literal[
-    "passed", "partial", "failed", "missing-implementation", "unrun"
-]
+ResultStatus = Literal["passed", "partial", "failed", "missing-implementation", "unrun"]
 CostStatus = Literal["measured", "estimated", "not-billable", "unavailable"]
+AttemptCompletionStatus = Literal[
+    "started", "response-received", "transport-failed", "invalid-provider-cost"
+]
 EvaluatorRule = Literal[
     "authority-v1",
     "authority-correction-preserved-v1",
@@ -191,6 +193,25 @@ class PriceBasis:
     supports_pricing: bool
 
 
+@dataclass(frozen=True)
+class AttemptReceipt:
+    call_number: int
+    reserved_cost_amount: float
+    reserved_cost_currency: str | None
+    price_basis_version: str | None
+    completion_status: AttemptCompletionStatus
+    latency_ms: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    cost_status: CostStatus = "unavailable"
+    estimated_cost_amount: float | None = None
+    actual_cost_amount: float | None = None
+    actual_cost_currency: str | None = None
+    quote_overrun: bool = False
+    failure_kind: str | None = None
+
+
 # Versioned price basis for live cost estimation. Costs derived from this
 # table are estimates labeled with the basis version, not measured charges.
 # Live runs must be authorized against the provider's current pricing.
@@ -240,11 +261,10 @@ class LiveBudget:
         self._reserved_input = max(0, reserved_input_tokens)
         self._reserved_output = max(0, reserved_output_tokens)
         self.calls_used = 0
-        self.input_tokens = 0
-        self.output_tokens = 0
         self.total_cost = 0.0
         self.exhausted = False
-        self._outstanding: list[float] = []
+        self._receipts: list[AttemptReceipt] = []
+        self._outstanding: dict[int, float] = {}
         self.price_basis = PRICE_BASIS.get(self._provider)
         if max_cost is not None and (
             self.price_basis is None or not self.price_basis.supports_pricing
@@ -265,9 +285,13 @@ class LiveBudget:
     @property
     def outstanding_cost(self) -> float:
         """Reserved cost for attempts that have not been reconciled yet."""
-        return sum(self._outstanding)
+        return sum(self._outstanding.values())
 
-    def check_call(self) -> None:
+    @property
+    def attempt_receipts(self) -> tuple[AttemptReceipt, ...]:
+        return tuple(self._receipts)
+
+    def check_call(self) -> int:
         if self.exhausted:
             raise BudgetExhausted("Budget already exhausted.")
         if self._max_calls is not None and self.calls_used >= self._max_calls:
@@ -284,35 +308,157 @@ class LiveBudget:
                     "Cost budget cannot cover the reserved cost of the next request."
                 )
         self.calls_used += 1
-        self._outstanding.append(reserved)
+        call_number = self.calls_used
+        self._outstanding[call_number] = reserved
+        self._receipts.append(
+            AttemptReceipt(
+                call_number=call_number,
+                reserved_cost_amount=reserved,
+                reserved_cost_currency=(
+                    self.price_basis.currency if self.price_basis is not None else None
+                ),
+                price_basis_version=(
+                    self.price_basis.version if self.price_basis is not None else None
+                ),
+                completion_status="started",
+            )
+        )
         if self._max_calls is not None and self.calls_used >= self._max_calls:
             self.exhausted = True
+        return call_number
 
-    def record_usage(self, input_tokens: int, output_tokens: int) -> None:
-        """Reconcile every outstanding reservation with measured usage."""
-        self._outstanding.clear()
-        self.input_tokens += max(0, input_tokens)
-        self.output_tokens += max(0, output_tokens)
-        if self.price_basis is not None and self.price_basis.supports_pricing:
-            self.total_cost += (
-                input_tokens * self.price_basis.input_price_per_1m
-                + output_tokens * self.price_basis.output_price_per_1m
-            ) / 1_000_000
-        if self._max_cost is not None and self.total_cost >= self._max_cost:
-            self.exhausted = True
-
-    def record_unknown_usage(self) -> None:
-        """Consume outstanding reservations when an attempt's usage is unknown.
-
-        A timeout, transport error, or malformed response still consumed its
-        call and reserved budget, so the reservation becomes spent rather than
-        being refunded for another attempt.
-        """
-        spent = self.outstanding_cost
-        self._outstanding.clear()
+    def record_response(
+        self,
+        call_number: int,
+        raw: bytes,
+        *,
+        latency_ms: int,
+    ) -> None:
+        reserved = self._outstanding[call_number]
+        try:
+            input_tokens, output_tokens, total_tokens, actual_cost, actual_currency = (
+                _provider_reported_metrics(self._provider, raw)
+            )
+        except ValueError:
+            self._outstanding.pop(call_number)
+            self._finish_invalid_cost(
+                call_number,
+                reserved,
+                latency_ms=latency_ms,
+                reason="invalid-amount",
+            )
+            raise
+        self._outstanding.pop(call_number)
+        estimate = self._estimate_cost(input_tokens, output_tokens, total_tokens)
+        cost_status: CostStatus = "unavailable"
+        spent = reserved
+        quote_overrun = False
+        if actual_cost is not None:
+            if actual_currency is None:
+                self._finish_invalid_cost(
+                    call_number,
+                    reserved,
+                    latency_ms=latency_ms,
+                    reason="missing-currency",
+                )
+                raise ValueError("Provider reported a cost without a currency.")
+            if (
+                self.price_basis is not None
+                and actual_currency != self.price_basis.currency
+            ):
+                self._finish_invalid_cost(
+                    call_number,
+                    reserved,
+                    latency_ms=latency_ms,
+                    reason="currency-mismatch",
+                )
+                raise ValueError(
+                    "Provider-reported cost currency does not match the budget."
+                )
+            cost_status = "measured"
+            spent = actual_cost
+            quote_overrun = (
+                self.price_basis is not None
+                and self.price_basis.supports_pricing
+                and actual_cost > reserved
+            )
+        elif estimate is not None:
+            cost_status = "estimated"
+            spent = estimate
+            quote_overrun = estimate > reserved
         self.total_cost += spent
+        if quote_overrun or (
+            self._max_cost is not None and self.total_cost > self._max_cost
+        ):
+            self.exhausted = True
+        self._replace_receipt(
+            call_number,
+            completion_status="response-received",
+            latency_ms=latency_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            cost_status=cost_status,
+            estimated_cost_amount=estimate,
+            actual_cost_amount=actual_cost,
+            actual_cost_currency=actual_currency,
+            quote_overrun=quote_overrun,
+        )
+
+    def record_transport_failure(
+        self,
+        call_number: int,
+        *,
+        latency_ms: int,
+        failure_kind: str,
+    ) -> None:
+        reserved = self._outstanding.pop(call_number)
+        self.total_cost += reserved
         if self._max_cost is not None and self.total_cost >= self._max_cost:
             self.exhausted = True
+        self._replace_receipt(
+            call_number,
+            completion_status="transport-failed",
+            latency_ms=latency_ms,
+            failure_kind=failure_kind,
+        )
+
+    def _estimate_cost(
+        self,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        total_tokens: int | None,
+    ) -> float | None:
+        if self.price_basis is None or not self.price_basis.supports_pricing:
+            return None
+        if input_tokens is None or output_tokens is None or total_tokens is None:
+            return None
+        return (
+            input_tokens * self.price_basis.input_price_per_1m
+            + output_tokens * self.price_basis.output_price_per_1m
+        ) / 1_000_000
+
+    def _finish_invalid_cost(
+        self,
+        call_number: int,
+        reserved: float,
+        *,
+        latency_ms: int,
+        reason: str,
+    ) -> None:
+        self.total_cost += reserved
+        self.exhausted = True
+        self._replace_receipt(
+            call_number,
+            completion_status="invalid-provider-cost",
+            latency_ms=latency_ms,
+            failure_kind=reason,
+        )
+
+    def _replace_receipt(self, call_number: int, **changes: Any) -> None:
+        index = call_number - 1
+        current = self._receipts[index]
+        self._receipts[index] = replace(current, **changes)
 
 
 class BudgetTransport:
@@ -327,8 +473,90 @@ class BudgetTransport:
         self._base = base_transport or urlopen_transport
 
     def __call__(self, request: Request, timeout: float) -> bytes:
-        self._budget.check_call()
-        return self._base(request, timeout)
+        call_number = self._budget.check_call()
+        started = time.perf_counter()
+        try:
+            raw = self._base(request, timeout)
+        except Exception as error:
+            self._budget.record_transport_failure(
+                call_number,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                failure_kind=type(error).__name__,
+            )
+            raise
+        self._budget.record_response(
+            call_number,
+            raw,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return raw
+
+
+def _provider_reported_metrics(
+    provider: str, raw: bytes
+) -> tuple[int | None, int | None, int | None, float | None, str | None]:
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, None, None, None, None
+    if not isinstance(parsed, dict):
+        return None, None, None, None, None
+    provider_id = provider.strip().casefold()
+    if provider_id == "google-gemini":
+        usage = parsed.get("usageMetadata")
+        input_key, output_key, total_key = (
+            "promptTokenCount",
+            "candidatesTokenCount",
+            "totalTokenCount",
+        )
+    elif provider_id == "anthropic":
+        usage = parsed.get("usage")
+        input_key, output_key, total_key = "input_tokens", "output_tokens", None
+    else:
+        usage = parsed.get("usage")
+        input_key, output_key, total_key = (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+        )
+    if not isinstance(usage, dict):
+        return None, None, None, None, None
+    input_tokens = _non_negative_int(usage.get(input_key))
+    output_tokens = _non_negative_int(usage.get(output_key))
+    total_tokens = (
+        _non_negative_int(usage.get(total_key)) if total_key is not None else None
+    )
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    actual_cost = _reported_cost(usage.get("cost"))
+    raw_currency = usage.get("cost_currency")
+    actual_currency = (
+        raw_currency.strip().upper()
+        if isinstance(raw_currency, str) and raw_currency.strip()
+        else None
+    )
+    if actual_currency is not None and (
+        len(actual_currency) != 3 or not actual_currency.isalpha()
+    ):
+        raise ValueError("Provider reported an invalid cost currency.")
+    return input_tokens, output_tokens, total_tokens, actual_cost, actual_currency
+
+
+def _non_negative_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _reported_cost(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Provider reported a non-numeric cost.")
+    amount = float(value)
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError("Provider reported an invalid cost.")
+    return amount
 
 
 def load_scenario_set(path: str | Path) -> ScenarioSet:
@@ -348,7 +576,9 @@ def load_scenario_set(path: str | Path) -> ScenarioSet:
 
     scenario_set_id = data.get("scenario_set_id")
     if not isinstance(scenario_set_id, str) or not scenario_set_id.strip():
-        raise ScenarioSetError("scenario_set_id is required and must be a non-empty string.")
+        raise ScenarioSetError(
+            "scenario_set_id is required and must be a non-empty string."
+        )
 
     raw_scenarios = data.get("scenarios")
     if not isinstance(raw_scenarios, list) or not raw_scenarios:
@@ -388,8 +618,7 @@ def _validate_scenario(raw: object, index: int) -> Scenario:
     if not isinstance(steps, list) or not steps:
         raise ScenarioSetError(f"{prefix}.steps must be a non-empty list.")
     parsed_steps = tuple(
-        _parse_step(step, prefix, step_index)
-        for step_index, step in enumerate(steps)
+        _parse_step(step, prefix, step_index) for step_index, step in enumerate(steps)
     )
 
     rubric = raw.get("rubric")
@@ -402,7 +631,9 @@ def _validate_scenario(raw: object, index: int) -> Scenario:
     )
     scripted_reckoning = raw.get("scripted_reckoning")
     if scripted_reckoning is not None and not isinstance(scripted_reckoning, dict):
-        raise ScenarioSetError(f"{prefix}.scripted_reckoning must be an object or omitted.")
+        raise ScenarioSetError(
+            f"{prefix}.scripted_reckoning must be an object or omitted."
+        )
 
     raw_tags = raw.get("tags", [])
     if not isinstance(raw_tags, list) or not all(isinstance(t, str) for t in raw_tags):
@@ -469,7 +700,9 @@ def _validate_rubric(raw: dict[object, object], prefix: str) -> dict[str, Rubric
 def _require_string(raw: dict[str, Any], key: str, prefix: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not value.strip():
-        raise ScenarioSetError(f"{prefix}.{key} is required and must be a non-empty string.")
+        raise ScenarioSetError(
+            f"{prefix}.{key} is required and must be a non-empty string."
+        )
     return value
 
 
@@ -477,9 +710,7 @@ def _parse_step(raw: object, prefix: str, index: int) -> ScenarioStep:
     """Parse one raw step object into the typed step union."""
     step_prefix = f"{prefix}.steps[{index}]"
     if not isinstance(raw, dict) or "action" not in raw:
-        raise ScenarioSetError(
-            f"{step_prefix} must be an object with an action field."
-        )
+        raise ScenarioSetError(f"{step_prefix} must be an object with an action field.")
     action = raw["action"]
     if action == "message":
         return MessageStep(_require_string(raw, "text", step_prefix))
@@ -583,12 +814,10 @@ def _evaluate_authority(
     proposed_count = evidence.get("proposed_reckoning_count", 0)
     last_status = evidence.get("last_reckoning_status")
     last_meanings = [
-        str(m).lower()
-        for m in evidence.get("last_reckoning_meanings", [])
+        str(m).lower() for m in evidence.get("last_reckoning_meanings", [])
     ]
     superseded_meanings = [
-        str(m).lower()
-        for m in evidence.get("superseded_reckoning_meanings", [])
+        str(m).lower() for m in evidence.get("superseded_reckoning_meanings", [])
     ]
 
     if rule == "authority-no-false-save-v1":
@@ -716,8 +945,44 @@ def _live_cost_summary(
     input_tokens: int,
     output_tokens: int,
     total_tokens: int,
+    receipts: tuple[AttemptReceipt, ...] = (),
 ) -> tuple[CostStatus, float, str | None, str | None]:
     basis = PRICE_BASIS.get(provider.strip().casefold())
+    if receipts and any(receipt.cost_status == "unavailable" for receipt in receipts):
+        return (
+            "unavailable",
+            0.0,
+            basis.currency if basis is not None else None,
+            basis.version if basis is not None else None,
+        )
+    completed = [
+        receipt
+        for receipt in receipts
+        if receipt.completion_status == "response-received"
+    ]
+    if completed and all(receipt.cost_status == "measured" for receipt in completed):
+        currencies = {receipt.actual_cost_currency for receipt in completed}
+        if len(currencies) == 1:
+            return (
+                "measured",
+                sum(receipt.actual_cost_amount or 0.0 for receipt in completed),
+                currencies.pop(),
+                None,
+            )
+    if completed:
+        currency = basis.currency if basis is not None else None
+        version = basis.version if basis is not None else None
+        return (
+            "estimated",
+            sum(
+                (receipt.actual_cost_amount or 0.0)
+                if receipt.cost_status == "measured"
+                else receipt.estimated_cost_amount or 0.0
+                for receipt in completed
+            ),
+            currency,
+            version,
+        )
     if basis is None or not basis.supports_pricing:
         return "unavailable", 0.0, None, None
     cost = (
@@ -757,6 +1022,7 @@ def evaluate_scenario(
     output_tokens = 0
     total_tokens = 0
     limitations = [f"profile={profile}"]
+    receipt_start = len(budget.attempt_receipts) if budget is not None else 0
 
     if execution_kind == "live" and not live_config.authorized:
         return _unrun_record(
@@ -854,11 +1120,9 @@ def evaluate_scenario(
             evidence = {}
             missing = True
             cost_status = "unavailable"
-            budget.record_unknown_usage()
         except (ValueError, RuntimeError) as error:
             # Configuration or credential problems surface as unrun records so
             # the run preserves evidence without silently falling back to fake.
-            budget.record_unknown_usage()
             return _unrun_record(
                 run_id=run_id,
                 scenario_set=scenario_set,
@@ -874,6 +1138,7 @@ def evaluate_scenario(
                 profile=profile,
                 reason=f"Live scenario could not start: {error}",
                 limitations=limitations,
+                attempt_receipts=budget.attempt_receipts[receipt_start:],
             )
         latency_ms = int((time.perf_counter() - start) * 1000)
 
@@ -886,9 +1151,11 @@ def evaluate_scenario(
             input_tokens += int(run.get("input_tokens", 0) or 0)
             output_tokens += int(run.get("output_tokens", 0) or 0)
             total_tokens += int(run.get("billable_units", 0) or 0)
-        budget.record_usage(input_tokens, output_tokens)
-        cost_status, cost_amount, cost_currency, price_basis_version = _live_cost_summary(
-            provider, input_tokens, output_tokens, total_tokens
+        attempt_receipts = budget.attempt_receipts[receipt_start:]
+        cost_status, cost_amount, cost_currency, price_basis_version = (
+            _live_cost_summary(
+                provider, input_tokens, output_tokens, total_tokens, attempt_receipts
+            )
         )
     else:
         start = time.perf_counter()
@@ -939,13 +1206,60 @@ def evaluate_scenario(
         "limitations": limitations,
     }
     if execution_kind == "live":
+        attempt_receipts = (
+            budget.attempt_receipts[receipt_start:] if budget is not None else ()
+        )
+        receipt_records = [_attempt_receipt_record(item) for item in attempt_receipts]
         record["input_tokens"] = input_tokens
         record["output_tokens"] = output_tokens
         record["total_tokens"] = total_tokens
         record["cost_amount"] = cost_amount
         record["cost_currency"] = cost_currency
         record["price_basis_version"] = price_basis_version
+        record["attempt_receipts"] = receipt_records
+        record["provider_reported_cost_amount"] = sum(
+            item.actual_cost_amount or 0.0 for item in attempt_receipts
+        )
+        record["estimated_cost_amount"] = sum(
+            item.estimated_cost_amount or 0.0 for item in attempt_receipts
+        )
+        record["unknown_cost_attempts"] = sum(
+            item.cost_status == "unavailable" for item in attempt_receipts
+        )
+        if any(item.quote_overrun for item in attempt_receipts):
+            record["spending_status"] = "quote-overrun"
+            record["overall_status"] = "failed"
+        elif any(
+            item.completion_status == "invalid-provider-cost"
+            for item in attempt_receipts
+        ):
+            record["spending_status"] = "invalid-provider-cost"
+            record["overall_status"] = "failed"
+        elif any(item.cost_status == "unavailable" for item in attempt_receipts):
+            record["spending_status"] = "unknown-cost"
+        else:
+            record["spending_status"] = "within-authorization"
     return record
+
+
+def _attempt_receipt_record(receipt: AttemptReceipt) -> dict[str, Any]:
+    return {
+        "call_number": receipt.call_number,
+        "reserved_cost_amount": receipt.reserved_cost_amount,
+        "reserved_cost_currency": receipt.reserved_cost_currency,
+        "price_basis_version": receipt.price_basis_version,
+        "completion_status": receipt.completion_status,
+        "latency_ms": receipt.latency_ms,
+        "input_tokens": receipt.input_tokens,
+        "output_tokens": receipt.output_tokens,
+        "total_tokens": receipt.total_tokens,
+        "cost_status": receipt.cost_status,
+        "estimated_cost_amount": receipt.estimated_cost_amount,
+        "actual_cost_amount": receipt.actual_cost_amount,
+        "actual_cost_currency": receipt.actual_cost_currency,
+        "quote_overrun": receipt.quote_overrun,
+        "failure_kind": receipt.failure_kind,
+    }
 
 
 def _unrun_record(
@@ -964,8 +1278,9 @@ def _unrun_record(
     profile: str,
     reason: str,
     limitations: list[str],
+    attempt_receipts: tuple[AttemptReceipt, ...] = (),
 ) -> dict[str, Any]:
-    return {
+    record = {
         "run_id": run_id,
         "scenario_set_id": scenario_set.scenario_set_id,
         "scenario_set_version": SUPPORTED_SCHEMA_VERSION,
@@ -990,6 +1305,25 @@ def _unrun_record(
         "cost_status": "unavailable",
         "limitations": limitations,
     }
+    if execution_kind == "live":
+        record["attempt_receipts"] = [
+            _attempt_receipt_record(item) for item in attempt_receipts
+        ]
+        record["provider_reported_cost_amount"] = sum(
+            item.actual_cost_amount or 0.0 for item in attempt_receipts
+        )
+        record["estimated_cost_amount"] = sum(
+            item.estimated_cost_amount or 0.0 for item in attempt_receipts
+        )
+        record["unknown_cost_attempts"] = sum(
+            item.cost_status == "unavailable" for item in attempt_receipts
+        )
+        record["spending_status"] = (
+            "quote-overrun"
+            if any(item.quote_overrun for item in attempt_receipts)
+            else "unrun"
+        )
+    return record
 
 
 def runtime_revision_and_dirty(repo_root: str | Path | None = None) -> tuple[str, bool]:
@@ -1137,9 +1471,7 @@ def run_evaluation(
             raise ValueError("Live mode requires --provider or --route.")
         definition = find_provider(provider_id)
         if not definition.available:
-            raise ValueError(
-                f"Provider {live_config.provider!r} is not available."
-            )
+            raise ValueError(f"Provider {live_config.provider!r} is not available.")
 
     budget: LiveBudget | None = None
     if live_config.enabled and live_config.authorized:
@@ -1171,6 +1503,8 @@ def run_evaluation(
         )
 
     credentials = Path(credentials_path) if credentials_path is not None else None
+    output = Path(output_path)
+    existing = _read_existing_records(output)
     records: list[dict[str, Any]] = []
     for attempt, scenario in enumerate(selected_scenarios, start=1):
         record = evaluate_scenario(
@@ -1187,16 +1521,15 @@ def run_evaluation(
             credentials_path=credentials,
             transport=transport,
         )
+        _write_records(output, [record])
         records.append(record)
-
-    output = Path(output_path)
-    existing = _read_existing_records(output)
-    _write_records(output, records)
 
     all_records = existing + records
     summary = _summarize(all_records, scenario_set, excluded_scenario_ids)
 
-    print(f"Scenario set: {scenario_set.scenario_set_id} (schema {scenario_set.schema_version})")
+    print(
+        f"Scenario set: {scenario_set.scenario_set_id} (schema {scenario_set.schema_version})"
+    )
     print(f"Scenario set digest: {scenario_set.content_digest}")
     print(f"Profile: {profile}")
     print(f"Runtime revision: {runtime_revision}{' (dirty)' if dirty else ''}")
@@ -1207,9 +1540,7 @@ def run_evaluation(
     print(f"Fake counts: {summary['fake_counts']}")
     print(f"Live counts: {summary['live_counts']}")
     if summary["excluded_scenarios"]:
-        print(
-            "Excluded by profile: " + ", ".join(summary["excluded_scenarios"])
-        )
+        print("Excluded by profile: " + ", ".join(summary["excluded_scenarios"]))
     if summary["accepted"]:
         print("Baseline accepted: every scenario record passed.")
     elif summary["mandatory_failures"]:

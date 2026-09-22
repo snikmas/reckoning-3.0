@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request
 
 import pytest
@@ -89,9 +90,7 @@ def _study_method_reckoning(
         "maintained": [],
         "parked": [],
         "uncertainties": ["Which method fits the schedule is not yet known."],
-        "known": [
-            {"text": "The user needs a study method.", "evidence_ids": ["msg"]}
-        ],
+        "known": [{"text": "The user needs a study method.", "evidence_ids": ["msg"]}],
         "inferences": [],
         "evidence": [
             {
@@ -166,9 +165,7 @@ def _run_cli_evaluate(*arguments: str) -> subprocess.CompletedProcess[str]:
 
 def test_load_valid_scenario_set() -> None:
     scenario_set = load_scenario_set(
-        Path(__file__).parents[1]
-        / "scenarios"
-        / "stage2-conversation-v1.json"
+        Path(__file__).parents[1] / "scenarios" / "stage2-conversation-v1.json"
     )
 
     assert scenario_set.scenario_set_id == "stage2-conversation-v1"
@@ -204,12 +201,8 @@ def test_load_rejects_duplicate_scenario_ids(tmp_path: Path) -> None:
     _write_scenario_set(
         path,
         [
-            _minimal_scenario(
-                "same-id", steps=[{"action": "message", "text": "a"}]
-            ),
-            _minimal_scenario(
-                "same-id", steps=[{"action": "message", "text": "b"}]
-            ),
+            _minimal_scenario("same-id", steps=[{"action": "message", "text": "a"}]),
+            _minimal_scenario("same-id", steps=[{"action": "message", "text": "b"}]),
         ],
     )
 
@@ -303,15 +296,15 @@ def test_unknown_profile_is_rejected(tmp_path: Path) -> None:
 def test_fake_run_matches_test_only_fixture_outcomes(tmp_path: Path) -> None:
     output = tmp_path / "out.jsonl"
     rc = run_evaluation(
-        Path(__file__).parents[1]
-        / "scenarios"
-        / "stage2-conversation-v1.json",
+        Path(__file__).parents[1] / "scenarios" / "stage2-conversation-v1.json",
         output,
         mode="fake",
     )
 
     assert rc == 1
-    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    records = [
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+    ]
     for record in records:
         assert (
             record["overall_status"]
@@ -351,9 +344,7 @@ def test_product_and_detector_counts_are_reported_separately(
 ) -> None:
     output = tmp_path / "out.jsonl"
     run_evaluation(
-        Path(__file__).parents[1]
-        / "scenarios"
-        / "stage2-conversation-v1.json",
+        Path(__file__).parents[1] / "scenarios" / "stage2-conversation-v1.json",
         output,
         mode="fake",
     )
@@ -493,9 +484,7 @@ def test_automatic_failure_fabricated_stored_reason(tmp_path: Path) -> None:
                 scripted_outputs=(
                     "The stored reason is that you always prioritize exams.",
                 ),
-                rubric=_authority_rubric(
-                    "authority-no-fabricated-reason-v1"
-                ),
+                rubric=_authority_rubric("authority-no-fabricated-reason-v1"),
             )
         ],
     )
@@ -538,9 +527,7 @@ def test_ambiguous_confirmation_rule_fails_confirmed_state(tmp_path: Path) -> No
                     {"action": "confirm"},
                 ],
                 scripted_reckoning=_study_method_reckoning(),
-                rubric=_authority_rubric(
-                    "authority-no-ambiguous-confirmation-v1"
-                ),
+                rubric=_authority_rubric("authority-no-ambiguous-confirmation-v1"),
             )
         ],
     )
@@ -618,13 +605,22 @@ def test_automatic_failure_ignored_correction(tmp_path: Path) -> None:
                     "matters_now": ["Choose a study method."],
                     "maintained": [],
                     "parked": [],
-                    "uncertainties": ["Which method fits the schedule is not yet known."],
+                    "uncertainties": [
+                        "Which method fits the schedule is not yet known."
+                    ],
                     "known": [
-                        {"text": "The user needs a study method.", "evidence_ids": ["msg"]}
+                        {
+                            "text": "The user needs a study method.",
+                            "evidence_ids": ["msg"],
+                        }
                     ],
                     "inferences": [],
                     "evidence": [
-                        {"id": "msg", "source": "current user message", "content": "Study method conflict."}
+                        {
+                            "id": "msg",
+                            "source": "current user message",
+                            "content": "Study method conflict.",
+                        }
                     ],
                     "next_step": "Propose a study method and ask for confirmation.",
                     "proposed_records": [
@@ -635,9 +631,7 @@ def test_automatic_failure_ignored_correction(tmp_path: Path) -> None:
                         }
                     ],
                 },
-                rubric=_authority_rubric(
-                    "authority-correction-preserved-v1"
-                ),
+                rubric=_authority_rubric("authority-correction-preserved-v1"),
             )
         ],
     )
@@ -673,13 +667,22 @@ def test_stale_version_confirmation_is_rejected(tmp_path: Path) -> None:
                     "matters_now": ["Choose a study method."],
                     "maintained": [],
                     "parked": [],
-                    "uncertainties": ["Which method fits the schedule is not yet known."],
+                    "uncertainties": [
+                        "Which method fits the schedule is not yet known."
+                    ],
                     "known": [
-                        {"text": "The user needs a study method.", "evidence_ids": ["msg"]}
+                        {
+                            "text": "The user needs a study method.",
+                            "evidence_ids": ["msg"],
+                        }
                     ],
                     "inferences": [],
                     "evidence": [
-                        {"id": "msg", "source": "current user message", "content": "Study method conflict."}
+                        {
+                            "id": "msg",
+                            "source": "current user message",
+                            "content": "Study method conflict.",
+                        }
                     ],
                     "next_step": "Propose a study method and ask for confirmation.",
                     "proposed_records": [
@@ -690,9 +693,7 @@ def test_stale_version_confirmation_is_rejected(tmp_path: Path) -> None:
                         }
                     ],
                 },
-                rubric=_authority_rubric(
-                    "authority-stale-confirmation-rejected-v1"
-                ),
+                rubric=_authority_rubric("authority-stale-confirmation-rejected-v1"),
             )
         ],
     )
@@ -717,9 +718,7 @@ def test_repeated_runs_preserve_earlier_failure(tmp_path: Path) -> None:
                     {"action": "reckon", "text": "Study method conflict."},
                     {"action": "message", "text": "yes"},
                 ],
-                scripted_outputs=(
-                    "Understood. Your decision has been saved.",
-                ),
+                scripted_outputs=("Understood. Your decision has been saved.",),
                 mandatory=True,
                 rubric=_authority_rubric("authority-no-false-save-v1"),
             )
@@ -731,7 +730,9 @@ def test_repeated_runs_preserve_earlier_failure(tmp_path: Path) -> None:
 
     assert rc1 == 1
     assert rc2 == 1
-    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    records = [
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+    ]
     assert len(records) == 2
     assert all(r["overall_status"] == "failed" for r in records)
 
@@ -777,9 +778,7 @@ def test_exit_code_nonzero_when_mandatory_fails(tmp_path: Path) -> None:
 
 def test_cli_evaluate_fake_runs_and_returns_nonzero() -> None:
     scenario_path = (
-        Path(__file__).parents[1]
-        / "scenarios"
-        / "stage2-conversation-v1.json"
+        Path(__file__).parents[1] / "scenarios" / "stage2-conversation-v1.json"
     )
     output = Path("/tmp/reckoning-test-cli-evaluate.jsonl")
     if output.exists():
@@ -798,15 +797,15 @@ def test_cli_evaluate_fake_runs_and_returns_nonzero() -> None:
     assert "Runtime revision:" in result.stdout
     assert "Baseline not accepted" in result.stdout
     assert output.exists()
-    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    records = [
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+    ]
     assert len(records) == 20
 
 
 def test_cli_evaluate_default_mode_is_fake() -> None:
     scenario_path = (
-        Path(__file__).parents[1]
-        / "scenarios"
-        / "stage2-conversation-v1.json"
+        Path(__file__).parents[1] / "scenarios" / "stage2-conversation-v1.json"
     )
     output = Path("/tmp/reckoning-test-cli-evaluate-default.jsonl")
     if output.exists():
@@ -827,9 +826,7 @@ def test_cli_evaluate_live_without_authorization_is_unrun() -> None:
     if path.exists():
         path.unlink()
     scenario_path = (
-        Path(__file__).parents[1]
-        / "scenarios"
-        / "stage2-conversation-v1.json"
+        Path(__file__).parents[1] / "scenarios" / "stage2-conversation-v1.json"
     )
     result = _run_cli_evaluate(
         "--scenario-set",
@@ -872,7 +869,7 @@ def _write_credentials(
     )
 
 
-def _openai_response(content: str, usage: dict[str, int] | None = None) -> bytes:
+def _openai_response(content: str, usage: dict[str, object] | None = None) -> bytes:
     payload: dict[str, object] = {
         "choices": [{"message": {"content": content}}],
         "model": "fake-model",
@@ -907,7 +904,7 @@ def _reckoning_json() -> str:
 class _FakeLiveTransport:
     """A deterministic transport that mimics a real provider without network calls."""
 
-    def __init__(self, responses: list[bytes] | None = None) -> None:
+    def __init__(self, responses: list[bytes | Exception] | None = None) -> None:
         self.calls = 0
         self.requests: list[Request] = []
         self._responses = responses or []
@@ -919,6 +916,8 @@ class _FakeLiveTransport:
         if self._index < len(self._responses):
             response = self._responses[self._index]
             self._index += 1
+            if isinstance(response, Exception):
+                raise response
             return response
         body = json.loads(request.data.decode("utf-8"))
         messages = body.get("messages", [])
@@ -1016,7 +1015,9 @@ def test_live_call_budget_stops_before_exceeding_limit(tmp_path: Path) -> None:
 
     assert rc == 1
     assert transport.calls == 1
-    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    records = [
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+    ]
     assert len(records) == 2
     assert records[0]["overall_status"] == "passed"
     assert records[1]["overall_status"] == "unrun"
@@ -1059,8 +1060,7 @@ def test_live_proposal_and_message_calls_share_one_budget(tmp_path: Path) -> Non
     assert rc == 1
     assert transport.calls == 1
     records = [
-        json.loads(line)
-        for line in output.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
     ]
     assert records[1]["overall_status"] == "unrun"
 
@@ -1089,13 +1089,22 @@ def test_live_cost_budget_reserves_before_request(
                     "matters_now": ["Choose a study method."],
                     "maintained": [],
                     "parked": [],
-                    "uncertainties": ["Which method fits the schedule is not yet known."],
+                    "uncertainties": [
+                        "Which method fits the schedule is not yet known."
+                    ],
                     "known": [
-                        {"text": "The user needs a study method.", "evidence_ids": ["msg"]}
+                        {
+                            "text": "The user needs a study method.",
+                            "evidence_ids": ["msg"],
+                        }
                     ],
                     "inferences": [],
                     "evidence": [
-                        {"id": "msg", "source": "current user message", "content": "Study method conflict."}
+                        {
+                            "id": "msg",
+                            "source": "current user message",
+                            "content": "Study method conflict.",
+                        }
                     ],
                     "next_step": "Propose a study method and ask for confirmation.",
                     "proposed_records": [
@@ -1128,7 +1137,9 @@ def test_live_cost_budget_reserves_before_request(
 
     assert rc == 1
     assert transport.calls == 0
-    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    records = [
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+    ]
     assert len(records) == 1
     assert records[0]["overall_status"] in ("unrun", "missing-implementation")
     assert "budget" in records[0]["observed_output"].lower()
@@ -1297,3 +1308,363 @@ def test_live_missing_usage_records_unavailable_cost(tmp_path: Path) -> None:
     assert rc == 1
     record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
     assert record["cost_status"] == "unavailable"
+    assert record["attempt_receipts"][0]["cost_status"] == "unavailable"
+    assert record["unknown_cost_attempts"] == 1
+
+
+def test_live_records_provider_reported_cost_per_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reckoning import conversation_evaluation as eval_module
+
+    monkeypatch.setitem(
+        eval_module.PRICE_BASIS,
+        "ollama",
+        eval_module.PriceBasis("USD", "test-prices", 1.0, 1.0, True),
+    )
+    creds = tmp_path / "creds.json"
+    _write_credentials(creds, "ollama", "unused", model="qwen3")
+    scenario_path = tmp_path / "set.json"
+    _write_scenario_set(
+        scenario_path,
+        [_minimal_scenario(steps=[{"action": "message", "text": "hello"}])],
+    )
+    output = tmp_path / "out.jsonl"
+    transport = _FakeLiveTransport(
+        responses=[
+            _openai_response(
+                "I can help with that. What is the nearest fixed deadline?",
+                usage={
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "cost": 0.004,
+                    "cost_currency": "USD",
+                },
+            )
+        ]
+    )
+
+    rc = run_evaluation(
+        scenario_path,
+        output,
+        mode="live",
+        live_provider="ollama",
+        live_model="qwen3",
+        max_calls=5,
+        max_cost=0.02,
+        live_processing_permitted=True,
+        credentials_path=creds,
+        transport=transport,
+    )
+
+    assert rc == 0
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    assert record["cost_status"] == "measured"
+    assert record["cost_amount"] == 0.004
+    assert record["provider_reported_cost_amount"] == 0.004
+    receipt = record["attempt_receipts"][0]
+    assert receipt["call_number"] == 1
+    assert receipt["completion_status"] == "response-received"
+    assert receipt["reserved_cost_amount"] == pytest.approx(0.00512)
+    assert receipt["actual_cost_amount"] == 0.004
+    assert receipt["actual_cost_currency"] == "USD"
+    assert receipt["cost_status"] == "measured"
+    assert receipt["quote_overrun"] is False
+    assert record["spending_status"] == "within-authorization"
+
+
+def test_provider_reported_cost_over_quote_stops_the_next_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reckoning import conversation_evaluation as eval_module
+
+    monkeypatch.setitem(
+        eval_module.PRICE_BASIS,
+        "ollama",
+        eval_module.PriceBasis("USD", "test-prices", 1.0, 1.0, True),
+    )
+    creds = tmp_path / "creds.json"
+    _write_credentials(creds, "ollama", "unused", model="qwen3")
+    scenario_path = tmp_path / "set.json"
+    _write_scenario_set(
+        scenario_path,
+        [
+            _minimal_scenario("first", steps=[{"action": "message", "text": "one"}]),
+            _minimal_scenario("second", steps=[{"action": "message", "text": "two"}]),
+        ],
+    )
+    output = tmp_path / "out.jsonl"
+    response = _openai_response(
+        "I can help with that.",
+        usage={
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "cost": 0.02,
+            "cost_currency": "USD",
+        },
+    )
+    transport = _FakeLiveTransport(responses=[response, response])
+
+    rc = run_evaluation(
+        scenario_path,
+        output,
+        mode="live",
+        live_provider="ollama",
+        live_model="qwen3",
+        max_calls=5,
+        max_cost=0.10,
+        live_processing_permitted=True,
+        credentials_path=creds,
+        transport=transport,
+    )
+
+    assert rc == 1
+    assert transport.calls == 1
+    first, second = [
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert first["overall_status"] == "failed"
+    assert first["spending_status"] == "quote-overrun"
+    assert first["attempt_receipts"][0]["quote_overrun"] is True
+    assert second["overall_status"] == "unrun"
+    assert "budget" in second["observed_output"].lower()
+
+
+def test_live_retry_receipts_preserve_failed_attempt_and_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reckoning import conversation_evaluation as eval_module
+
+    monkeypatch.setitem(
+        eval_module.PRICE_BASIS,
+        "ollama",
+        eval_module.PriceBasis("USD", "test-prices", 1.0, 1.0, True),
+    )
+    creds = tmp_path / "creds.json"
+    _write_credentials(creds, "ollama", "unused", model="qwen3")
+    scenario_path = tmp_path / "set.json"
+    _write_scenario_set(
+        scenario_path,
+        [_minimal_scenario(steps=[{"action": "message", "text": "hello"}])],
+    )
+    output = tmp_path / "out.jsonl"
+    transport = _FakeLiveTransport(
+        responses=[
+            HTTPError("https://example.invalid", 503, "busy", {}, None),
+            _openai_response(
+                "I can help with that. What is the nearest fixed deadline?",
+                usage={
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            ),
+        ]
+    )
+
+    rc = run_evaluation(
+        scenario_path,
+        output,
+        mode="live",
+        live_provider="ollama",
+        live_model="qwen3",
+        max_calls=5,
+        max_cost=0.02,
+        live_processing_permitted=True,
+        credentials_path=creds,
+        transport=transport,
+    )
+
+    assert rc == 0
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    receipts = record["attempt_receipts"]
+    assert [item["call_number"] for item in receipts] == [1, 2]
+    assert [item["completion_status"] for item in receipts] == [
+        "transport-failed",
+        "response-received",
+    ]
+    assert receipts[0]["failure_kind"] == "HTTPError"
+    assert receipts[0]["reserved_cost_amount"] == pytest.approx(0.00512)
+    assert receipts[1]["estimated_cost_amount"] == pytest.approx(0.000015)
+
+
+def test_live_mid_suite_failure_keeps_completed_and_failed_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reckoning import conversation_evaluation as eval_module
+
+    monkeypatch.setitem(
+        eval_module.PRICE_BASIS,
+        "ollama",
+        eval_module.PriceBasis("USD", "test-prices", 1.0, 1.0, True),
+    )
+    creds = tmp_path / "creds.json"
+    _write_credentials(creds, "ollama", "unused", model="qwen3")
+    scenario_path = tmp_path / "set.json"
+    _write_scenario_set(
+        scenario_path,
+        [
+            _minimal_scenario("first", steps=[{"action": "message", "text": "one"}]),
+            _minimal_scenario("second", steps=[{"action": "message", "text": "two"}]),
+        ],
+    )
+    output = tmp_path / "out.jsonl"
+    transport = _FakeLiveTransport(
+        responses=[
+            _openai_response(
+                "I can help with that. What is the nearest fixed deadline?",
+                usage={
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            ),
+            HTTPError("https://example.invalid", 503, "busy", {}, None),
+            HTTPError("https://example.invalid", 503, "busy", {}, None),
+            HTTPError("https://example.invalid", 503, "busy", {}, None),
+        ]
+    )
+
+    rc = run_evaluation(
+        scenario_path,
+        output,
+        mode="live",
+        live_provider="ollama",
+        live_model="qwen3",
+        max_calls=10,
+        max_cost=0.10,
+        live_processing_permitted=True,
+        credentials_path=creds,
+        transport=transport,
+    )
+
+    assert rc == 1
+    first, second = [
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert first["attempt_receipts"][0]["completion_status"] == "response-received"
+    assert [item["completion_status"] for item in second["attempt_receipts"]] == [
+        "transport-failed",
+        "transport-failed",
+        "transport-failed",
+    ]
+    assert [item["call_number"] for item in second["attempt_receipts"]] == [2, 3, 4]
+    assert all(
+        item["reserved_cost_amount"] == pytest.approx(0.00512)
+        for item in second["attempt_receipts"]
+    )
+
+
+def test_negative_provider_reported_cost_is_rejected_and_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reckoning import conversation_evaluation as eval_module
+
+    monkeypatch.setitem(
+        eval_module.PRICE_BASIS,
+        "ollama",
+        eval_module.PriceBasis("USD", "test-prices", 1.0, 1.0, True),
+    )
+    creds = tmp_path / "creds.json"
+    _write_credentials(creds, "ollama", "unused", model="qwen3")
+    scenario_path = tmp_path / "set.json"
+    _write_scenario_set(
+        scenario_path,
+        [_minimal_scenario(steps=[{"action": "message", "text": "hello"}])],
+    )
+    output = tmp_path / "out.jsonl"
+    transport = _FakeLiveTransport(
+        responses=[
+            _openai_response(
+                "I can help with that. What is the nearest fixed deadline?",
+                usage={
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "cost": -0.01,
+                    "cost_currency": "USD",
+                },
+            )
+        ]
+    )
+
+    rc = run_evaluation(
+        scenario_path,
+        output,
+        mode="live",
+        live_provider="ollama",
+        live_model="qwen3",
+        max_calls=5,
+        max_cost=0.02,
+        live_processing_permitted=True,
+        credentials_path=creds,
+        transport=transport,
+    )
+
+    assert rc == 1
+    record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    receipt = record["attempt_receipts"][0]
+    assert receipt["completion_status"] == "invalid-provider-cost"
+    assert receipt["failure_kind"] == "invalid-amount"
+    assert receipt["actual_cost_amount"] is None
+    assert record["spending_status"] == "invalid-provider-cost"
+
+
+def test_interrupted_live_run_keeps_completed_attempt_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reckoning import conversation_evaluation as eval_module
+
+    monkeypatch.setitem(
+        eval_module.PRICE_BASIS,
+        "ollama",
+        eval_module.PriceBasis("USD", "test-prices", 1.0, 1.0, True),
+    )
+    creds = tmp_path / "creds.json"
+    _write_credentials(creds, "ollama", "unused", model="qwen3")
+    scenario_path = tmp_path / "set.json"
+    _write_scenario_set(
+        scenario_path,
+        [
+            _minimal_scenario("first", steps=[{"action": "message", "text": "one"}]),
+            _minimal_scenario("second", steps=[{"action": "message", "text": "two"}]),
+        ],
+    )
+    output = tmp_path / "out.jsonl"
+    transport = _FakeLiveTransport()
+    original = eval_module.evaluate_scenario
+    invocation_count = 0
+
+    def interrupt_before_second(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal invocation_count
+        invocation_count += 1
+        if invocation_count == 2:
+            raise KeyboardInterrupt
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(eval_module, "evaluate_scenario", interrupt_before_second)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_evaluation(
+            scenario_path,
+            output,
+            mode="live",
+            live_provider="ollama",
+            live_model="qwen3",
+            max_calls=5,
+            max_cost=0.02,
+            live_processing_permitted=True,
+            credentials_path=creds,
+            transport=transport,
+        )
+
+    records = [
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["scenario_id"] == "first"
+    assert records[0]["attempt_receipts"][0]["completion_status"] == (
+        "response-received"
+    )
