@@ -308,7 +308,7 @@ I am learning backend programming.
         cookie=cookie,
     )
     assert status == "303 See Other"
-    assert headers["Location"] == "/simon"
+    assert headers["Location"] == "/simon#latest-reply"
 
     _, _, review_page = request(web, "GET", "/simon")
     assert b"Review your profile" in review_page

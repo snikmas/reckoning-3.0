@@ -357,7 +357,7 @@ def test_configured_local_and_private_origins_can_submit_with_a_session_token(
     )
 
     assert status == "303 See Other"
-    assert headers["Location"] == "/simon"
+    assert headers["Location"] == "/simon#latest-reply"
     assert [item.content for item in interface.channel_session("web")] == [
         "Process this",
         "Persisted Simon reply",
@@ -508,9 +508,9 @@ def test_successful_submission_redirects_to_the_visible_saved_simon_reply() -> N
         "/messages", {"message": "Show me the answer"}
     )
     assert status == "303 See Other"
-    assert headers["Location"] == "/simon"
+    assert headers["Location"] == "/simon#latest-reply"
 
-    final_status, _, final_page = browser.get(headers["Location"])
+    final_status, _, final_page = browser.get(headers["Location"].split("#", 1)[0])
     assert final_status == "200 OK"
     assert b"Show me the answer" in final_page
     assert b"Persisted Simon reply" in final_page

@@ -646,7 +646,7 @@ def test_conversational_correction_and_confirmation(tmp_path: Path) -> None:
         composer.submission(message="What happens if I confirm?"),
     )
     assert status == "303 See Other"
-    assert headers["Location"] == "/simon"
+    assert headers["Location"] == "/simon#latest-reply"
     status, _, page = browser.get(first_location)
     assert b'class="status status-proposed"' in page
 
@@ -682,7 +682,11 @@ def test_conversational_correction_and_confirmation(tmp_path: Path) -> None:
         "/messages", composer.submission(message="What should I focus on this week?")
     )
     assert status == "303 See Other"
-    assert headers["Location"] == "/simon"
+    assert headers["Location"] == "/simon#latest-reply"
+    status, _, page = browser.get("/simon")
+    assert status == "200 OK"
+    assert b'id="latest-reply"' in page
+    assert b"padding: 1rem 1rem 8.5rem" in page
     status, _, page = browser.get("/")
     assert len(browser.parse(page).decision_links) == 1
 

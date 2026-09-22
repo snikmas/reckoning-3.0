@@ -381,7 +381,7 @@ class ReckoningWebApplication:
                 )
             start_response(
                 "303 See Other",
-                [("Location", "/simon"), ("Content-Length", "0")],
+                [("Location", "/simon#latest-reply"), ("Content-Length", "0")],
             )
             return [b""]
         if method == "POST" and path == "/sessions/new":
@@ -1552,7 +1552,7 @@ class ReckoningWebApplication:
       aside {{
         border-left: 0;
         border-top: 1px solid var(--border);
-        padding: 1rem;
+        padding: 1rem 1rem 8.5rem;
       }}
       .composer {{
         left: 0;
@@ -1800,7 +1800,8 @@ class ReckoningWebApplication:
           <header><p class="eyebrow">Conversation</p><h1>Simon</h1></header>
           {session_header}
           {notice_markup}
-          <div aria-live="polite">{conversation}</div>{error_markup}
+          <div aria-live="polite">{conversation}</div>
+          <span id="latest-reply" aria-hidden="true"></span>{error_markup}
           {active_proposal}
           {pending_cards}
           {profile_review}
