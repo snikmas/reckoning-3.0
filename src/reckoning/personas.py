@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+import fcntl
 from hashlib import sha256
+import os
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
@@ -28,6 +31,9 @@ _PERSONA_FILE_FIELDS = {
 _PERSONA_FILE_FIELDS_V2 = _PERSONA_FILE_FIELDS | {
     "private_versions",
     "active_private_selection",
+}
+_PERSONA_FILE_FIELDS_V3 = _PERSONA_FILE_FIELDS_V2 | {
+    "active_selection_revision",
 }
 _PERSONA_DEFINITION_FIELDS = {
     "id",
@@ -57,7 +63,8 @@ _PRIVATE_VERSION_FIELDS = {
     "imported_at",
     "predecessor_id",
 }
-_ACTIVE_PRIVATE_SELECTION_FIELDS = {"version_id", "selected_at"}
+_ACTIVE_PRIVATE_SELECTION_FIELDS_V2 = {"version_id", "selected_at"}
+_ACTIVE_PRIVATE_SELECTION_FIELDS = _ACTIVE_PRIVATE_SELECTION_FIELDS_V2 | {"revision"}
 _DECLARED_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
 
 _VOICE_INSTRUCTIONS: dict[Voice, str] = {
@@ -290,6 +297,29 @@ class PersonaVersion:
 class ActivePersonaSelection:
     version_id: str
     selected_at: datetime
+    revision: int
+
+
+@dataclass(frozen=True)
+class PrivatePersonaVersionSummary:
+    version_id: str
+    display_name: str
+    private_identifier: str
+    declared_version: str
+    fingerprint: str
+    imported_at: datetime
+    predecessor_id: str | None
+    status: Literal["active", "historical"]
+
+
+class PersonaSelectionConflict(RuntimeError):
+    def __init__(self, expected: int, actual: int) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            "Private persona selection changed from revision "
+            f"{expected} to {actual}. Reload before selecting a version."
+        )
 
 
 @dataclass(frozen=True)
@@ -315,7 +345,13 @@ class CompiledPersona:
     def to_application_settings(self) -> PersonaSettings:
         from reckoning.application import PersonaSettings
 
-        return PersonaSettings(name=self.name, instructions=self.instructions)
+        return PersonaSettings(
+            name=self.name,
+            instructions=self.instructions,
+            private_identifier=self.private_identifier,
+            private_version_id=self.version_id,
+            private_declared_version=self.declared_version,
+        )
 
 
 def _validate_private_identifier(value: str) -> None:
@@ -357,20 +393,25 @@ def _validate_role_content(role: str, content: str) -> str:
     return content
 
 
-def _bundle_fingerprint(bundle: PersonaBundle) -> str:
-    digest = sha256()
+def canonical_private_bundle_bytes(bundle: PersonaBundle) -> bytes:
+    """Return the versioned, role-delimited bytes used for fingerprints."""
+    canonical = bytearray(b"reckoning.private-persona.bundle\x00v1\x00")
     for role, content in (
         ("private-guidance", bundle.private_guidance),
         ("stable-identity", bundle.stable_identity),
         ("expression-persona", bundle.expression_persona),
     ):
+        role_bytes = role.encode("ascii")
         encoded = content.encode("utf-8")
-        digest.update(role.encode("ascii"))
-        digest.update(b"\x00")
-        digest.update(str(len(encoded)).encode("ascii"))
-        digest.update(b"\x00")
-        digest.update(encoded)
-    return digest.hexdigest()
+        canonical.extend(len(role_bytes).to_bytes(2, "big"))
+        canonical.extend(role_bytes)
+        canonical.extend(len(encoded).to_bytes(8, "big"))
+        canonical.extend(encoded)
+    return bytes(canonical)
+
+
+def _bundle_fingerprint(bundle: PersonaBundle) -> str:
+    return sha256(canonical_private_bundle_bytes(bundle)).hexdigest()
 
 
 def _validated_bundle(bundle: PersonaBundle) -> PersonaBundle:
@@ -578,7 +619,7 @@ class PersonaRepository(Protocol):
 
     def remove_authored(self, persona_id: str) -> bool: ...
 
-    def set_active(self, persona_id: str) -> None: ...
+    def set_active(self, persona_id: str, *, expected_revision: int) -> None: ...
 
     def active_id(self) -> str | None: ...
 
@@ -586,8 +627,22 @@ class PersonaRepository(Protocol):
 
     def active_private_selection(self) -> ActivePersonaSelection | None: ...
 
+    def selection_revision(self) -> int: ...
+
     def activate_private(
-        self, version: PersonaVersion, selection: ActivePersonaSelection
+        self,
+        version: PersonaVersion,
+        *,
+        selected_at: datetime,
+        expected_revision: int,
+    ) -> PersonaVersion: ...
+
+    def select_private(
+        self,
+        version_id: str,
+        *,
+        selected_at: datetime,
+        expected_revision: int,
     ) -> None: ...
 
 
@@ -597,6 +652,7 @@ class InMemoryPersonaRepository:
         self._active_id: str | None = None
         self._private_versions: dict[str, PersonaVersion] = {}
         self._active_private_selection: ActivePersonaSelection | None = None
+        self._selection_revision = 0
 
     def save_authored(self, definition: PersonaDefinition) -> None:
         self._authored[definition.id] = definition
@@ -607,9 +663,11 @@ class InMemoryPersonaRepository:
     def remove_authored(self, persona_id: str) -> bool:
         return self._authored.pop(persona_id, None) is not None
 
-    def set_active(self, persona_id: str) -> None:
+    def set_active(self, persona_id: str, *, expected_revision: int) -> None:
+        self._check_selection_revision(expected_revision)
         self._active_id = persona_id
         self._active_private_selection = None
+        self._selection_revision += 1
 
     def active_id(self) -> str | None:
         return self._active_id
@@ -620,13 +678,79 @@ class InMemoryPersonaRepository:
     def active_private_selection(self) -> ActivePersonaSelection | None:
         return self._active_private_selection
 
+    def selection_revision(self) -> int:
+        return self._selection_revision
+
     def activate_private(
-        self, version: PersonaVersion, selection: ActivePersonaSelection
+        self,
+        version: PersonaVersion,
+        *,
+        selected_at: datetime,
+        expected_revision: int,
+    ) -> PersonaVersion:
+        self._check_selection_revision(expected_revision)
+        stored = _resolve_private_import(tuple(self._private_versions.values()), version)
+        self._private_versions = {**self._private_versions, stored.version_id: stored}
+        revision = expected_revision + 1
+        self._active_private_selection = ActivePersonaSelection(
+            stored.version_id, selected_at, revision
+        )
+        self._selection_revision = revision
+        return stored
+
+    def select_private(
+        self,
+        version_id: str,
+        *,
+        selected_at: datetime,
+        expected_revision: int,
     ) -> None:
-        if selection.version_id != version.version_id:
-            raise ValueError("Active private selection must name the imported version.")
-        self._private_versions[version.version_id] = version
-        self._active_private_selection = selection
+        self._check_selection_revision(expected_revision)
+        if version_id not in self._private_versions:
+            raise KeyError(f"Unknown private persona version: {version_id}")
+        revision = expected_revision + 1
+        self._active_private_selection = ActivePersonaSelection(
+            version_id, selected_at, revision
+        )
+        self._selection_revision = revision
+
+    def _check_selection_revision(self, expected_revision: int) -> None:
+        if self._selection_revision != expected_revision:
+            raise PersonaSelectionConflict(expected_revision, self._selection_revision)
+
+
+def _resolve_private_import(
+    existing: tuple[PersonaVersion, ...], candidate: PersonaVersion
+) -> PersonaVersion:
+    same_persona = tuple(
+        item
+        for item in existing
+        if item.private_identifier == candidate.private_identifier
+    )
+    unchanged = next(
+        (item for item in same_persona if item.fingerprint == candidate.fingerprint),
+        None,
+    )
+    if unchanged is not None:
+        return unchanged
+    predecessor = same_persona[-1] if same_persona else None
+    return replace(
+        candidate,
+        predecessor_id=predecessor.version_id if predecessor is not None else None,
+    )
+
+
+@contextmanager
+def _persona_write_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+b") as lock_file:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class JsonFilePersonaRepository(InMemoryPersonaRepository):
@@ -636,19 +760,22 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
         data = read_json(
             path,
             default={
-                "schema_version": 2,
+                "schema_version": 3,
                 "authored": [],
                 "active_persona_id": None,
                 "private_versions": [],
                 "active_private_selection": None,
+                "active_selection_revision": 0,
             },
         )
         schema_version = data.get("schema_version")
-        if schema_version not in (1, 2):
+        if schema_version not in (1, 2, 3):
             raise RuntimeError("Unsupported persona storage schema.")
-        expected_fields = (
-            _PERSONA_FILE_FIELDS if schema_version == 1 else _PERSONA_FILE_FIELDS_V2
-        )
+        expected_fields = {
+            1: _PERSONA_FILE_FIELDS,
+            2: _PERSONA_FILE_FIELDS_V2,
+            3: _PERSONA_FILE_FIELDS_V3,
+        }[schema_version]
         if set(data) != expected_fields:
             raise RuntimeError("Stored persona configuration is invalid.")
         authored = data.get("authored")
@@ -688,48 +815,128 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
             {version.version_id for version in versions}
         ) != len(versions):
             raise RuntimeError("Stored private persona configuration is invalid.")
+        latest_by_persona: dict[str, PersonaVersion] = {}
+        fingerprints: set[tuple[str, str]] = set()
+        for version in versions:
+            previous = latest_by_persona.get(version.private_identifier)
+            expected_predecessor = (
+                previous.version_id if previous is not None else None
+            )
+            key = (version.private_identifier, version.fingerprint)
+            if version.predecessor_id != expected_predecessor or key in fingerprints:
+                raise RuntimeError("Stored private persona history is invalid.")
+            latest_by_persona[version.private_identifier] = version
+            fingerprints.add(key)
         self._private_versions = {item.version_id: item for item in versions}
         selection_data = data.get("active_private_selection")
+        revision = (
+            data.get("active_selection_revision")
+            if schema_version == 3
+            else 1 if selection_data is not None else 0
+        )
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            raise RuntimeError("Stored persona selection revision is invalid.")
+        self._selection_revision = revision
         if selection_data is None:
             return
         try:
-            selection = _active_private_selection_from_data(selection_data)
+            selection = _active_private_selection_from_data(
+                selection_data,
+                fallback_revision=revision if schema_version == 2 else None,
+            )
         except (TypeError, ValueError) as error:
             raise RuntimeError("Stored active private persona is invalid.") from error
-        if selection.version_id not in self._private_versions:
+        if (
+            selection.version_id not in self._private_versions
+            or selection.revision != revision
+        ):
             raise RuntimeError("Stored active private persona is invalid.")
         self._active_private_selection = selection
 
     def save_authored(self, definition: PersonaDefinition) -> None:
-        super().save_authored(definition)
-        self._flush()
+        with _persona_write_lock(self._path):
+            self._refresh_from_disk()
+            self._authored[definition.id] = definition
+            self._flush()
 
     def remove_authored(self, persona_id: str) -> bool:
-        removed = super().remove_authored(persona_id)
-        if removed:
-            self._flush()
-        return removed
+        with _persona_write_lock(self._path):
+            self._refresh_from_disk()
+            removed = self._authored.pop(persona_id, None) is not None
+            if removed:
+                self._flush()
+            return removed
 
-    def set_active(self, persona_id: str) -> None:
-        self._write_state(
-            active_id=persona_id,
-            active_private_selection=None,
-        )
-        self._active_id = persona_id
-        self._active_private_selection = None
+    def set_active(self, persona_id: str, *, expected_revision: int) -> None:
+        with _persona_write_lock(self._path):
+            self._refresh_from_disk()
+            self._check_selection_revision(expected_revision)
+            revision = expected_revision + 1
+            self._write_state(
+                active_id=persona_id,
+                active_private_selection=None,
+                selection_revision=revision,
+            )
+            self._active_id = persona_id
+            self._active_private_selection = None
+            self._selection_revision = revision
 
     def activate_private(
-        self, version: PersonaVersion, selection: ActivePersonaSelection
+        self,
+        version: PersonaVersion,
+        *,
+        selected_at: datetime,
+        expected_revision: int,
+    ) -> PersonaVersion:
+        with _persona_write_lock(self._path):
+            self._refresh_from_disk()
+            self._check_selection_revision(expected_revision)
+            stored = _resolve_private_import(
+                tuple(self._private_versions.values()), version
+            )
+            versions = {**self._private_versions, stored.version_id: stored}
+            revision = expected_revision + 1
+            selection = ActivePersonaSelection(
+                stored.version_id, selected_at, revision
+            )
+            self._write_state(
+                private_versions=versions,
+                active_private_selection=selection,
+                selection_revision=revision,
+            )
+            self._private_versions = versions
+            self._active_private_selection = selection
+            self._selection_revision = revision
+            return stored
+
+    def select_private(
+        self,
+        version_id: str,
+        *,
+        selected_at: datetime,
+        expected_revision: int,
     ) -> None:
-        if selection.version_id != version.version_id:
-            raise ValueError("Active private selection must name the imported version.")
-        versions = {**self._private_versions, version.version_id: version}
-        self._write_state(
-            private_versions=versions,
-            active_private_selection=selection,
-        )
-        self._private_versions = versions
-        self._active_private_selection = selection
+        with _persona_write_lock(self._path):
+            self._refresh_from_disk()
+            self._check_selection_revision(expected_revision)
+            if version_id not in self._private_versions:
+                raise KeyError(f"Unknown private persona version: {version_id}")
+            revision = expected_revision + 1
+            selection = ActivePersonaSelection(version_id, selected_at, revision)
+            self._write_state(
+                active_private_selection=selection,
+                selection_revision=revision,
+            )
+            self._active_private_selection = selection
+            self._selection_revision = revision
+
+    def _refresh_from_disk(self) -> None:
+        refreshed = type(self)(self._path)
+        self._authored = refreshed._authored
+        self._active_id = refreshed._active_id
+        self._private_versions = refreshed._private_versions
+        self._active_private_selection = refreshed._active_private_selection
+        self._selection_revision = refreshed._selection_revision
 
     def _flush(self) -> None:
         self._write_state()
@@ -740,6 +947,7 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
         active_id: str | None | object = ...,
         private_versions: dict[str, PersonaVersion] | None = None,
         active_private_selection: ActivePersonaSelection | None | object = ...,
+        selection_revision: int | None = None,
     ) -> None:
         selected_active_id = self._active_id if active_id is ... else active_id
         selected_private = (
@@ -750,10 +958,15 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
             if active_private_selection is ...
             else active_private_selection
         )
+        selected_revision = (
+            self._selection_revision
+            if selection_revision is None
+            else selection_revision
+        )
         atomic_write_json(
             self._path,
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "authored": [asdict(item) for item in self._authored.values()],
                 "active_persona_id": selected_active_id,
                 "private_versions": [
@@ -765,6 +978,7 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
                     if isinstance(selected_private_selection, ActivePersonaSelection)
                     else None
                 ),
+                "active_selection_revision": selected_revision,
             },
         )
 
@@ -835,9 +1049,18 @@ class PersonaService:
         if not self._repository.remove_authored(persona_id):
             raise KeyError(f"Unknown persona: {persona_id}")
 
-    def select(self, persona_id: str) -> SelectedPersona:
+    def select(
+        self, persona_id: str, *, expected_revision: int | None = None
+    ) -> SelectedPersona:
         definition = self._find(persona_id)
-        self._repository.set_active(definition.id)
+        self._repository.set_active(
+            definition.id,
+            expected_revision=(
+                self._repository.selection_revision()
+                if expected_revision is None
+                else expected_revision
+            ),
+        )
         return SelectedPersona(definition)
 
     def active(self) -> SelectedPersona:
@@ -849,7 +1072,11 @@ class PersonaService:
         return SelectedPersona(self._find(active_id))
 
     def import_and_select_private(
-        self, version: PersonaVersion, *, selected_at: datetime | None = None
+        self,
+        version: PersonaVersion,
+        *,
+        selected_at: datetime | None = None,
+        expected_revision: int | None = None,
     ) -> CompiledPersona:
         version = _private_version_from_data(_private_version_to_data(version))
         if version.private_identifier in self._defaults:
@@ -857,27 +1084,85 @@ class PersonaService:
         authored = {item.id for item in self._repository.list_authored()}
         if version.private_identifier in authored:
             raise ValueError("A private persona cannot replace an authored persona.")
-        existing = self._repository.list_private_versions()
-        conflicts = {
-            item.version_id: item
-            for item in existing
-            if item.private_identifier == version.private_identifier
-        }
-        if conflicts and version.version_id not in conflicts:
-            raise ValueError(
-                "Changed private persona content requires the versioning workflow."
-            )
         selection_time = selected_at or datetime.now(UTC)
         if selection_time.tzinfo is None:
             raise ValueError("Private persona selection time must include a timezone.")
-        self._repository.activate_private(
+        stored = self._repository.activate_private(
             version,
-            ActivePersonaSelection(
-                version_id=version.version_id,
-                selected_at=selection_time,
+            selected_at=selection_time,
+            expected_revision=(
+                self._repository.selection_revision()
+                if expected_revision is None
+                else expected_revision
             ),
         )
-        return compile_persona(version)
+        return compile_persona(stored)
+
+    def selection_revision(self) -> int:
+        return self._repository.selection_revision()
+
+    def list_private_versions(self) -> tuple[PrivatePersonaVersionSummary, ...]:
+        selection = self._repository.active_private_selection()
+        active_version_id = selection.version_id if selection is not None else None
+        return tuple(
+            PrivatePersonaVersionSummary(
+                version_id=item.version_id,
+                display_name=item.display_name,
+                private_identifier=item.private_identifier,
+                declared_version=item.declared_version,
+                fingerprint=item.fingerprint,
+                imported_at=item.imported_at,
+                predecessor_id=item.predecessor_id,
+                status=(
+                    "active" if item.version_id == active_version_id else "historical"
+                ),
+            )
+            for item in self._repository.list_private_versions()
+        )
+
+    def rollback_private(
+        self,
+        version_id: str,
+        *,
+        selected_at: datetime | None = None,
+        expected_revision: int | None = None,
+    ) -> CompiledPersona:
+        versions = {
+            item.version_id: item
+            for item in self._repository.list_private_versions()
+        }
+        try:
+            target = versions[version_id]
+        except KeyError as error:
+            raise KeyError(f"Unknown private persona version: {version_id}") from error
+        current = self._repository.active_private_selection()
+        if current is None:
+            raise ValueError("No private persona version is active.")
+        active = versions[current.version_id]
+        if target.private_identifier != active.private_identifier:
+            raise ValueError("Rollback must keep the active private persona identifier.")
+        if target.version_id == active.version_id:
+            raise ValueError("The requested private persona version is already active.")
+        ancestors: set[str] = set()
+        predecessor = active.predecessor_id
+        while predecessor is not None:
+            ancestors.add(predecessor)
+            predecessor = versions[predecessor].predecessor_id
+        if target.version_id not in ancestors:
+            raise ValueError("Rollback must select an earlier private persona version.")
+        selection_time = selected_at or datetime.now(UTC)
+        if selection_time.tzinfo is None:
+            raise ValueError("Private persona selection time must include a timezone.")
+        self._repository.select_private(
+            target.version_id,
+            selected_at=selection_time,
+            expected_revision=(
+                self._repository.selection_revision()
+                if expected_revision is None
+                else expected_revision
+            ),
+        )
+        return compile_persona(target)
 
     def active_compiled(self) -> CompiledPersona:
         selection = self._repository.active_private_selection()
@@ -979,15 +1264,23 @@ def _private_version_from_data(data: dict[str, Any]) -> PersonaVersion:
 
 def _active_private_selection_to_data(
     selection: ActivePersonaSelection,
-) -> dict[str, str]:
+) -> dict[str, str | int]:
     return {
         "version_id": selection.version_id,
         "selected_at": selection.selected_at.isoformat(),
+        "revision": selection.revision,
     }
 
 
-def _active_private_selection_from_data(data: object) -> ActivePersonaSelection:
-    if not isinstance(data, dict) or set(data) != _ACTIVE_PRIVATE_SELECTION_FIELDS:
+def _active_private_selection_from_data(
+    data: object, *, fallback_revision: int | None = None
+) -> ActivePersonaSelection:
+    expected_fields = (
+        _ACTIVE_PRIVATE_SELECTION_FIELDS_V2
+        if fallback_revision is not None
+        else _ACTIVE_PRIVATE_SELECTION_FIELDS
+    )
+    if not isinstance(data, dict) or set(data) != expected_fields:
         raise ValueError("Stored active private persona has invalid fields.")
     version_id = data["version_id"]
     if not isinstance(version_id, str) or not version_id:
@@ -998,7 +1291,14 @@ def _active_private_selection_from_data(data: object) -> ActivePersonaSelection:
     selected_at = datetime.fromisoformat(selected_at_value)
     if selected_at.tzinfo is None:
         raise ValueError("Stored private persona selection time needs a timezone.")
-    return ActivePersonaSelection(version_id=version_id, selected_at=selected_at)
+    revision = fallback_revision if fallback_revision is not None else data["revision"]
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+        raise ValueError("Stored private persona selection revision is invalid.")
+    return ActivePersonaSelection(
+        version_id=version_id,
+        selected_at=selected_at,
+        revision=revision,
+    )
 
 
 def persona_from_data(data: dict[str, Any]) -> PersonaDefinition:

@@ -95,6 +95,28 @@ class PersonaSettings:
         "Be composed, precise, ambitious, intellectually honest, and willing to "
         "challenge weak reasoning."
     )
+    private_identifier: str | None = None
+    private_version_id: str | None = None
+    private_declared_version: str | None = None
+
+    def __post_init__(self) -> None:
+        evidence = (
+            self.private_identifier,
+            self.private_version_id,
+            self.private_declared_version,
+        )
+        if any(value is not None for value in evidence) != all(
+            isinstance(value, str) and bool(value) for value in evidence
+        ):
+            raise ValueError("Private persona run identity must be complete.")
+        if (
+            self.private_identifier is not None
+            and self.private_version_id is not None
+            and not self.private_version_id.startswith(
+                f"{self.private_identifier}@{self.private_declared_version}:"
+            )
+        ):
+            raise ValueError("Private persona version identity is inconsistent.")
 
 
 @dataclass(frozen=True)
@@ -150,6 +172,9 @@ class ModelRunRecord:
     output_policy_decision: OutputPolicyDecision | None = None
     danger_decision: DangerDecision | None = None
     history_selection: HistorySelection | None = None
+    private_persona_identifier: str | None = None
+    private_persona_version_id: str | None = None
+    private_persona_declared_version: str | None = None
 
 
 class ModelRunRepository(Protocol):
@@ -1122,6 +1147,11 @@ class ReckoningApplication:
                 coverage_version=COVERAGE_VERSION,
             ),
             danger_decision=danger_decision,
+            private_persona_identifier=self._dependencies.persona.private_identifier,
+            private_persona_version_id=self._dependencies.persona.private_version_id,
+            private_persona_declared_version=(
+                self._dependencies.persona.private_declared_version
+            ),
         )
 
     def _model_run_record(
@@ -1157,6 +1187,11 @@ class ReckoningApplication:
             output_policy_decision=output_policy_decision,
             danger_decision=danger_decision,
             history_selection=history_selection,
+            private_persona_identifier=self._dependencies.persona.private_identifier,
+            private_persona_version_id=self._dependencies.persona.private_version_id,
+            private_persona_declared_version=(
+                self._dependencies.persona.private_declared_version
+            ),
         )
 
     def _reckoning_run_record(
@@ -1186,6 +1221,11 @@ class ReckoningApplication:
                 result.billable_units,
             ),
             failure=failure,
+            private_persona_identifier=self._dependencies.persona.private_identifier,
+            private_persona_version_id=self._dependencies.persona.private_version_id,
+            private_persona_declared_version=(
+                self._dependencies.persona.private_declared_version
+            ),
         )
 
     def _failed_run_record(
@@ -1205,6 +1245,11 @@ class ReckoningApplication:
             billable_units=0,
             usage_status="unknown",
             failure=str(error),
+            private_persona_identifier=self._dependencies.persona.private_identifier,
+            private_persona_version_id=self._dependencies.persona.private_version_id,
+            private_persona_declared_version=(
+                self._dependencies.persona.private_declared_version
+            ),
         )
 
     @staticmethod

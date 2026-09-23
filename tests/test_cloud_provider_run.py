@@ -120,6 +120,9 @@ def test_orcarouter_uses_same_boundary_and_records_billable_units() -> None:
         "failure": None,
         "output_policy_decision": classify_output("Choose the smaller proof."),
         "danger_decision": classify_danger("Compare these options."),
+        "private_persona_identifier": None,
+        "private_persona_version_id": None,
+        "private_persona_declared_version": None,
     }
 
 

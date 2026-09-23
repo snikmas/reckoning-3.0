@@ -942,6 +942,12 @@ class SetupWorkflow:
                 return
 
     def _import_private_persona(self) -> None:
+        version = self._prompt_private_persona()
+        self._pending_private_persona = version
+        self._draft.persona_id = version.private_identifier
+        self._draft.authored_persona = None
+
+    def _prompt_private_persona(self) -> PersonaVersion:
         def selected_or_ask(key: str, prompt: str, *, default: str = "") -> str:
             if key in self._preselected:
                 return self._preselected[key]
@@ -1000,9 +1006,7 @@ class SetupWorkflow:
             default=False,
         ):
             raise SetupBack
-        self._pending_private_persona = version
-        self._draft.persona_id = version.private_identifier
-        self._draft.authored_persona = None
+        return version
 
     def _author_persona(self) -> None:
         name = self._ui.ask(
@@ -2553,6 +2557,9 @@ class SetupWorkflow:
                 MenuOption("duplicate", "Duplicate a persona"),
                 MenuOption("rename", "Rename an authored persona"),
                 MenuOption("remove", "Remove an authored persona"),
+                MenuOption("private-import", "Import a private persona version"),
+                MenuOption("private-versions", "Review private persona versions"),
+                MenuOption("private-rollback", "Roll back a private persona"),
             ),
         )
         known = {item.id: item for item in service.list_defaults()}
@@ -2576,6 +2583,71 @@ class SetupWorkflow:
             assert authored is not None
             service.author_and_select(self._persona_definition())
             self._ui.success(f"Active persona: {authored['name']}")
+            return
+        if action == "private-import":
+            expected_revision = service.selection_revision()
+            version = self._prompt_private_persona()
+            selected = service.import_and_select_private(
+                version,
+                expected_revision=expected_revision,
+            )
+            self._ui.success(
+                f"Active private persona: {selected.name} "
+                f"({selected.declared_version})."
+            )
+            return
+        if action in {"private-versions", "private-rollback"}:
+            versions = service.list_private_versions()
+            if not versions:
+                self._ui.info("No private persona versions are installed.")
+                return
+            self._ui.info("Private persona versions")
+            for item in versions:
+                predecessor = item.predecessor_id or "none"
+                self._ui.info(
+                    f"{item.private_identifier} {item.declared_version} | "
+                    f"status: {item.status} | imported: {item.imported_at.isoformat()} | "
+                    f"fingerprint: {item.fingerprint} | predecessor: {predecessor}"
+                )
+            if action == "private-versions":
+                return
+            expected_revision = service.selection_revision()
+            by_id = {item.version_id: item for item in versions}
+            active = next(
+                (item for item in versions if item.status == "active"), None
+            )
+            if active is None:
+                self._ui.info("No private persona version is active.")
+                return
+            ancestor_ids: set[str] = set()
+            predecessor_id = active.predecessor_id
+            while predecessor_id is not None:
+                ancestor_ids.add(predecessor_id)
+                predecessor_id = by_id[predecessor_id].predecessor_id
+            earlier = tuple(
+                item for item in versions if item.version_id in ancestor_ids
+            )
+            if not earlier:
+                self._ui.info("No earlier private persona version is available.")
+                return
+            version_id = self._ui.choose(
+                "persona-private-rollback-target",
+                "Select an earlier version: ",
+                tuple(
+                    MenuOption(
+                        item.version_id,
+                        f"{item.display_name} {item.declared_version}",
+                    )
+                    for item in earlier
+                ),
+            )
+            selected = service.rollback_private(
+                version_id,
+                expected_revision=expected_revision,
+            )
+            self._ui.success(
+                f"Rolled back to {selected.name} ({selected.declared_version})."
+            )
             return
         chosen = self._ui.choose(
             f"persona-{action}-target",
@@ -2900,7 +2972,7 @@ def _inspect_personas(data_dir: Path) -> None:
     try:
         PersonaService(
             JsonFilePersonaRepository(data_dir / "personas.json")
-        ).active()
+        ).active_compiled()
     except (KeyError, LookupError, RuntimeError, ValueError) as error:
         raise OperationError(f"the persona configuration is invalid: {error}")
 

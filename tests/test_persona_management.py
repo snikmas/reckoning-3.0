@@ -11,6 +11,7 @@ from reckoning.personas import (
     PERSONA_AXES,
     InMemoryPersonaRepository,
     JsonFilePersonaRepository,
+    PersonaVersion,
     PrivatePersonaImport,
     PersonaService,
     blank_persona_template,
@@ -159,3 +160,46 @@ def test_failed_private_activation_keeps_previous_persona_and_file(
 
     assert path.read_bytes() == original
     assert PersonaService(JsonFilePersonaRepository(path)).active_compiled().persona_id == "steady"
+
+
+def test_private_rollback_failure_preserves_history_and_active_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "personas.json"
+
+    def version(label: str, guidance: str, hour: int) -> PersonaVersion:
+        sources = []
+        for index, content in enumerate((guidance, "identity", "expression")):
+            source = tmp_path / f"{label}-{index}.md"
+            source.write_text(content, encoding="utf-8")
+            sources.append(source)
+        return import_private_persona(
+            PrivatePersonaImport(
+                private_guidance_path=sources[0],
+                stable_identity_path=sources[1],
+                expression_persona_path=sources[2],
+                private_identifier="private-simon",
+                display_name=f"Simon {label}",
+                declared_version=label,
+            ),
+            imported_at=datetime(2026, 9, 24, hour, tzinfo=UTC),
+        )
+
+    first = version("1.0.0", "first guidance", 8)
+    second = version("2.0.0", "second guidance", 9)
+    service = PersonaService(JsonFilePersonaRepository(path))
+    service.import_and_select_private(first)
+    service.import_and_select_private(second)
+    before = path.read_bytes()
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated rollback persistence failure")
+
+    monkeypatch.setattr("reckoning.personas.atomic_write_json", fail_write)
+    with pytest.raises(OSError, match="rollback persistence failure"):
+        service.rollback_private(first.version_id)
+
+    assert path.read_bytes() == before
+    reopened = PersonaService(JsonFilePersonaRepository(path))
+    assert reopened.active_compiled().version_id == second.version_id
+    assert len(reopened.list_private_versions()) == 2

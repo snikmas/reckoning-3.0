@@ -26,9 +26,13 @@ from reckoning.personas import (
     PRIVATE_PERSONA_ROLE_LIMIT_BYTES,
     InMemoryPersonaRepository,
     JsonFilePersonaRepository,
+    PersonaBundle,
     PersonaDefinition,
+    PersonaSelectionConflict,
+    PersonaVersion,
     PrivatePersonaImport,
     PersonaService,
+    canonical_private_bundle_bytes,
     import_private_persona,
 )
 
@@ -158,8 +162,9 @@ def test_persisted_persona_file_contains_style_not_protected_product_rules(
         "active_persona_id",
         "private_versions",
         "active_private_selection",
+        "active_selection_revision",
     }
-    assert stored["schema_version"] == 2
+    assert stored["schema_version"] == 3
     stored_text = json.dumps(stored).casefold()
     for protected_control in (
         "truth",
@@ -421,6 +426,84 @@ def test_private_bundle_is_copied_activated_and_reopened_without_source_paths(
     assert stored_data["active_private_selection"]["version_id"] == version.version_id
 
 
+def test_private_bundle_fingerprint_bytes_preserve_role_boundaries() -> None:
+    first = PersonaBundle("alpha", "beta", "gamma")
+    reassigned = PersonaBundle("beta", "alpha", "gamma")
+
+    assert canonical_private_bundle_bytes(first) != canonical_private_bundle_bytes(
+        reassigned
+    )
+
+
+def test_private_reimport_versions_history_and_rollback_are_revision_aware(
+    tmp_path: Path,
+) -> None:
+    def imported(
+        declared_version: str, guidance: str, imported_at: datetime
+    ) -> PersonaVersion:
+        paths = []
+        for index, content in enumerate((guidance, "Fictional identity.", "Plain voice.")):
+            path = tmp_path / f"{declared_version}-{index}.md"
+            path.write_text(content, encoding="utf-8")
+            paths.append(path)
+        return import_private_persona(
+            PrivatePersonaImport(
+                private_guidance_path=paths[0],
+                stable_identity_path=paths[1],
+                expression_persona_path=paths[2],
+                private_identifier="private-simon",
+                display_name="Simon",
+                declared_version=declared_version,
+            ),
+            imported_at=imported_at,
+        )
+
+    path = tmp_path / "personas.json"
+    first_service = PersonaService(JsonFilePersonaRepository(path))
+    stale_service = PersonaService(JsonFilePersonaRepository(path))
+    first_version = imported(
+        "1.0.0", "Ask for evidence.", datetime(2026, 9, 23, 8, tzinfo=UTC)
+    )
+    unchanged = imported(
+        "1.0.1", "Ask for evidence.", datetime(2026, 9, 23, 9, tzinfo=UTC)
+    )
+    changed = imported(
+        "2.0.0", "Ask for evidence, then test it.", datetime(2026, 9, 23, 10, tzinfo=UTC)
+    )
+
+    selected_first = first_service.import_and_select_private(first_version)
+    selected_unchanged = first_service.import_and_select_private(unchanged)
+    selected_changed = first_service.import_and_select_private(changed)
+
+    assert selected_unchanged.version_id == selected_first.version_id
+    assert selected_changed.version_id != selected_first.version_id
+    versions = first_service.list_private_versions()
+    assert len(versions) == 2
+    assert versions[0].predecessor_id is None
+    assert versions[1].predecessor_id == versions[0].version_id
+    assert [item.status for item in versions] == ["historical", "active"]
+    assert not hasattr(versions[0], "bundle")
+
+    with pytest.raises(PersonaSelectionConflict):
+        stale_service.import_and_select_private(changed)
+    assert len(PersonaService(JsonFilePersonaRepository(path)).list_private_versions()) == 2
+
+    revision = first_service.selection_revision()
+    rolled_back = first_service.rollback_private(
+        versions[0].version_id,
+        selected_at=datetime(2026, 9, 23, 11, tzinfo=UTC),
+        expected_revision=revision,
+    )
+    reopened = PersonaService(JsonFilePersonaRepository(path))
+    assert rolled_back.version_id == versions[0].version_id
+    assert reopened.active_compiled().version_id == versions[0].version_id
+    assert len(reopened.list_private_versions()) == 2
+    assert [item.status for item in reopened.list_private_versions()] == [
+        "active",
+        "historical",
+    ]
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -518,6 +601,23 @@ def test_private_bundle_installs_atomically_and_runtime_compiles_stored_copy(
     data_dir = tmp_path / "installation"
 
     setup_instance(data_dir, "local", version)
+    guidance.write_text("Keep changed guidance abstract.", encoding="utf-8")
+    changed = import_private_persona(
+        PrivatePersonaImport(
+            private_guidance_path=guidance,
+            stable_identity_path=identity,
+            expression_persona_path=expression,
+            private_identifier="private-simon",
+            display_name="Simon changed",
+            declared_version="2.0.0",
+        ),
+        imported_at=datetime(2026, 9, 23, 10, 0, tzinfo=UTC),
+    )
+    service = PersonaService(
+        JsonFilePersonaRepository(data_dir / "personas.json")
+    )
+    service.import_and_select_private(changed)
+    service.rollback_private(version.version_id)
     guidance.unlink()
     identity.unlink()
     expression.unlink()
@@ -577,6 +677,7 @@ def test_private_bundle_installs_atomically_and_runtime_compiles_stored_copy(
 
     assert web_model.requests[0].provider_conversation.messages[2].content == active.instructions
     assert terminal_model.requests[0].provider_conversation.messages[2].content == active.instructions
+    assert len(service.list_private_versions()) == 2
 
 
 def test_private_bundle_conflicts_and_tampering_do_not_change_active_persona(

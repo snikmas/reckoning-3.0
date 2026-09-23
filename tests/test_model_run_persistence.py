@@ -26,6 +26,7 @@ from reckoning.operations import (
     restore_transfer,
     setup_instance,
 )
+from reckoning.personas import PrivatePersonaImport, import_private_persona
 
 PASSPHRASE = "test-passphrase-for-receipts"
 
@@ -83,6 +84,52 @@ def test_independent_applications_preserve_each_model_run(tmp_path: Path) -> Non
     assert [run.provider for run in runs] == ["fake", "fake"]
     assert [run.usage_status for run in runs] == ["not-billable", "not-billable"]
     assert len(first.inspect_model_runs()) == 2
+
+
+def test_model_run_records_exact_private_persona_version_without_content(
+    tmp_path: Path,
+) -> None:
+    sources = tmp_path / "fictional-sources"
+    sources.mkdir()
+    paths = []
+    contents = (
+        "Ask for concrete fictional evidence.",
+        "Use the stable fictional identity Simon.",
+        "Write in a plain fictional voice.",
+    )
+    for index, content in enumerate(contents):
+        path = sources / f"role-{index}.md"
+        path.write_text(content, encoding="utf-8")
+        paths.append(path)
+    version = import_private_persona(
+        PrivatePersonaImport(
+            private_guidance_path=paths[0],
+            stable_identity_path=paths[1],
+            expression_persona_path=paths[2],
+            private_identifier="private-simon",
+            display_name="Simon",
+            declared_version="2.0.0",
+        ),
+        imported_at=datetime(2026, 9, 24, 8, tzinfo=UTC),
+    )
+    data_dir = tmp_path / "installation"
+    setup_instance(data_dir, "local", version)
+    runtime = load_installation_runtime(data_dir)
+    application = create_local_application(
+        runtime.state_path("confirmed-state", "continuity.json"),
+        persona=runtime.persona,
+        placement=runtime.application_placement,
+    )
+
+    application.send_message("Use the selected fictional persona.")
+    run = application.inspect_model_runs()[0]
+
+    assert run.private_persona_identifier == "private-simon"
+    assert run.private_persona_version_id == version.version_id
+    assert run.private_persona_declared_version == "2.0.0"
+    evidence = repr(run)
+    for private_content in contents:
+        assert private_content not in evidence
 
 
 def test_budgeting_evidence_persists_with_the_model_run(tmp_path: Path) -> None:
@@ -252,6 +299,9 @@ def test_existing_receipts_migrate_once_without_losing_fields(tmp_path: Path) ->
             "output_policy_decision": None,
             "danger_decision": None,
             "history_selection": None,
+            "private_persona_identifier": None,
+            "private_persona_version_id": None,
+            "private_persona_declared_version": None,
         },
         {
             "id": "run-failed",
@@ -270,6 +320,9 @@ def test_existing_receipts_migrate_once_without_losing_fields(tmp_path: Path) ->
             "output_policy_decision": None,
             "danger_decision": None,
             "history_selection": None,
+            "private_persona_identifier": None,
+            "private_persona_version_id": None,
+            "private_persona_declared_version": None,
         },
     ]
     assert (source / ROOT_DATABASE_FILENAME).is_file()

@@ -21,7 +21,13 @@ from reckoning.operations import (
     setup_instance,
 )
 from reckoning.personal_context import JsonFilePersonalContextRepository
-from reckoning.personas import PersonaDefinition, PersonaVersion, compile_persona
+from reckoning.personas import (
+    JsonFilePersonaRepository,
+    PersonaDefinition,
+    PersonaService,
+    PersonaVersion,
+    compile_persona,
+)
 from reckoning.processing import (
     PROCESSING_CATEGORIES,
     JsonFileProcessingGrantRepository,
@@ -1299,6 +1305,97 @@ def test_section_editing_changes_the_persona_without_rerunning_setup(
     personas = json.loads((tmp_path / "data" / "personas.json").read_text())
     assert personas["active_persona_id"] == "steady"
     assert "Active persona: Steady" in "\n".join(ui.lines)
+
+
+def test_setup_management_imports_lists_and_rolls_back_private_versions(
+    tmp_path: Path,
+) -> None:
+    guidance = tmp_path / "fictional-guidance.md"
+    identity = tmp_path / "fictional-identity.md"
+    expression = tmp_path / "fictional-expression.md"
+    guidance.write_text("Earlier fictional guidance.", encoding="utf-8")
+    identity.write_text("Stable fictional identity.", encoding="utf-8")
+    expression.write_text("Plain fictional expression.", encoding="utf-8")
+    initial_answers = [
+        ("provider", "fake"),
+        ("connectors", "skip"),
+        ("persona", "private-import"),
+        ("persona-private-id", "private-simon"),
+        ("persona-private-name", "Simon Earlier"),
+        ("persona-private-version", "1.0.0"),
+        ("persona-private-guidance-path", str(guidance)),
+        ("persona-stable-identity-path", str(identity)),
+        ("persona-expression-path", str(expression)),
+        ("persona-private-accept", "y"),
+        ("profile", "skip"),
+        ("review-action", "continue"),
+        ("first-message", "Use the earlier persona."),
+        ("first-message-action", "accept"),
+    ]
+    run_workflow(tmp_path, initial_answers)
+    persona_path = tmp_path / "data" / "personas.json"
+    first = PersonaService(
+        JsonFilePersonaRepository(persona_path)
+    ).list_private_versions()[0]
+
+    guidance.write_text("Later fictional guidance.", encoding="utf-8")
+    _, import_ui = run_workflow(
+        tmp_path,
+        [
+            ("status-action", "edit"),
+            ("edit-section", "persona"),
+            ("persona-manage", "private-import"),
+            ("persona-private-id", "private-simon"),
+            ("persona-private-name", "Simon Later"),
+            ("persona-private-version", "2.0.0"),
+            ("persona-private-guidance-path", str(guidance)),
+            ("persona-stable-identity-path", str(identity)),
+            ("persona-expression-path", str(expression)),
+            ("persona-private-accept", "y"),
+            ("status-action", "exit"),
+        ],
+    )
+    assert "Active private persona: Simon Later (2.0.0)." in "\n".join(
+        import_ui.lines
+    )
+
+    _, list_ui = run_workflow(
+        tmp_path,
+        [
+            ("status-action", "edit"),
+            ("edit-section", "persona"),
+            ("persona-manage", "private-versions"),
+            ("status-action", "exit"),
+        ],
+    )
+    listed = "\n".join(list_ui.lines)
+    assert "status: historical" in listed
+    assert "status: active" in listed
+    assert "Earlier fictional guidance." not in listed
+    assert "Later fictional guidance." not in listed
+
+    _, rollback_ui = run_workflow(
+        tmp_path,
+        [
+            ("status-action", "edit"),
+            ("edit-section", "persona"),
+            ("persona-manage", "private-rollback"),
+            ("persona-private-rollback-target", first.version_id),
+            ("status-action", "exit"),
+        ],
+    )
+    restarted = load_installation_runtime(tmp_path / "data")
+    rendered = "\n".join(rollback_ui.lines)
+
+    assert "Rolled back to Simon Earlier (1.0.0)." in rendered
+    assert "Agent style: Simon Earlier" in rendered
+    assert restarted.persona.name == "Simon Earlier"
+    assert "Earlier fictional guidance." in restarted.persona.instructions
+    assert len(
+        PersonaService(
+            JsonFilePersonaRepository(persona_path)
+        ).list_private_versions()
+    ) == 2
 
 
 def test_status_view_reports_a_running_gateway(tmp_path: Path) -> None:

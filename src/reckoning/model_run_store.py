@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from reckoning.application import ModelRunRecord, ModelRunUsageStatus
 
 
-MODEL_RUN_SCHEMA_VERSION = "3"
+MODEL_RUN_SCHEMA_VERSION = "4"
 
 
 def _load_output_policy_decision(
@@ -118,8 +118,11 @@ class SQLiteModelRunRepository:
                     danger_kind,
                     danger_response_kind,
                     danger_reason_code,
-                    budgeting_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    budgeting_json,
+                    private_persona_identifier,
+                    private_persona_version_id,
+                    private_persona_declared_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.id,
@@ -142,6 +145,9 @@ class SQLiteModelRunRepository:
                     danger.response_kind if danger is not None else None,
                     danger.reason_code if danger is not None else None,
                     _budgeting_to_json(run.history_selection),
+                    run.private_persona_identifier,
+                    run.private_persona_version_id,
+                    run.private_persona_declared_version,
                 ),
             )
 
@@ -171,7 +177,10 @@ class SQLiteModelRunRepository:
                     danger_kind,
                     danger_response_kind,
                     danger_reason_code,
-                    budgeting_json
+                    budgeting_json,
+                    private_persona_identifier,
+                    private_persona_version_id,
+                    private_persona_declared_version
                 FROM model_runs
                 ORDER BY sequence
                 """
@@ -198,6 +207,15 @@ class SQLiteModelRunRepository:
                     row[16], row[17], row[18]
                 ),
                 history_selection=_budgeting_from_json(row[19]),
+                private_persona_identifier=(
+                    str(row[20]) if row[20] is not None else None
+                ),
+                private_persona_version_id=(
+                    str(row[21]) if row[21] is not None else None
+                ),
+                private_persona_declared_version=(
+                    str(row[22]) if row[22] is not None else None
+                ),
             )
             for row in rows
         )
@@ -235,13 +253,22 @@ class SQLiteModelRunRepository:
                     )
                 _create_schema(connection)
                 current_version = metadata(connection, "model_runs_schema_version")
-                if current_version not in (None, MODEL_RUN_SCHEMA_VERSION):
+                if current_version not in (
+                    None,
+                    "1",
+                    "2",
+                    "3",
+                    MODEL_RUN_SCHEMA_VERSION,
+                ):
                     raise RuntimeError("Unsupported model-run storage schema.")
                 if current_version == "1":
                     _migrate_v1_to_v2(connection)
                     current_version = "2"
                 if current_version == "2":
                     _migrate_v2_to_v3(connection)
+                    current_version = "3"
+                if current_version == "3":
+                    _migrate_v3_to_v4(connection)
                 if current_version is None:
                     existing = int(
                         connection.execute(
@@ -363,6 +390,16 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     connection.execute(
         "ALTER TABLE model_runs ADD COLUMN budgeting_json TEXT"
     )
+    set_metadata(connection, "model_runs_schema_version", "3")
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    for column in (
+        "private_persona_identifier",
+        "private_persona_version_id",
+        "private_persona_declared_version",
+    ):
+        connection.execute(f"ALTER TABLE model_runs ADD COLUMN {column} TEXT")
     set_metadata(connection, "model_runs_schema_version", MODEL_RUN_SCHEMA_VERSION)
 
 
@@ -393,7 +430,10 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             danger_kind TEXT,
             danger_response_kind TEXT,
             danger_reason_code TEXT,
-            budgeting_json TEXT
+            budgeting_json TEXT,
+            private_persona_identifier TEXT,
+            private_persona_version_id TEXT,
+            private_persona_declared_version TEXT
         )
         """
     )
@@ -481,6 +521,16 @@ def _validate_records(runs: tuple[ModelRunRecord, ...]) -> None:
         for run in runs
     ):
         raise ValueError("Legacy model-run fields are invalid.")
+    for run in runs:
+        evidence = (
+            run.private_persona_identifier,
+            run.private_persona_version_id,
+            run.private_persona_declared_version,
+        )
+        if any(value is not None for value in evidence) != all(
+            isinstance(value, str) and bool(value) for value in evidence
+        ):
+            raise ValueError("Model-run private persona evidence is incomplete.")
 
 
 def _preserve_legacy_rollback(path: Path, data: dict[str, Any]) -> None:
@@ -556,8 +606,10 @@ def _insert_run(connection: sqlite3.Connection, run: ModelRunRecord) -> None:
             id, requested_at, status, provider, model, model_calls, latency_ms,
             retries, input_tokens, output_tokens, billable_units, usage_status, failure,
             output_policy_action, output_policy_reason_code, output_policy_delivered_speech,
-            danger_kind, danger_response_kind, danger_reason_code, budgeting_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            danger_kind, danger_response_kind, danger_reason_code, budgeting_json,
+            private_persona_identifier, private_persona_version_id,
+            private_persona_declared_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run.id,
@@ -580,6 +632,9 @@ def _insert_run(connection: sqlite3.Connection, run: ModelRunRecord) -> None:
             danger.response_kind if danger is not None else None,
             danger.reason_code if danger is not None else None,
             _budgeting_to_json(run.history_selection),
+            run.private_persona_identifier,
+            run.private_persona_version_id,
+            run.private_persona_declared_version,
         ),
     )
 
