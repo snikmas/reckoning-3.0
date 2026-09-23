@@ -26,6 +26,7 @@ from reckoning.continuity import (
     WhyView,
 )
 from reckoning.conversation import (
+    PRODUCT_IDENTITY,
     PROTECTED_PRODUCT_CONTRACT,
     ChannelCapabilities,
     ComposerInput,
@@ -394,13 +395,11 @@ class ReckoningApplication:
                 "a grant for: " + ", ".join(processing.blocked_categories) + "."
             )
         allowed = set(processing.allowed_categories)
-        if "personal-context" in allowed:
-            profile_context, profile_missing = self._personal_context_for_message(
-                user_message, requested_at
-            )
-        else:
-            profile_context = ()
-            profile_missing = False
+        profile_context = (
+            self._personal_context_for_message(user_message, requested_at)
+            if "personal-context" in allowed
+            else ()
+        )
         if "recent-channel-history" not in allowed:
             recent_history = ()
         if supplied_context_category not in allowed:
@@ -469,8 +468,6 @@ class ReckoningApplication:
         speech = output_policy.delivered_speech
 
         notices: list[str] = []
-        if profile_missing:
-            notices.append("Limited context: no user profile is available.")
         if processing.unavailable_categories:
             notices.append(
                 "Limited context: unavailable processing categories: "
@@ -1027,11 +1024,7 @@ class ReckoningApplication:
         return compose_provider_conversation(
             ComposerInput(
                 protected_contract=PROTECTED_PRODUCT_CONTRACT,
-                product_identity=(
-                    "Reckoning is one accountable personal agent. The selected persona "
-                    "is only its style expression and owns no memory, authority, or "
-                    "final answer."
-                ),
+                product_identity=PRODUCT_IDENTITY,
                 persona_expression=self._dependencies.persona.instructions,
                 current_request=user_message,
                 confirmed_records=confirmed_records,
@@ -1046,13 +1039,13 @@ class ReckoningApplication:
 
     def _personal_context_for_message(
         self, user_message: str, requested_at: datetime
-    ) -> tuple[tuple[str, ...], bool]:
+    ) -> tuple[str, ...]:
         context = self._dependencies.personal_context
         if context is None:
-            return (), False
+            return ()
         active = context.list_active()
         if not active:
-            return (), True
+            return ()
         query = RetrievalQuery(
             text=user_message,
             now=requested_at,
@@ -1063,7 +1056,7 @@ class ReckoningApplication:
         confirmed = tuple(
             self._render_personal_context(item) for item in context.retrieve(query)
         )
-        return confirmed, False
+        return confirmed
 
     @staticmethod
     def _render_personal_context(item: PersonalContextVersion) -> str:

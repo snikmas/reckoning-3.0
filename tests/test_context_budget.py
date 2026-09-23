@@ -343,7 +343,8 @@ def test_composer_required_instruction_ordering() -> None:
 
     roles = [message.role for message in conversation.messages]
     contents = [message.content for message in conversation.messages]
-    assert roles[:7] == [
+    assert roles[:8] == [
+        "system",
         "system",
         "system",
         "system",
@@ -356,8 +357,9 @@ def test_composer_required_instruction_ordering() -> None:
     assert contents[1] == "identity"
     assert contents[2] == "persona"
     assert "Do not return HTML" in contents[3]
-    assert "[CONFIRMED CONTEXT]" in contents[4]
-    assert contents[5] == "perm"
-    assert "[RETRIEVED CONTEXT]" in contents[6]
-    assert "tool" in contents[7]
+    assert "untrusted data" in contents[4].casefold()
+    assert "[CONFIRMED CONTEXT]" in contents[5]
+    assert contents[6] == "perm"
+    assert "[RETRIEVED CONTEXT]" in contents[7]
+    assert "tool" in contents[8]
     assert contents[-1] == "current"

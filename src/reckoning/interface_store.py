@@ -1227,6 +1227,7 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
         ORDER BY channel, session_id, position
         """
     ).fetchall()
+    _validate_legacy_turn_order(messages)
     turns: dict[tuple[str, str, int], dict[str, object]] = {}
     for channel, session_id, position, role, content in messages:
         key = (channel, session_id, position // 2)
@@ -1287,7 +1288,21 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
                     turn_session_id,
                     turn_position * 2 + 1,
                 ),
-)
+                )
+
+
+def _validate_legacy_turn_order(messages: list[tuple[Any, ...]]) -> None:
+    expected_positions: dict[tuple[str, str], int] = {}
+    for channel, session_id, position, role, _content in messages:
+        session = (str(channel), str(session_id))
+        expected_position = expected_positions.get(session, 0)
+        expected_role = "user" if expected_position % 2 == 0 else "assistant"
+        if int(position) != expected_position or role != expected_role:
+            raise RuntimeError(
+                "Malformed legacy interface turn order for "
+                f"{session[0]}:{session[1] or '<default>'}."
+            )
+        expected_positions[session] = expected_position + 1
 
 
 def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:

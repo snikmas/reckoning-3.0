@@ -71,6 +71,12 @@ class FixedResponder:
         )
 
 
+class PostSaveFailingRepository(InMemoryInterfaceRepository):
+    def complete_turn(self, *args: object, **kwargs: object):
+        super().complete_turn(*args, **kwargs)  # type: ignore[arg-type]
+        raise RuntimeError("response delivery failed after durable completion")
+
+
 def test_user_speech_is_reserved_before_provider_work() -> None:
     repository = InMemoryInterfaceRepository()
     interface = ReckoningInterfaceApplication(
@@ -110,6 +116,72 @@ def test_completed_turn_stores_notices_and_context_status() -> None:
     assert turns[0].notices == ("Limited context: unavailable category.",)
     assert turns[0].context_status is not None
     assert turns[0].context_status.unavailable == ("personal-context",)
+
+
+def test_post_save_failure_remains_a_completed_inspectable_turn() -> None:
+    repository = PostSaveFailingRepository()
+    interface = ReckoningInterfaceApplication(
+        repository=repository,
+        responder=FixedResponder("durable reply"),
+        placement=_local_policy(),
+    )
+
+    with pytest.raises(RuntimeError, match="after durable completion"):
+        interface.send_channel_message("web", "kept input")
+
+    turn = repository.list_turns("web")[0]
+    assert turn.state == "completed"
+    assert turn.user_speech == "kept input"
+    assert turn.assistant_speech == "durable reply"
+    assert repository.load().sessions[0].messages == (
+        ChannelMessage("user", "kept input"),
+        ChannelMessage("assistant", "durable reply"),
+    )
+
+
+def test_independent_sqlite_writers_preserve_turns_and_keep_notices_out_of_speech(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "interfaces.json"
+    first = SQLiteInterfaceRepository(path)
+    session = first.create_session("web", None, "user-created", _FixedTurnClock(
+        datetime(2026, 9, 20, 10, 0, 0, tzinfo=timezone.utc)
+    ).now())
+    second = SQLiteInterfaceRepository(path)
+
+    first.reserve_turn(
+        "web", session.session_id, "first input", "turn-1", expected_revision=1
+    )
+    first.complete_turn(
+        "web",
+        session.session_id,
+        "turn-1",
+        "first reply",
+        notices=("Limited context: unavailable category.",),
+    )
+    second.reserve_turn(
+        "web", session.session_id, "second input", "turn-2", expected_revision=2
+    )
+    second.complete_turn(
+        "web", session.session_id, "turn-2", "second reply"
+    )
+
+    reopened = SQLiteInterfaceRepository(path)
+    assert reopened.list_sessions("web")[0].messages == (
+        ChannelMessage("user", "first input"),
+        ChannelMessage("assistant", "first reply"),
+        ChannelMessage("user", "second input"),
+        ChannelMessage("assistant", "second reply"),
+    )
+    turns = reopened.list_turns("web", session.session_id)
+    assert [turn.notices for turn in turns] == [
+        ("Limited context: unavailable category.",),
+        (),
+    ]
+    assert all(
+        "Limited context" not in message.content
+        for message in reopened.list_sessions("web")[0].messages
+    )
 
 
 def test_legacy_notice_prefix_split() -> None:
@@ -264,3 +336,71 @@ def test_sqlite_migration_splits_legacy_notice_prefix(tmp_path: Path) -> None:
     messages = reopened.load().sessions[0].messages
     assert messages[0] == ChannelMessage("user", "user text")
     assert messages[1] == ChannelMessage("assistant", "reply")
+
+
+def test_malformed_legacy_turn_order_fails_without_rewriting_state(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    legacy_path = tmp_path / "interfaces.json"
+    db_path = tmp_path / "reckoning.sqlite3"
+    connection = sqlite3.connect(str(db_path))
+    connection.execute(
+        "CREATE TABLE root_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE interface_sessions (
+            channel TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            PRIMARY KEY (channel, session_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE interface_session_messages (
+            channel TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            PRIMARY KEY (channel, session_id, position)
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO root_metadata (key, value) VALUES (?, ?)",
+        ("interfaces_schema_version", "1"),
+    )
+    connection.execute(
+        "INSERT INTO interface_sessions (channel, session_id, revision) VALUES (?, ?, ?)",
+        ("web", "", 1),
+    )
+    malformed = "Limited context: no user profile is available. orphan reply"
+    connection.execute(
+        """
+        INSERT INTO interface_session_messages (channel, session_id, position, role, content)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("web", "", 0, "assistant", malformed),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(RuntimeError, match="Malformed legacy interface turn order"):
+        SQLiteInterfaceRepository(legacy_path)
+
+    connection = sqlite3.connect(str(db_path))
+    assert connection.execute(
+        "SELECT value FROM root_metadata WHERE key = 'interfaces_schema_version'"
+    ).fetchone() == ("1",)
+    assert connection.execute(
+        "SELECT role, content FROM interface_session_messages"
+    ).fetchall() == [("assistant", malformed)]
+    assert connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'interface_turns'"
+    ).fetchone() is None
+    connection.close()

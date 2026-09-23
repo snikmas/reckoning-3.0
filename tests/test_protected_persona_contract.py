@@ -67,9 +67,11 @@ def test_protected_contract_outranks_every_application_prompt_layer() -> None:
         "system",
         "system",
         "system",
+        "system",
         "user",
         "user",
     ]
+    assert "untrusted data" in messages[4].content.casefold()
     assert response.speech == (
         "That request crosses a protected boundary. I can challenge your choice "
         "and reasoning, but not your worth or your relationships. You remain "

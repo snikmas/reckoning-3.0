@@ -486,7 +486,9 @@ class _ProviderSetupResponder:
 
     def respond(self, text: str) -> str:
         from reckoning.conversation import (
+            PRODUCT_IDENTITY,
             PROTECTED_PRODUCT_CONTRACT,
+            ChannelCapabilities,
             ComposerInput,
             compose_provider_conversation,
         )
@@ -495,12 +497,10 @@ class _ProviderSetupResponder:
         conversation, _history_selection = compose_provider_conversation(
             ComposerInput(
                 protected_contract=PROTECTED_PRODUCT_CONTRACT,
-                product_identity=(
-                    "Reckoning is one accountable personal agent. The selected "
-                    "persona is only its style expression."
-                ),
+                product_identity=PRODUCT_IDENTITY,
                 persona_expression=SelectedPersona(self._persona).prompt_instructions,
                 current_request=text.strip(),
+                channel_capabilities=ChannelCapabilities(),
             )
         )
         messages = tuple(

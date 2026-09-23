@@ -1537,9 +1537,12 @@ def test_keyless_local_provider_remains_active_in_the_installed_runtime(
         persona=runtime.persona,
         placement=runtime.application_placement,
     )
-    answer = application.send_message("Use the installed local provider.")
+    answer = application.send_message("First local message.")
     assert "Local runtime answer." in answer.speech
     assert calls[-1].full_url == "http://127.0.0.1:11434/v1/chat/completions"
+    setup_messages = json.loads(calls[1].data.decode("utf-8"))["messages"]
+    runtime_messages = json.loads(calls[-1].data.decode("utf-8"))["messages"]
+    assert runtime_messages == setup_messages
 
 
 def test_custom_provider_is_not_selectable_until_its_smoke_passes(
