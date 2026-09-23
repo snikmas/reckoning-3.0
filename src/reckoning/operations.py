@@ -44,6 +44,7 @@ from reckoning.personas import (
     JsonFilePersonaRepository,
     PersonaDefinition,
     PersonaService,
+    PersonaVersion,
 )
 from reckoning.processing import (
     JsonFileProcessingGrantRepository,
@@ -188,7 +189,7 @@ def load_installation_runtime(
     try:
         persona = PersonaService(
             JsonFilePersonaRepository(local_root / "personas.json")
-        ).active().to_application_settings()
+        ).active_compiled().to_application_settings()
     except (KeyError, LookupError, RuntimeError, ValueError) as error:
         raise OperationError("the selected persona configuration is invalid") from error
 
@@ -226,7 +227,7 @@ def load_installation_runtime(
 def setup_instance(
     data_dir: Path,
     placement: PlacementProfile,
-    persona: PersonaDefinition | None = None,
+    persona: PersonaDefinition | PersonaVersion | None = None,
     *,
     server_data_dir: Path | None = None,
     user_profile: Path | None = None,
@@ -241,7 +242,7 @@ def setup_instance(
         _require_empty_setup_root(server_root, "server data")
     defaults_by_id = {item.id: item for item in DEFAULT_PERSONAS}
     if (
-        persona is not None
+        isinstance(persona, PersonaDefinition)
         and persona.id in defaults_by_id
         and persona != defaults_by_id[persona.id]
     ):
@@ -338,7 +339,7 @@ def _write_staged_setup(
     local_staging: Path,
     server_staging: Path | None,
     placement: PlacementProfile,
-    selected_persona: PersonaDefinition,
+    selected_persona: PersonaDefinition | PersonaVersion,
     configuration: dict[str, Any],
     profile_entries: tuple[UserProfileEntry, ...],
     created_at: datetime,
@@ -366,7 +367,11 @@ def _write_staged_setup(
     persona_service = PersonaService(
         JsonFilePersonaRepository(local_staging / "personas.json")
     )
-    if selected_persona in DEFAULT_PERSONAS:
+    if isinstance(selected_persona, PersonaVersion):
+        persona_service.import_and_select_private(
+            selected_persona, selected_at=created_at
+        )
+    elif selected_persona in DEFAULT_PERSONAS:
         persona_service.select(selected_persona.id)
     else:
         persona_service.author_and_select(selected_persona)

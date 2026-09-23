@@ -104,31 +104,6 @@ class ConversationTurn:
 
 
 @dataclass(frozen=True)
-class PersonaBundle:
-    private_guidance: str
-    stable_identity: str
-    expression_persona: str
-
-
-@dataclass(frozen=True)
-class PersonaVersion:
-    version_id: str
-    display_name: str
-    private_identifier: str
-    declared_version: str
-    fingerprint: str
-    bundle: PersonaBundle
-    imported_at: datetime
-    predecessor_id: str | None = None
-
-
-@dataclass(frozen=True)
-class ActivePersonaSelection:
-    version_id: str
-    selected_at: datetime
-
-
-@dataclass(frozen=True)
 class ComposerInput:
     protected_contract: str
     product_identity: str

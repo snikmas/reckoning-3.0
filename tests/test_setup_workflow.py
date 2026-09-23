@@ -21,6 +21,7 @@ from reckoning.operations import (
     setup_instance,
 )
 from reckoning.personal_context import JsonFilePersonalContextRepository
+from reckoning.personas import PersonaDefinition, PersonaVersion, compile_persona
 from reckoning.processing import (
     PROCESSING_CATEGORIES,
     JsonFileProcessingGrantRepository,
@@ -354,6 +355,109 @@ def test_guided_setup_persists_the_accepted_first_conversation(
     contents = [(message.role, message.content) for message in sessions[0].messages]
     assert contents[0] == ("user", "I need to protect my mornings for study.")
     assert contents[1][0] == "assistant"
+
+
+def test_guided_setup_reviews_and_installs_private_persona_without_exposing_content(
+    tmp_path: Path,
+) -> None:
+    guidance = tmp_path / "fictional-guidance.md"
+    identity = tmp_path / "fictional-identity.md"
+    expression = tmp_path / "fictional-expression.md"
+    guidance.write_text("PRIVATE-GUIDANCE-MARKER", encoding="utf-8")
+    identity.write_text("PRIVATE-IDENTITY-MARKER", encoding="utf-8")
+    expression.write_text("PRIVATE-EXPRESSION-MARKER", encoding="utf-8")
+    captured: list[PersonaDefinition | PersonaVersion] = []
+
+    class CapturingResponder:
+        def __init__(self, persona: PersonaDefinition | PersonaVersion) -> None:
+            self.persona = persona
+
+        def respond(self, text: str) -> str:
+            captured.append(self.persona)
+            return f"Fictional response to {text}"
+
+    def responder_for(
+        persona: PersonaDefinition | PersonaVersion,
+        _provider_id: str,
+        _config: AdapterConfig,
+    ) -> CapturingResponder:
+        return CapturingResponder(persona)
+
+    answers = [
+        ("provider", "fake"),
+        ("connectors", "skip"),
+        ("persona", "private-import"),
+        ("persona-private-id", "private-simon"),
+        ("persona-private-name", "Simon"),
+        ("persona-private-version", "1.0.0"),
+        ("persona-private-guidance-path", str(guidance)),
+        ("persona-stable-identity-path", str(identity)),
+        ("persona-expression-path", str(expression)),
+        ("persona-private-accept", "y"),
+        ("profile", "skip"),
+        ("review-action", "continue"),
+        ("first-message", "Test the selected persona."),
+        ("first-message-action", "accept"),
+    ]
+
+    outcome, ui = run_workflow(
+        tmp_path,
+        answers,
+        services=offline_services(responder_for=responder_for),
+    )
+    runtime = load_installation_runtime(tmp_path / "data")
+    rendered = "\n".join(ui.lines)
+
+    assert outcome.status == "activated"
+    assert outcome.persona_id == "private-simon"
+    assert len(captured) == 1
+    assert isinstance(captured[0], PersonaVersion)
+    assert runtime.persona.instructions == compile_persona(captured[0]).instructions
+    assert "Private guidance: selected document" in rendered
+    assert "Stable assistant identity: selected document" in rendered
+    assert "Expression persona: selected document" in rendered
+    assert "Display name: Simon" in rendered
+    assert "Declared version: 1.0.0" in rendered
+    assert "Fingerprint:" in rendered
+    assert "Model destination: fake / deterministic-fake" in rendered
+    assert "PRIVATE-GUIDANCE-MARKER" not in rendered
+    assert "PRIVATE-IDENTITY-MARKER" not in rendered
+    assert "PRIVATE-EXPRESSION-MARKER" not in rendered
+    assert str(guidance) not in (tmp_path / "data" / "personas.json").read_text()
+
+
+def test_paused_private_persona_setup_keeps_sources_out_of_resumable_draft(
+    tmp_path: Path,
+) -> None:
+    files = []
+    for role in ("guidance", "identity", "expression"):
+        path = tmp_path / f"{role}.md"
+        path.write_text(f"private {role} marker", encoding="utf-8")
+        files.append(path)
+    answers = [
+        ("provider", "fake"),
+        ("connectors", "skip"),
+        ("persona", "private-import"),
+        ("persona-private-id", "private-simon"),
+        ("persona-private-name", "Simon"),
+        ("persona-private-version", "1.0.0"),
+        ("persona-private-guidance-path", str(files[0])),
+        ("persona-stable-identity-path", str(files[1])),
+        ("persona-expression-path", str(files[2])),
+        ("persona-private-accept", "y"),
+        ("profile", "__exit__"),
+    ]
+
+    outcome, _ui = run_workflow(tmp_path, answers)
+    draft = json.loads((tmp_path / "setup-draft.json").read_text(encoding="utf-8"))
+    serialized = json.dumps(draft)
+
+    assert outcome.status == "draft"
+    assert draft["persona_id"] is None
+    assert "persona" not in draft["completed"]
+    assert "private guidance marker" not in serialized
+    for path in files:
+        assert str(path) not in serialized
 
 
 def test_installed_state_survives_a_fresh_application_load(tmp_path: Path) -> None:
@@ -1543,6 +1647,83 @@ def test_keyless_local_provider_remains_active_in_the_installed_runtime(
     setup_messages = json.loads(calls[1].data.decode("utf-8"))["messages"]
     runtime_messages = json.loads(calls[-1].data.decode("utf-8"))["messages"]
     assert runtime_messages == setup_messages
+
+
+def test_private_persona_setup_preview_matches_installed_local_runtime(
+    tmp_path: Path,
+) -> None:
+    from reckoning.application import create_local_application
+    from reckoning.config import RuntimeProviderSettings
+
+    source_paths = []
+    for index, content in enumerate(
+        ("Private guidance.", "Stable identity.", "Expression persona.")
+    ):
+        path = tmp_path / f"selected-{index}.md"
+        path.write_text(content, encoding="utf-8")
+        source_paths.append(path)
+    transport, calls = chat_transport("Local private answer.")
+    services = offline_services(
+        probe=lambda url: url.endswith(":11434"),
+        transport=transport,
+    )
+    outcome, _ = run_workflow(
+        tmp_path,
+        [
+            ("provider", "ollama"),
+            ("provider-model", "manual"),
+            ("provider-model-manual", "qwen3"),
+            ("provider-verify-consent", "y"),
+            ("persona-live-sample", "n"),
+            ("connectors", "skip"),
+            ("persona", "private-import"),
+            ("persona-private-id", "private-simon"),
+            ("persona-private-name", "Simon"),
+            ("persona-private-version", "1.0.0"),
+            ("persona-private-guidance-path", str(source_paths[0])),
+            ("persona-stable-identity-path", str(source_paths[1])),
+            ("persona-expression-path", str(source_paths[2])),
+            ("persona-private-accept", "y"),
+            ("profile", "skip"),
+            ("review-action", "continue"),
+            ("first-message", "Same private request."),
+            ("first-message-action", "accept"),
+        ],
+        services=services,
+    )
+    assert outcome.persona_id == "private-simon"
+    for path in source_paths:
+        path.unlink()
+
+    settings = RuntimeProviderSettings.load(
+        tmp_path / "data",
+        credentials_path=tmp_path / "provider.json",
+        environ={},
+    )
+    runtime = load_installation_runtime(tmp_path / "data")
+    application = create_local_application(
+        runtime.state_path("confirmed-state", "continuity.json"),
+        personal_context_path=runtime.state_path(
+            "personal-context", "personal-context.json"
+        ),
+        provider_name=settings.provider_name,
+        provider_config=AdapterConfig(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            model=settings.model,
+        ),
+        provider_transport=transport,
+        persona=runtime.persona,
+        placement=runtime.application_placement,
+    )
+    application.send_message("Same private request.")
+
+    setup_messages = json.loads(calls[1].data.decode("utf-8"))["messages"]
+    runtime_messages = json.loads(calls[-1].data.decode("utf-8"))["messages"]
+    assert runtime_messages == setup_messages
+    assert "Private guidance." in runtime_messages[2]["content"]
+    assert "Stable identity." in runtime_messages[2]["content"]
+    assert "Expression persona." in runtime_messages[2]["content"]
 
 
 def test_custom_provider_is_not_selectable_until_its_smoke_passes(

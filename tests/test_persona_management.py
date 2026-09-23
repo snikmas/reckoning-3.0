@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -10,9 +11,11 @@ from reckoning.personas import (
     PERSONA_AXES,
     InMemoryPersonaRepository,
     JsonFilePersonaRepository,
+    PrivatePersonaImport,
     PersonaService,
     blank_persona_template,
     describe_persona,
+    import_private_persona,
     persona_from_preset,
 )
 
@@ -121,3 +124,38 @@ def test_the_autonomy_floor_is_listed_separately_from_persona_axes() -> None:
     assert "final decision" in rendered
     axis_fields = {axis.field for axis in PERSONA_AXES}
     assert "autonomy" not in axis_fields
+
+
+def test_failed_private_activation_keeps_previous_persona_and_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "personas.json"
+    service = PersonaService(JsonFilePersonaRepository(path))
+    service.select("steady")
+    original = path.read_bytes()
+    source_paths = []
+    for index, content in enumerate(("guidance", "identity", "expression")):
+        source = tmp_path / f"source-{index}.md"
+        source.write_text(content, encoding="utf-8")
+        source_paths.append(source)
+    version = import_private_persona(
+        PrivatePersonaImport(
+            private_guidance_path=source_paths[0],
+            stable_identity_path=source_paths[1],
+            expression_persona_path=source_paths[2],
+            private_identifier="private-simon",
+            display_name="Simon",
+            declared_version="1.0.0",
+        ),
+        imported_at=datetime(2026, 9, 23, tzinfo=UTC),
+    )
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated persistence failure")
+
+    monkeypatch.setattr("reckoning.personas.atomic_write_json", fail_write)
+    with pytest.raises(OSError, match="simulated persistence failure"):
+        service.import_and_select_private(version)
+
+    assert path.read_bytes() == original
+    assert PersonaService(JsonFilePersonaRepository(path)).active_compiled().persona_id == "steady"

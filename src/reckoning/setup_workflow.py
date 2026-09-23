@@ -11,7 +11,7 @@ import os
 import shutil
 import stat
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -42,9 +42,13 @@ from reckoning.personas import (
     PERSONA_AXES,
     JsonFilePersonaRepository,
     PersonaDefinition,
+    PersonaVersion,
+    PrivatePersonaImport,
     PersonaService,
     blank_persona_template,
+    compile_persona,
     describe_persona,
+    import_private_persona,
     persona_from_data,
     persona_from_preset,
 )
@@ -445,7 +449,7 @@ class SetupServices:
     telegram_pairing_code: str | None = None
     telegram_max_polls: int = 12
     responder_for: Callable[
-        [PersonaDefinition, str, AdapterConfig], SetupResponder
+        [PersonaDefinition | PersonaVersion, str, AdapterConfig], SetupResponder
     ] | None = None
 
     def api_factory(self) -> Callable[[str], TelegramBotClient]:
@@ -453,7 +457,7 @@ class SetupServices:
 
     def responder(
         self,
-        persona: PersonaDefinition,
+        persona: PersonaDefinition | PersonaVersion,
         provider_id: str,
         config: AdapterConfig,
     ) -> SetupResponder:
@@ -474,7 +478,7 @@ class _ProviderSetupResponder:
 
     def __init__(
         self,
-        persona: PersonaDefinition,
+        persona: PersonaDefinition | PersonaVersion,
         adapter: SetupProviderAdapter,
         config: AdapterConfig,
         transport: Transport,
@@ -492,13 +496,11 @@ class _ProviderSetupResponder:
             ComposerInput,
             compose_provider_conversation,
         )
-        from reckoning.personas import SelectedPersona
-
         conversation, _history_selection = compose_provider_conversation(
             ComposerInput(
                 protected_contract=PROTECTED_PRODUCT_CONTRACT,
                 product_identity=PRODUCT_IDENTITY,
-                persona_expression=SelectedPersona(self._persona).prompt_instructions,
+                persona_expression=compile_persona(self._persona).instructions,
                 current_request=text.strip(),
                 channel_capabilities=ChannelCapabilities(),
             )
@@ -516,7 +518,7 @@ class _ProviderSetupResponder:
 
 
 def default_setup_responder(
-    persona: PersonaDefinition,
+    persona: PersonaDefinition | PersonaVersion,
     provider_id: str,
     config: AdapterConfig,
     *,
@@ -640,6 +642,7 @@ class SetupWorkflow:
         self._accepted: tuple[str, str] | None = None
         self._pending_key: str | None = None
         self._pending_env_name: str | None = None
+        self._pending_private_persona: PersonaVersion | None = None
 
     # ------------------------------------------------------------------ entry
 
@@ -820,7 +823,18 @@ class SetupWorkflow:
             raise KeyError(f"Unknown setup step: {step}")
 
     def _save_draft(self) -> None:
-        self._draft.save(self._paths.draft_path)
+        draft = self._draft
+        if self._pending_private_persona is not None:
+            draft = replace(
+                draft,
+                persona_id=None,
+                completed=[
+                    step
+                    for step in draft.completed
+                    if step not in {"persona", "review", "first-conversation"}
+                ],
+            )
+        draft.save(self._paths.draft_path)
 
     # --------------------------------------------------------------- placement
 
@@ -866,16 +880,25 @@ class SetupWorkflow:
             if chosen in ("simon", "steady"):
                 self._draft.persona_id = chosen
                 self._draft.authored_persona = None
+                self._pending_private_persona = None
+                return
+            if chosen == "private-import":
+                self._import_private_persona()
                 return
             raise SetupInputError(
-                "preselected personas must be simon or steady; author "
-                "original personas interactively"
+                "preselected personas must be simon, steady, or private-import; "
+                "author original axis personas interactively"
             )
         while True:
             options = [
                 MenuOption("simon", PERSONA_PRESET_SIMON),
                 MenuOption("steady", PERSONA_PRESET_STEADY),
                 MenuOption("author", PERSONA_AUTHOR),
+                MenuOption(
+                    "private-import",
+                    "Import three private Desired-self documents",
+                    note="Private guidance, stable assistant identity, and expression persona.",
+                ),
             ]
             if self._draft.authored_persona is not None:
                 options.insert(
@@ -891,12 +914,17 @@ class SetupWorkflow:
             if choice in ("simon", "steady"):
                 self._draft.persona_id = choice
                 self._draft.authored_persona = None
+                self._pending_private_persona = None
             elif choice == "draft-authored":
                 authored = self._draft.authored_persona
                 assert authored is not None
                 self._draft.persona_id = str(authored["id"])
             elif choice == "author":
+                self._pending_private_persona = None
                 self._author_persona()
+            elif choice == "private-import":
+                self._import_private_persona()
+                return
             else:
                 raise SetupInputError(f"Unknown persona choice: {choice}")
             definition = self._persona_definition()
@@ -912,6 +940,69 @@ class SetupWorkflow:
                 default=True,
             ):
                 return
+
+    def _import_private_persona(self) -> None:
+        def selected_or_ask(key: str, prompt: str, *, default: str = "") -> str:
+            if key in self._preselected:
+                return self._preselected[key]
+            return self._ui.ask(key, prompt, default=default, allow_empty=False)
+
+        private_identifier = selected_or_ask(
+            "persona-private-id",
+            "Private persona identifier (lowercase slug): ",
+            default="private-simon",
+        ).strip()
+        display_name = selected_or_ask(
+            "persona-private-name", "Private persona display name: ", default="Simon"
+        ).strip()
+        declared_version = selected_or_ask(
+            "persona-private-version", "Declared version: ", default="1.0.0"
+        ).strip()
+        request = PrivatePersonaImport(
+            private_guidance_path=Path(
+                selected_or_ask(
+                    "persona-private-guidance-path", "Private guidance file: "
+                )
+            ),
+            stable_identity_path=Path(
+                selected_or_ask(
+                    "persona-stable-identity-path",
+                    "Stable assistant identity file: ",
+                )
+            ),
+            expression_persona_path=Path(
+                selected_or_ask(
+                    "persona-expression-path", "Expression persona file: "
+                )
+            ),
+            private_identifier=private_identifier,
+            display_name=display_name,
+            declared_version=declared_version,
+        )
+        try:
+            version = import_private_persona(request)
+        except ValueError as error:
+            raise SetupInputError(str(error)) from error
+        self._ui.info("Private persona review")
+        self._ui.info(f"Display name: {version.display_name}")
+        self._ui.info(f"Private identifier: {version.private_identifier}")
+        self._ui.info(f"Declared version: {version.declared_version}")
+        self._ui.info(f"Fingerprint: {version.fingerprint}")
+        self._ui.info("Private guidance: selected document")
+        self._ui.info("Stable assistant identity: selected document")
+        self._ui.info("Expression persona: selected document")
+        provider_id = self._draft.provider_id or "fake"
+        model = self._draft.provider_model or "deterministic-fake"
+        self._ui.info(f"Model destination: {provider_id} / {model}")
+        if not self._ui.confirm(
+            "persona-private-accept",
+            f"Import and activate {version.display_name}?",
+            default=False,
+        ):
+            raise SetupBack
+        self._pending_private_persona = version
+        self._draft.persona_id = version.private_identifier
+        self._draft.authored_persona = None
 
     def _author_persona(self) -> None:
         name = self._ui.ask(
@@ -975,6 +1066,11 @@ class SetupWorkflow:
             return persona_from_data(authored)
         persona_id = self._draft.persona_id or "simon"
         return next(item for item in DEFAULT_PERSONAS if item.id == persona_id)
+
+    def _selected_persona(self) -> PersonaDefinition | PersonaVersion:
+        if self._pending_private_persona is not None:
+            return self._pending_private_persona
+        return self._persona_definition()
 
     # ---------------------------------------------------------------- provider
 
@@ -1114,7 +1210,7 @@ class SetupWorkflow:
             default=False,
         ):
             return
-        persona = self._persona_definition()
+        persona = self._selected_persona()
         responder = self._services.responder(persona, definition.id, config)
         try:
             sample = responder.respond(
@@ -1693,7 +1789,7 @@ class SetupWorkflow:
                 "first-message", "Your first message: ", allow_empty=False
             )
             responder = self._services.responder(
-                self._persona_definition(),
+                self._selected_persona(),
                 self._draft.provider_id or "fake",
                 self._current_adapter_config(),
             )
@@ -1772,7 +1868,7 @@ class SetupWorkflow:
     def _step_review(self) -> None:
         while True:
             definition = find_provider(self._draft.provider_id or "fake")
-            persona = self._persona_definition()
+            persona = self._selected_persona()
             storage = self._draft.placement or "local"
             about_you = (
                 f"{self._draft.profile_proposal_count} unconfirmed proposals"
@@ -1838,7 +1934,7 @@ class SetupWorkflow:
     def _activate(self) -> SetupOutcome:
         provider_id = self._draft.provider_id or "fake"
         definition = find_provider(provider_id)
-        persona = self._persona_definition()
+        persona = self._selected_persona()
         demo = self._draft.provider_demo
         model_name = (
             self._draft.provider_model
@@ -2166,11 +2262,9 @@ class SetupWorkflow:
         try:
             persona = PersonaService(
                 JsonFilePersonaRepository(self._paths.data_dir / "personas.json")
-            ).active()
+            ).active_compiled()
             sections.append(
-                SectionStatus(
-                    "persona", STATUS_LABEL_STYLE, True, persona.definition.name
-                )
+                SectionStatus("persona", STATUS_LABEL_STYLE, True, persona.name)
             )
         except (KeyError, LookupError, RuntimeError, ValueError) as error:
             sections.append(

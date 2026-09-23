@@ -340,6 +340,33 @@ def _setup_parser(prog: str) -> argparse.ArgumentParser:
         help="Desired-self persona preset; author originals interactively.",
     )
     parser.add_argument(
+        "--private-persona-guidance",
+        type=Path,
+        help="Selected private-guidance document for a private persona import.",
+    )
+    parser.add_argument(
+        "--private-persona-identity",
+        type=Path,
+        help="Selected stable-assistant-identity document for a private persona import.",
+    )
+    parser.add_argument(
+        "--private-persona-expression",
+        type=Path,
+        help="Selected expression-persona document for a private persona import.",
+    )
+    parser.add_argument(
+        "--private-persona-id",
+        help="Stable lowercase identifier for the imported private persona.",
+    )
+    parser.add_argument(
+        "--private-persona-name",
+        help="Display name for the imported private persona.",
+    )
+    parser.add_argument(
+        "--private-persona-version",
+        help="Declared version for the imported private persona.",
+    )
+    parser.add_argument(
         "--provider",
         choices=_PROVIDER_IDS,
         help="Primary provider; secrets arrive via environment variables only.",
@@ -439,6 +466,8 @@ def _non_interactive_answers(
         "review-action": "continue",
         "provider-verify-consent": "y",
     }
+    if arguments.private_persona_guidance is not None:
+        answers["persona-private-accept"] = "y"
     if arguments.profile == "import":
         if arguments.profile_file is None:
             raise OperationError("--profile import requires --profile-file")
@@ -543,6 +572,22 @@ def _run_setup(rest: Sequence[str]) -> int:
             "--base-url, --protocol, --context-window, and --header-env are "
             "only valid with --provider custom"
         )
+    private_persona_values = (
+        arguments.private_persona_guidance,
+        arguments.private_persona_identity,
+        arguments.private_persona_expression,
+        arguments.private_persona_id,
+        arguments.private_persona_name,
+        arguments.private_persona_version,
+    )
+    if any(value is not None for value in private_persona_values) and not all(
+        value is not None for value in private_persona_values
+    ):
+        parser.error(
+            "private persona import requires all three documents, id, name, and version"
+        )
+    if all(value is not None for value in private_persona_values) and arguments.persona:
+        parser.error("--persona cannot be combined with a private persona import")
     paths = _setup_paths(arguments)
     services = SetupServices(environ=dict(os.environ), probe=probe_local_endpoint)
     preselected = {
@@ -555,8 +600,27 @@ def _run_setup(rest: Sequence[str]) -> int:
         if value
     }
     if arguments.non_interactive:
-        preselected.setdefault("persona", "simon")
+        if arguments.private_persona_guidance is None:
+            preselected.setdefault("persona", "simon")
         preselected.setdefault("provider", "fake")
+    if arguments.private_persona_guidance is not None:
+        preselected.update(
+            {
+                "persona": "private-import",
+                "persona-private-guidance-path": str(
+                    arguments.private_persona_guidance
+                ),
+                "persona-stable-identity-path": str(
+                    arguments.private_persona_identity
+                ),
+                "persona-expression-path": str(
+                    arguments.private_persona_expression
+                ),
+                "persona-private-id": str(arguments.private_persona_id),
+                "persona-private-name": str(arguments.private_persona_name),
+                "persona-private-version": str(arguments.private_persona_version),
+            }
+        )
     if arguments.server_data_dir is not None:
         preselected["server-data-dir"] = str(arguments.server_data_dir)
     if arguments.credential_env:

@@ -12,6 +12,7 @@ import pytest
 from reckoning.command import main
 from reckoning.config import ProviderCredentialStore
 from reckoning.operations import setup_instance
+from reckoning.operations import load_installation_runtime
 from reckoning.setup_copy import BRAND_LINE
 
 
@@ -89,6 +90,72 @@ def test_setup_edits_the_agent_style_section(
     # Editing the style did not disturb the installed provider.
     instance = json.loads((data_dir / "instance.json").read_text())
     assert instance["activation"]["provider"] == "fake"
+
+
+def test_non_interactive_setup_imports_three_private_persona_files(
+    tmp_path: Path,
+) -> None:
+    guidance = tmp_path / "guidance.md"
+    identity = tmp_path / "identity.md"
+    expression = tmp_path / "expression.md"
+    guidance.write_text("fictional guidance", encoding="utf-8")
+    identity.write_text("fictional identity", encoding="utf-8")
+    expression.write_text("fictional expression", encoding="utf-8")
+    data_dir = tmp_path / "private-installation"
+
+    returncode, stdout, stderr = run_cli(
+        "setup",
+        "--non-interactive",
+        "--data-dir",
+        str(data_dir),
+        *cli_paths(tmp_path),
+        "--private-persona-guidance",
+        str(guidance),
+        "--private-persona-identity",
+        str(identity),
+        "--private-persona-expression",
+        str(expression),
+        "--private-persona-id",
+        "private-simon",
+        "--private-persona-name",
+        "Simon",
+        "--private-persona-version",
+        "1.0.0",
+    )
+
+    assert returncode == 0, stderr
+    assert "Private guidance: selected document" in stdout
+    assert "Model destination: fake / deterministic-fake" in stdout
+    assert "fictional guidance" not in stdout
+    guidance.unlink()
+    identity.unlink()
+    expression.unlink()
+    runtime = load_installation_runtime(data_dir)
+    assert runtime.persona.name == "Simon"
+    assert "fictional guidance" in runtime.persona.instructions
+
+
+def test_private_persona_cli_requires_complete_metadata_before_setup(
+    tmp_path: Path,
+) -> None:
+    guidance = tmp_path / "guidance.md"
+    guidance.write_text("must never be echoed", encoding="utf-8")
+    data_dir = tmp_path / "incomplete-private-installation"
+
+    returncode, stdout, stderr = run_cli(
+        "setup",
+        "--non-interactive",
+        "--data-dir",
+        str(data_dir),
+        *cli_paths(tmp_path),
+        "--private-persona-guidance",
+        str(guidance),
+    )
+
+    assert returncode == 2
+    assert "requires all three documents, id, name, and version" in stderr
+    assert "must never be echoed" not in stdout + stderr
+    assert not data_dir.exists()
 
 
 class _TtyStdin(io.StringIO):
