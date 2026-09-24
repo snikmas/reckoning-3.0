@@ -16,6 +16,7 @@ from reckoning.provider_registry import find_provider
 ProcessingCategory = Literal[
     "current-request",
     "recent-channel-history",
+    "private-persona",
     "personal-context",
     "confirmed-state",
     "permissions",
@@ -28,6 +29,7 @@ ProcessingCategory = Literal[
 PROCESSING_CATEGORIES: tuple[ProcessingCategory, ...] = (
     "current-request",
     "recent-channel-history",
+    "private-persona",
     "personal-context",
     "confirmed-state",
     "permissions",

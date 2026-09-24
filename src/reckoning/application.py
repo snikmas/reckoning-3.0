@@ -383,9 +383,15 @@ class ReckoningApplication:
             available_processing_categories is None
             or "personal-context" in available_processing_categories
         )
+        private_persona_categories = (
+            ("private-persona",)
+            if self._dependencies.persona.private_identifier is not None
+            else ()
+        )
         present_processing_categories = (
             "current-request",
             *(("recent-channel-history",) if recent_history else ()),
+            *private_persona_categories,
             *(
                 ("personal-context",)
                 if self._dependencies.personal_context
@@ -402,11 +408,15 @@ class ReckoningApplication:
             )
         )
         required_categories = (
-            ("current-request",)
+            tuple(dict.fromkeys(("current-request", *private_persona_categories)))
             if safe_when_incomplete
             else tuple(
                 dict.fromkeys(
-                    ("current-request", *required_processing_categories)
+                    (
+                        "current-request",
+                        *private_persona_categories,
+                        *required_processing_categories,
+                    )
                 )
             )
         )
@@ -415,6 +425,13 @@ class ReckoningApplication:
             required_categories=required_categories,
         )
         if processing.blocked_categories:
+            if "private-persona" in processing.blocked_categories:
+                raise RuntimeError(
+                    "Private persona processing is blocked because the selected "
+                    "model destination does not permit private-persona. Review the "
+                    "processing grant and explicitly allow private-persona for this "
+                    "destination, or select a local destination."
+                )
             raise RuntimeError(
                 "Model processing is blocked because the destination lacks "
                 "a grant for: " + ", ".join(processing.blocked_categories) + "."
@@ -462,15 +479,20 @@ class ReckoningApplication:
                 self._dependencies.model.respond(request)
             )
         except ProviderFailure as error:
+            failure = self._provider_failure_text(error)
             self._dependencies.model_runs.save_run(
-                self._failed_run_record(error, requested_at=requested_at)
+                self._failed_run_record(
+                    error,
+                    requested_at=requested_at,
+                    failure=failure,
+                )
             )
             if persist_session:
                 self._dependencies.storage.append(
                     "user", user_message, requested_at
                 )
             raise RuntimeError(
-                f"The {error.provider} run failed. {error}"
+                f"The {error.provider} run failed. {failure}"
             ) from error
         proposed_response = provider_result.content.strip()
         if not proposed_response:
@@ -1229,7 +1251,11 @@ class ReckoningApplication:
         )
 
     def _failed_run_record(
-        self, error: ProviderFailure, *, requested_at: datetime
+        self,
+        error: ProviderFailure,
+        *,
+        requested_at: datetime,
+        failure: str | None = None,
     ) -> ModelRunRecord:
         return ModelRunRecord(
             id=self._dependencies.identifiers.new(),
@@ -1244,13 +1270,21 @@ class ReckoningApplication:
             output_tokens=0,
             billable_units=0,
             usage_status="unknown",
-            failure=str(error),
+            failure=failure or self._provider_failure_text(error),
             private_persona_identifier=self._dependencies.persona.private_identifier,
             private_persona_version_id=self._dependencies.persona.private_version_id,
             private_persona_declared_version=(
                 self._dependencies.persona.private_declared_version
             ),
         )
+
+    def _provider_failure_text(self, error: ProviderFailure) -> str:
+        if self._dependencies.persona.private_identifier is not None:
+            return (
+                "Provider failure details were redacted for private persona "
+                "processing."
+            )
+        return str(error)
 
     @staticmethod
     def _usage_status(

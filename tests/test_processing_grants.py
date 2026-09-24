@@ -11,6 +11,7 @@ from reckoning.application import (
     ApplicationDependencies,
     InMemoryConversationStorage,
     NoConnectors,
+    PersonaSettings,
     PlacementState,
     ReckoningApplication,
 )
@@ -27,16 +28,19 @@ from reckoning.interfaces import (
     SourcePlacement,
 )
 from reckoning.processing import (
+    PROCESSING_CATEGORIES,
     JsonFileProcessingGrantRepository,
     ProcessingDestination,
     ProcessingGrantConflict,
     ProcessingScope,
+    ensure_initial_processing_grant,
 )
 from reckoning.personal_context import (
     InMemoryPersonalContextRepository,
     PersonalContextService,
 )
 from reckoning.provider_adapters import AdapterConfig, RuntimeAdapterModelProvider
+from reckoning.providers import ProviderFailure
 
 
 NOW = datetime(2026, 9, 10, 11, 0, tzinfo=timezone.utc)
@@ -76,6 +80,7 @@ def cloud_application(
     *,
     personal_context: PersonalContextService | None = None,
     reckoning_provider: object | None = None,
+    persona: PersonaSettings | None = None,
 ) -> ReckoningApplication:
     config = AdapterConfig(api_key="synthetic-key", model="deepseek-chat")
     return ReckoningApplication(
@@ -90,6 +95,7 @@ def cloud_application(
             retrieved_context=("SYNTHETIC SUPPLIED CONTEXT",),
             processing_scope=scope,
             personal_context=personal_context,
+            persona=persona or PersonaSettings(),
             **(
                 {"reckoning_provider": reckoning_provider}
                 if reckoning_provider is not None
@@ -97,6 +103,281 @@ def cloud_application(
             ),
         )
     )
+
+
+PRIVATE_PERSONA_MARKER = "FICTIONAL PRIVATE PERSONA MARKER ORCHID"
+
+
+def private_persona() -> PersonaSettings:
+    return PersonaSettings(
+        name="Fictional Simon",
+        instructions=PRIVATE_PERSONA_MARKER,
+        private_identifier="fictional-simon",
+        private_version_id="fictional-simon@1.0.0:synthetic",
+        private_declared_version="1.0.0",
+    )
+
+
+def test_private_persona_is_a_distinct_named_processing_category() -> None:
+    assert "private-persona" in PROCESSING_CATEGORIES
+    assert len(
+        {
+            "private-persona",
+            "personal-context",
+            "confirmed-state",
+            "current-request",
+        }
+    ) == 4
+
+
+def test_authorized_private_persona_reaches_the_exact_provider_request(
+    tmp_path: Path,
+) -> None:
+    repository = JsonFileProcessingGrantRepository(tmp_path / "processing-grants.json")
+    destination = ProcessingDestination(
+        "deepseek", "https://api.deepseek.com", "cloud"
+    )
+    scope = ProcessingScope(repository, destination)
+    scope.change(
+        ("current-request", "private-persona"),
+        changed_at=NOW,
+        expected_version=0,
+    )
+    transport = RecordingTransport()
+    application = cloud_application(
+        tmp_path,
+        scope,
+        transport,
+        persona=private_persona(),
+    )
+
+    reply = application.send_message("Use the authorized fictional persona.")
+
+    assert len(transport.requests) == 1
+    assert PRIVATE_PERSONA_MARKER in transport.requests[0].data.decode()
+    assert "private-persona" in reply.context_status.used
+
+
+@pytest.mark.parametrize(
+    "allowed_categories",
+    [None, ("current-request",), ()],
+    ids=("missing", "narrowed", "revoked"),
+)
+def test_private_persona_denial_returns_a_safe_next_action_before_transport(
+    tmp_path: Path,
+    allowed_categories: tuple[str, ...] | None,
+) -> None:
+    repository = JsonFileProcessingGrantRepository(tmp_path / "processing-grants.json")
+    destination = ProcessingDestination(
+        "deepseek", "https://api.deepseek.com", "cloud"
+    )
+    scope = ProcessingScope(repository, destination)
+    if allowed_categories is not None:
+        scope.change(
+            allowed_categories,
+            changed_at=NOW,
+            expected_version=0,
+        )
+    transport = RecordingTransport()
+    application = cloud_application(
+        tmp_path,
+        scope,
+        transport,
+        persona=private_persona(),
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        application.send_message("Do not fall back to the public persona.")
+
+    status = str(captured.value)
+    assert "private-persona" in status
+    assert "Review the processing grant" in status
+    assert PRIVATE_PERSONA_MARKER not in status
+    assert transport.requests == []
+    assert application.inspect_model_runs() == ()
+    assert application.open_session() == ()
+
+
+def test_private_persona_denial_survives_restart_without_cached_disclosure(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "processing-grants.json"
+    destination = ProcessingDestination(
+        "deepseek", "https://api.deepseek.com", "cloud"
+    )
+    first_scope = ProcessingScope(JsonFileProcessingGrantRepository(path), destination)
+    first_scope.change(("current-request",), changed_at=NOW, expected_version=0)
+    first_transport = RecordingTransport()
+    first = cloud_application(
+        tmp_path,
+        first_scope,
+        first_transport,
+        persona=private_persona(),
+    )
+
+    with pytest.raises(RuntimeError, match="private-persona"):
+        first.send_message("First denied request.")
+
+    restarted_transport = RecordingTransport()
+    restarted = cloud_application(
+        tmp_path,
+        ProcessingScope(JsonFileProcessingGrantRepository(path), destination),
+        restarted_transport,
+        persona=private_persona(),
+    )
+    with pytest.raises(RuntimeError, match="private-persona"):
+        restarted.send_message("Denied after restart.")
+
+    assert first_transport.requests == []
+    assert restarted_transport.requests == []
+    assert restarted.inspect_model_runs() == ()
+
+
+def test_stale_writer_cannot_restore_private_persona_authority(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "processing-grants.json"
+    destination = ProcessingDestination(
+        "deepseek", "https://api.deepseek.com", "cloud"
+    )
+    owner = ProcessingScope(JsonFileProcessingGrantRepository(path), destination)
+    stale = ProcessingScope(JsonFileProcessingGrantRepository(path), destination)
+    owner.change(
+        ("current-request", "private-persona"),
+        changed_at=NOW,
+        expected_version=0,
+    )
+    owner.change(("current-request",), changed_at=NOW, expected_version=1)
+
+    with pytest.raises(ProcessingGrantConflict):
+        stale.change(
+            ("current-request", "private-persona"),
+            changed_at=NOW,
+            expected_version=1,
+        )
+
+    transport = RecordingTransport()
+    application = cloud_application(
+        tmp_path,
+        owner,
+        transport,
+        persona=private_persona(),
+    )
+    with pytest.raises(RuntimeError, match="private-persona"):
+        application.send_message("Keep the owner's denial authoritative.")
+    assert transport.requests == []
+
+
+def test_destination_change_requires_private_persona_authority_for_the_new_target(
+    tmp_path: Path,
+) -> None:
+    repository = JsonFileProcessingGrantRepository(tmp_path / "processing-grants.json")
+    old_destination = ProcessingDestination(
+        "deepseek", "https://api.deepseek.com", "cloud"
+    )
+    old_scope = ProcessingScope(repository, old_destination)
+    old_scope.change(
+        ("current-request", "private-persona"),
+        changed_at=NOW,
+        expected_version=0,
+    )
+    new_scope = ProcessingScope(
+        repository,
+        ProcessingDestination("deepseek", "https://regional.example/v1", "cloud"),
+    )
+    transport = RecordingTransport()
+    application = cloud_application(
+        tmp_path,
+        new_scope,
+        transport,
+        persona=private_persona(),
+    )
+
+    with pytest.raises(RuntimeError, match="private-persona"):
+        application.send_message("Do not reuse authority from another destination.")
+
+    assert transport.requests == []
+
+
+def test_new_cloud_grant_includes_private_persona_without_expanding_existing_grant(
+    tmp_path: Path,
+) -> None:
+    repository = JsonFileProcessingGrantRepository(tmp_path / "processing-grants.json")
+    new_destination = ProcessingDestination(
+        "deepseek", "https://api.deepseek.com", "cloud"
+    )
+
+    created = ensure_initial_processing_grant(
+        repository,
+        new_destination,
+        changed_at=NOW,
+    )
+
+    assert created is not None
+    assert created[0].allowed_categories == PROCESSING_CATEGORIES
+    assert "private-persona" in created[0].allowed_categories
+
+    narrowed_destination = ProcessingDestination(
+        "deepseek", "https://narrowed.example/v1", "cloud"
+    )
+    narrowed = ProcessingScope(repository, narrowed_destination)
+    narrowed.change(("current-request",), changed_at=NOW, expected_version=0)
+
+    preserved = ensure_initial_processing_grant(
+        repository,
+        narrowed_destination,
+        changed_at=NOW,
+    )
+
+    assert preserved is not None
+    assert preserved[1] is False
+    assert preserved[0].allowed_categories == ("current-request",)
+
+
+def test_private_persona_content_is_redacted_from_provider_failures_and_receipts(
+    tmp_path: Path,
+) -> None:
+    class EchoingFailureModel:
+        def respond(self, request: object) -> str:
+            assert PRIVATE_PERSONA_MARKER in repr(request)
+            raise ProviderFailure(
+                f"provider echoed {PRIVATE_PERSONA_MARKER}",
+                provider="deepseek",
+                model="deepseek-chat",
+                model_calls=1,
+                latency_ms=12,
+                retries=0,
+            )
+
+    repository = JsonFileProcessingGrantRepository(tmp_path / "processing-grants.json")
+    destination = ProcessingDestination(
+        "deepseek", "https://api.deepseek.com", "cloud"
+    )
+    scope = ProcessingScope(repository, destination)
+    scope.change(
+        ("current-request", "private-persona"),
+        changed_at=NOW,
+        expected_version=0,
+    )
+    application = ReckoningApplication(
+        ApplicationDependencies(
+            clock=FixedClock(),
+            model=EchoingFailureModel(),
+            placement=PlacementState("server", "local", True),
+            connectors=NoConnectors(),
+            storage=InMemoryConversationStorage(),
+            processing_scope=scope,
+            persona=private_persona(),
+        )
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        application.send_message("Exercise the fictional failure path.")
+
+    run = application.inspect_model_runs()[0]
+    assert PRIVATE_PERSONA_MARKER not in str(captured.value)
+    assert PRIVATE_PERSONA_MARKER not in repr(run)
+    assert run.failure == "Provider failure details were redacted for private persona processing."
 
 
 def test_cloud_destination_blocks_missing_grant_before_transport_and_provider_change(
@@ -164,6 +445,28 @@ def test_local_destination_defaults_to_all_context_with_fake_transport(
         "SYNTHETIC SUPPLIED CONTEXT",
     ):
         assert content in payload
+    assert scope.review().explicit is False
+
+
+def test_local_destination_allows_private_persona_without_a_cloud_grant(
+    tmp_path: Path,
+) -> None:
+    scope = ProcessingScope(
+        JsonFileProcessingGrantRepository(tmp_path / "processing-grants.json"),
+        ProcessingDestination("deepseek", "http://127.0.0.1:9000", "local"),
+    )
+    transport = RecordingTransport()
+    application = cloud_application(
+        tmp_path,
+        scope,
+        transport,
+        persona=private_persona(),
+    )
+
+    reply = application.send_message("Use the local private persona.")
+
+    assert PRIVATE_PERSONA_MARKER in transport.requests[0].data.decode()
+    assert "private-persona" in reply.context_status.used
     assert scope.review().explicit is False
 
 
