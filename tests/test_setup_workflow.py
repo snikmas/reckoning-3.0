@@ -1482,6 +1482,108 @@ def test_migration_previews_backs_up_and_commits_atomically(tmp_path: Path) -> N
     assert migrated["providers"]["deepseek"]["secret"] == "sk-old"
 
 
+def test_configured_installation_migrates_six_axis_personas_additively(
+    tmp_path: Path,
+) -> None:
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
+    persona_path = tmp_path / "data" / "personas.json"
+    legacy = {
+        "schema_version": 1,
+        "authored": [
+            {
+                "id": "north-star",
+                "name": "North Star",
+                "voice": "reflective",
+                "directness": "balanced",
+                "warmth": "warm",
+                "humor": "light",
+                "challenge": "probing",
+                "sensitive_topic_handling": "calm",
+            }
+        ],
+        "active_persona_id": "north-star",
+    }
+    persona_path.write_text(json.dumps(legacy), encoding="utf-8")
+    before = persona_path.read_bytes()
+
+    outcome, ui = run_workflow(
+        tmp_path,
+        [
+            ("migrate", "migrate"),
+            ("migrate-confirm", "y"),
+            ("status-action", "exit"),
+        ],
+    )
+
+    assert outcome.status == "managed"
+    migrated = json.loads(persona_path.read_text(encoding="utf-8"))
+    assert migrated == {
+        **legacy,
+        "schema_version": 3,
+        "private_versions": [],
+        "active_private_selection": None,
+        "active_selection_revision": 0,
+    }
+    assert (tmp_path / "data" / "personas.json.bak").read_bytes() == before
+    service = PersonaService(JsonFilePersonaRepository(persona_path))
+    assert service.active_compiled().persona_id == "north-star"
+    selected_default = service.select("simon")
+    assert selected_default.definition.name == "Simon"
+    assert service.active_compiled().private_identifier is None
+    rendered = "\n".join(ui.lines)
+    assert "six-axis personas stay six-axis personas" in rendered
+    assert "private persona history fields are added empty" in rendered
+
+
+def test_malformed_six_axis_persona_migration_changes_nothing(tmp_path: Path) -> None:
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
+    persona_path = tmp_path / "data" / "personas.json"
+    persona_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "authored": [],
+                "active_persona_id": "missing-persona",
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = persona_path.read_bytes()
+
+    outcome, ui = run_workflow(tmp_path, [("status-action", "exit")])
+
+    assert outcome.status == "managed"
+    assert persona_path.read_bytes() == original
+    assert not (tmp_path / "data" / "personas.json.bak").exists()
+    assert "cannot be migrated safely" in "\n".join(ui.lines)
+
+
+def test_interrupted_persona_only_migration_restores_legacy_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_workflow(tmp_path, list(GUIDED_FAKE_ANSWERS))
+    persona_path = tmp_path / "data" / "personas.json"
+    legacy = {
+        "schema_version": 1,
+        "authored": [],
+        "active_persona_id": "steady",
+    }
+    persona_path.write_text(json.dumps(legacy), encoding="utf-8")
+    original = persona_path.read_bytes()
+    _flaky_replace(monkeypatch, 1)
+
+    workflow = SetupWorkflow(
+        paths=make_paths(tmp_path),
+        ui=ScriptedUI([("migrate", "migrate"), ("migrate-confirm", "y")]),
+        services=offline_services(),
+    )
+    with pytest.raises(OperationError, match="Migration failed"):
+        workflow.run()
+
+    assert persona_path.read_bytes() == original
+    assert PersonaService(JsonFilePersonaRepository(persona_path)).active().definition.id == "steady"
+
+
 def test_migration_merges_the_new_grant_without_dropping_history(
     tmp_path: Path,
 ) -> None:

@@ -51,6 +51,7 @@ from reckoning.personas import (
     import_private_persona,
     persona_from_data,
     persona_from_preset,
+    persona_schema_migration_payload,
 )
 from reckoning.processing import (
     JsonFileProcessingGrantRepository,
@@ -2231,6 +2232,9 @@ class SetupWorkflow:
         instance = read_json(self._paths.data_dir / "instance.json", default={})
         activation = instance.get("activation")
         placement = instance.get("placement_profile", "unknown")
+        persona_schema_current = _persona_schema_is_current(
+            self._paths.data_dir / "personas.json"
+        )
         sections.append(
             SectionStatus("placement", STATUS_LABEL_STORAGE, True, f"{placement}")
         )
@@ -2238,8 +2242,12 @@ class SetupWorkflow:
             SectionStatus(
                 "migration",
                 STATUS_LABEL_FORMAT,
-                isinstance(activation, dict),
-                "current" if isinstance(activation, dict) else "required",
+                isinstance(activation, dict) and persona_schema_current,
+                (
+                    "current"
+                    if isinstance(activation, dict) and persona_schema_current
+                    else "required"
+                ),
             )
         )
         if self._paths.draft_path.exists():
@@ -2710,7 +2718,12 @@ class SetupWorkflow:
 
     def _maybe_offer_migration(self) -> None:
         instance = read_json(self._paths.data_dir / "instance.json", default={})
-        if not instance or "activation" in instance:
+        persona_path = self._paths.data_dir / "personas.json"
+        if (
+            not instance
+            or "activation" in instance
+            and _persona_schema_is_current(persona_path)
+        ):
             return
         try:
             plan = build_migration_plan(self._paths)
@@ -2754,7 +2767,7 @@ class SetupWorkflow:
 class MigrationWrite:
     """One validated file the migration will replace."""
 
-    kind: Literal["credentials", "telegram", "grant", "instance"]
+    kind: Literal["credentials", "telegram", "persona", "grant", "instance"]
     label: str
     path: Path
     payload: bytes
@@ -2783,6 +2796,13 @@ def _migration_paths(paths: SetupPaths) -> tuple[Path, Path, Path]:
     )
 
 
+def _persona_schema_is_current(path: Path) -> bool:
+    try:
+        return read_json(path, default={}).get("schema_version") == 3
+    except RuntimeError:
+        return False
+
+
 def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
     """Validate every supported setup format before proposing any change."""
     credentials_path, telegram_path, instance_path = _migration_paths(paths)
@@ -2791,8 +2811,7 @@ def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
     instance = read_json(instance_path, default={})
     if not instance:
         raise OperationError("the installation record is empty")
-    if "activation" in instance:
-        raise OperationError("the installation is already migrated")
+    activation_required = "activation" not in instance
     placement = instance.get("placement_profile")
     if placement not in ("local", "personal-server", "hybrid"):
         raise OperationError("the installation has no supported storage placement")
@@ -2800,10 +2819,33 @@ def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
     if not isinstance(roots, dict) or roots.get("local") != "local-data-dir":
         raise OperationError("the installation has no enforceable storage roots")
 
+    persona_payload = _inspect_personas(instance_path.parent)
+    _inspect_runtime_state(paths, instance, roots)
+
+    if not activation_required:
+        if persona_payload is None:
+            raise OperationError("the installation is already migrated")
+        return MigrationPlan(
+            (
+                MigrationWrite(
+                    "persona",
+                    "persona history",
+                    instance_path.parent / "personas.json",
+                    persona_payload,
+                    0o600,
+                ),
+            ),
+            (
+                "Migration preview (nothing changes until you confirm):",
+                "- existing six-axis personas stay six-axis personas",
+                "- private persona history fields are added empty",
+                "- the active built-in or authored persona stays selected",
+                "- the staged persona file is validated before it replaces live state",
+            ),
+        )
+
     store, credentials_payload = _inspect_credentials(credentials_path)
     telegram_payload = _inspect_telegram(telegram_path)
-    _inspect_personas(instance_path.parent)
-    _inspect_runtime_state(paths, instance, roots)
 
     server_root = (
         _optional_absolute_root(roots.get("server"))
@@ -2887,6 +2929,16 @@ def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
                 0o600,
             )
         )
+    if persona_payload is not None:
+        writes.append(
+            MigrationWrite(
+                "persona",
+                "persona history",
+                instance_path.parent / "personas.json",
+                persona_payload,
+                0o600,
+            )
+        )
     if grant_payload is not None:
         writes.append(
             MigrationWrite(
@@ -2914,6 +2966,10 @@ def build_migration_plan(paths: SetupPaths) -> MigrationPlan:
         "- provider credentials rewrite to schema v2 (backup kept)",
         "- Telegram connector rewrites to schema v2 (backup kept)",
     ]
+    if persona_payload is not None:
+        preview.append(
+            "- existing six-axis personas stay selectable in persona schema v3"
+        )
     if grant_payload is not None:
         preview.append(
             f"- processing grant: {grant_path} gains a full-category grant "
@@ -2968,13 +3024,16 @@ def _inspect_telegram(path: Path) -> bytes | None:
     return _json_bytes(payload)
 
 
-def _inspect_personas(data_dir: Path) -> None:
+def _inspect_personas(data_dir: Path) -> bytes | None:
+    path = data_dir / "personas.json"
     try:
         PersonaService(
-            JsonFilePersonaRepository(data_dir / "personas.json")
+            JsonFilePersonaRepository(path)
         ).active_compiled()
+        payload = persona_schema_migration_payload(path)
     except (KeyError, LookupError, RuntimeError, ValueError) as error:
         raise OperationError(f"the persona configuration is invalid: {error}")
+    return _json_bytes(payload) if payload is not None else None
 
 
 def _inspect_runtime_state(
@@ -3042,6 +3101,8 @@ def _validate_staged_migration(write: MigrationWrite, staged: Path) -> None:
         TelegramConnectorConfig.load(staged)
     elif write.kind == "grant":
         JsonFileProcessingGrantRepository(staged).get("")
+    elif write.kind == "persona":
+        PersonaService(JsonFilePersonaRepository(staged)).active_compiled()
     else:
         staged_instance = read_json(staged, default={})
         if "activation" not in staged_instance:
@@ -3053,17 +3114,18 @@ def _validate_staged_migration(write: MigrationWrite, staged: Path) -> None:
 def commit_migration_plan(paths: SetupPaths, plan: MigrationPlan) -> None:
     """Write backups, stage every file, then activate the marker last."""
     del paths
-    snapshots = tuple(
-        _FileSnapshot.capture(write.path) for write in plan.writes
-    )
+    ordered_writes = tuple(
+        write for write in plan.writes if not write.activation
+    ) + tuple(write for write in plan.writes if write.activation)
+    snapshots = tuple(_FileSnapshot.capture(write.path) for write in ordered_writes)
     staged: list[tuple[MigrationWrite, Path]] = []
     try:
-        for write in plan.writes:
+        for write in ordered_writes:
             if write.path.exists():
                 shutil.copy2(
                     write.path, write.path.with_suffix(write.path.suffix + ".bak")
                 )
-        for write in plan.writes:
+        for write in ordered_writes:
             staged.append((write, _stage_migration_write(write)))
         for write, temporary_path in staged:
             _validate_staged_migration(write, temporary_path)

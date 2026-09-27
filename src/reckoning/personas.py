@@ -791,9 +791,20 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
             raise RuntimeError("Stored persona configuration is invalid.") from error
         if len(definitions) != len(authored):
             raise RuntimeError("Stored persona configuration is invalid.")
+        definition_ids = [item.id for item in definitions]
+        if len(definition_ids) != len(set(definition_ids)) or any(
+            persona_id in {item.id for item in DEFAULT_PERSONAS}
+            for persona_id in definition_ids
+        ):
+            raise RuntimeError("Stored persona configuration is invalid.")
         self._authored = {item.id: item for item in definitions}
         active_id = data.get("active_persona_id")
         if active_id is not None and not isinstance(active_id, str):
+            raise RuntimeError("Stored active persona is invalid.")
+        if active_id is not None and active_id not in {
+            *(item.id for item in DEFAULT_PERSONAS),
+            *self._authored,
+        }:
             raise RuntimeError("Stored active persona is invalid.")
         self._active_id = active_id
         if schema_version == 1:
@@ -828,6 +839,11 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
             latest_by_persona[version.private_identifier] = version
             fingerprints.add(key)
         self._private_versions = {item.version_id: item for item in versions}
+        if any(
+            item.private_identifier in self._authored
+            for item in self._private_versions.values()
+        ):
+            raise RuntimeError("Stored private persona configuration is invalid.")
         selection_data = data.get("active_private_selection")
         revision = (
             data.get("active_selection_revision")
@@ -965,21 +981,17 @@ class JsonFilePersonaRepository(InMemoryPersonaRepository):
         )
         atomic_write_json(
             self._path,
-            {
-                "schema_version": 3,
-                "authored": [asdict(item) for item in self._authored.values()],
-                "active_persona_id": selected_active_id,
-                "private_versions": [
-                    _private_version_to_data(item)
-                    for item in selected_private.values()
-                ],
-                "active_private_selection": (
-                    _active_private_selection_to_data(selected_private_selection)
+            _persona_state_data(
+                authored=tuple(self._authored.values()),
+                active_id=cast(str | None, selected_active_id),
+                private_versions=tuple(selected_private.values()),
+                active_private_selection=(
+                    selected_private_selection
                     if isinstance(selected_private_selection, ActivePersonaSelection)
                     else None
                 ),
-                "active_selection_revision": selected_revision,
-            },
+                selection_revision=selected_revision,
+            ),
         )
 
 
@@ -1190,6 +1202,47 @@ class PersonaService:
             return authored[persona_id]
         except KeyError as error:
             raise KeyError(f"Unknown persona: {persona_id}") from error
+
+
+def persona_schema_migration_payload(path: Path) -> dict[str, Any] | None:
+    """Return a validated schema-v3 copy without changing the live file."""
+    data = read_json(path, default={})
+    if not data:
+        raise RuntimeError("Stored persona configuration is missing.")
+    repository = JsonFilePersonaRepository(path)
+    if data.get("schema_version") == 3:
+        return None
+    return _persona_state_data(
+        authored=repository.list_authored(),
+        active_id=repository.active_id(),
+        private_versions=repository.list_private_versions(),
+        active_private_selection=repository.active_private_selection(),
+        selection_revision=repository.selection_revision(),
+    )
+
+
+def _persona_state_data(
+    *,
+    authored: tuple[PersonaDefinition, ...],
+    active_id: str | None,
+    private_versions: tuple[PersonaVersion, ...],
+    active_private_selection: ActivePersonaSelection | None,
+    selection_revision: int,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 3,
+        "authored": [asdict(item) for item in authored],
+        "active_persona_id": active_id,
+        "private_versions": [
+            _private_version_to_data(item) for item in private_versions
+        ],
+        "active_private_selection": (
+            _active_private_selection_to_data(active_private_selection)
+            if active_private_selection is not None
+            else None
+        ),
+        "active_selection_revision": selection_revision,
+    }
 
 
 def _private_version_to_data(version: PersonaVersion) -> dict[str, Any]:

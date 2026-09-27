@@ -588,6 +588,7 @@ def create_transfer(
     server_data_dir: Path | None = None,
 ) -> int:
     roots = _transfer_roots(data_dir, server_data_dir=server_data_dir)
+    _validate_persona_and_processing_state(roots, operation="backup")
     rooted_files = tuple(
         (root_name, root, path)
         for root_name, root in roots
@@ -672,6 +673,14 @@ def restore_transfer(
         _rewrite_restored_storage_roots(
             local_staging / "instance.json",
             server_root=server_root,
+        )
+        validation_roots: tuple[tuple[Literal["local", "server"], Path], ...] = (
+            ("local", local_staging),
+        )
+        if server_staging is not None:
+            validation_roots += (("server", server_staging),)
+        _validate_persona_and_processing_state(
+            validation_roots, operation="restore"
         )
         staged_roots = [(local_root, local_staging)]
         if server_root is not None and server_staging is not None:
@@ -921,6 +930,36 @@ def _transfer_roots(
     if _roots_overlap(local_root, server_root):
         raise OperationError("local and personal-server roots must be separate")
     return (("local", local_root), ("server", server_root))
+
+
+def _validate_persona_and_processing_state(
+    roots: tuple[tuple[Literal["local", "server"], Path], ...],
+    *,
+    operation: Literal["backup", "restore"],
+) -> None:
+    local_root = next(root for name, root in roots if name == "local")
+    instance_path = local_root / "instance.json"
+    if not instance_path.exists():
+        return
+    instance = _read_state_file(instance_path)
+    persona_path = local_root / "personas.json"
+    if persona_path.exists() or "active_persona_id" in instance:
+        try:
+            PersonaService(
+                JsonFilePersonaRepository(persona_path)
+            ).active_compiled()
+        except (KeyError, LookupError, RuntimeError, ValueError) as error:
+            raise OperationError(
+                f"{operation} rejected invalid persona state"
+            ) from error
+    try:
+        for _root_name, root in roots:
+            for grant_path in root.rglob("processing-grants.json"):
+                JsonFileProcessingGrantRepository(grant_path).list_all()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise OperationError(
+            f"{operation} rejected invalid processing-grant state"
+        ) from error
 
 
 def _roots_overlap(local_root: Path, server_root: Path) -> bool:

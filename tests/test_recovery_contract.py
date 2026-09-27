@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from base64 import b64decode, b64encode
 from datetime import datetime, timezone
+from hashlib import sha256
 import json
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
 import reckoning.operations as operations
+from reckoning.application import ModelRequest, create_local_application
 from reckoning.automation import (
     BriefingFinding,
     BriefingPolicy,
@@ -30,9 +34,20 @@ from reckoning.operations import (
     restore_transfer,
     setup_instance,
 )
+from reckoning.interfaces import create_local_interface_application
 from reckoning.personal_context import (
     JsonFilePersonalContextRepository,
     PersonalContextService,
+)
+from reckoning.personas import (
+    JsonFilePersonaRepository,
+    PersonaService,
+    PrivatePersonaImport,
+    import_private_persona,
+)
+from reckoning.processing import (
+    JsonFileProcessingGrantRepository,
+    ProcessingGrant,
 )
 
 
@@ -329,6 +344,199 @@ def test_clean_restore_preserves_real_visible_operational_contract(
     )
     assert completed.status == "success"
     assert completed_adapter.calls == 0
+
+
+@pytest.mark.parametrize("placement", ("local", "personal-server", "hybrid"))
+def test_persona_history_authority_and_runtime_survive_clean_restore(
+    tmp_path: Path, placement: str
+) -> None:
+    source = tmp_path / f"{placement}-source"
+    source_server = (
+        tmp_path / f"{placement}-source-server" if placement != "local" else None
+    )
+    restored = tmp_path / f"{placement}-restored"
+    restored_server = (
+        tmp_path / f"{placement}-restored-server" if placement != "local" else None
+    )
+    archive = tmp_path / f"{placement}.reckoning"
+    selected_files = tmp_path / f"{placement}-selected-files"
+    selected_files.mkdir()
+    first_paths = []
+    for role, content in zip(
+        ("guidance", "identity", "expression"),
+        (
+            "Ask for fictional evidence.",
+            "Keep one fictional identity.",
+            "Use a plain fictional voice.",
+        ),
+        strict=True,
+    ):
+        path = selected_files / f"{role}.md"
+        path.write_text(content, encoding="utf-8")
+        first_paths.append(path)
+    first = import_private_persona(
+        PrivatePersonaImport(
+            private_guidance_path=first_paths[0],
+            stable_identity_path=first_paths[1],
+            expression_persona_path=first_paths[2],
+            private_identifier="fictional-private",
+            display_name="Fictional Private",
+            declared_version="1.0.0",
+        ),
+        imported_at=NOW,
+    )
+    setup_instance(
+        source,
+        placement,  # type: ignore[arg-type]
+        first,
+        server_data_dir=source_server,
+    )
+    first_paths[0].write_text("Ask for revised fictional evidence.", encoding="utf-8")
+    second = import_private_persona(
+        PrivatePersonaImport(
+            private_guidance_path=first_paths[0],
+            stable_identity_path=first_paths[1],
+            expression_persona_path=first_paths[2],
+            private_identifier="fictional-private",
+            display_name="Fictional Private Revised",
+            declared_version="2.0.0",
+        ),
+        imported_at=NOW.replace(hour=13),
+    )
+    PersonaService(
+        JsonFilePersonaRepository(source / "personas.json")
+    ).import_and_select_private(second)
+    source_runtime = operations.load_installation_runtime(
+        source, server_data_dir=source_server
+    )
+    grant_path = source_runtime.state_path(
+        "confirmed-state", "processing-grants.json"
+    )
+    grant = ProcessingGrant(
+        "fictional-cloud@https://fictional.invalid",
+        1,
+        ("current-request", "private-persona"),
+        NOW,
+    )
+    JsonFileProcessingGrantRepository(grant_path).save(grant, expected_version=0)
+
+    create_transfer(
+        source,
+        archive,
+        PASSPHRASE,
+        kind="backup",
+        server_data_dir=source_server,
+    )
+    payload = operations._read_encrypted_payload(archive, PASSPHRASE)
+    archived_content = b"\n".join(
+        b64decode(item["content"]) for item in payload["files"]
+    ).decode("utf-8", errors="ignore")
+    assert str(selected_files.resolve()) not in archived_content
+    assert all(path.name not in archived_content for path in first_paths)
+
+    restore_transfer(
+        archive,
+        restored,
+        PASSPHRASE,
+        server_data_dir=restored_server,
+    )
+    restored_runtime = operations.load_installation_runtime(
+        restored, server_data_dir=restored_server
+    )
+    restored_personas = PersonaService(
+        JsonFilePersonaRepository(restored / "personas.json")
+    )
+    active = restored_personas.active_compiled()
+    versions = restored_personas.list_private_versions()
+    assert active.private_identifier == second.private_identifier
+    assert active.version_id == second.version_id
+    assert versions[0].fingerprint == first.fingerprint
+    assert versions[0].predecessor_id is None
+    assert versions[1].display_name == second.display_name
+    assert versions[1].declared_version == second.declared_version
+    assert versions[1].fingerprint == second.fingerprint
+    assert versions[1].predecessor_id == first.version_id
+    restored_grants = JsonFileProcessingGrantRepository(
+        restored_runtime.state_path("confirmed-state", "processing-grants.json")
+    ).list_all()
+    assert restored_grants == (grant,)
+
+    class RecordingModel:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        def respond(self, request: ModelRequest) -> str:
+            self.requests.append(request)
+            return "Restored fictional reply."
+
+    channels: tuple[Literal["web", "terminal"], ...] = ("web", "terminal")
+    for channel in channels:
+        model = RecordingModel()
+        application = create_local_application(
+            restored_runtime.state_path("confirmed-state", "continuity.json"),
+            personal_context_path=restored_runtime.state_path(
+                "personal-context", "personal-context.json"
+            ),
+            persona=restored_runtime.persona,
+            placement=restored_runtime.application_placement,
+            model_override=model,
+        )
+        interface = create_local_interface_application(
+            application,
+            restored_runtime.state_path("confirmed-state", "interfaces.json"),
+            placement=restored_runtime.interface_placement,
+        )
+        reply = interface.send_channel_message(channel, f"{channel} after restore")
+        assert reply.text == "Restored fictional reply."
+        assert (
+            model.requests[0].provider_conversation.messages[2].content
+            == active.instructions
+        )
+
+    first_paths[0].write_text("Ask for final fictional evidence.", encoding="utf-8")
+    later = import_private_persona(
+        PrivatePersonaImport(
+            private_guidance_path=first_paths[0],
+            stable_identity_path=first_paths[1],
+            expression_persona_path=first_paths[2],
+            private_identifier="fictional-private",
+            display_name="Fictional Private Later",
+            declared_version="3.0.0",
+        ),
+        imported_at=NOW.replace(hour=14),
+    )
+    selected_later = restored_personas.import_and_select_private(later)
+    history = restored_personas.list_private_versions()
+    assert selected_later.version_id == later.version_id
+    assert history[-1].predecessor_id == second.version_id
+
+
+def test_restore_rejects_semantically_invalid_persona_before_activation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    current_archive = tmp_path / "current.reckoning"
+    malformed_archive = tmp_path / "malformed.reckoning"
+    target = tmp_path / "target"
+    setup_instance(source, "local")
+    create_transfer(source, current_archive, PASSPHRASE, kind="backup")
+    payload = operations._read_encrypted_payload(current_archive, PASSPHRASE)
+    persona_entry = next(
+        item for item in payload["files"] if item["path"] == "personas.json"
+    )
+    persona_data = json.loads(b64decode(persona_entry["content"]))
+    persona_data["active_persona_id"] = "missing-persona"
+    malformed_content = (json.dumps(persona_data) + "\n").encode("utf-8")
+    persona_entry["content"] = b64encode(malformed_content).decode("ascii")
+    persona_entry["size"] = len(malformed_content)
+    persona_entry["sha256"] = sha256(malformed_content).hexdigest()
+    operations._write_encrypted_payload(malformed_archive, payload, PASSPHRASE)
+
+    with pytest.raises(OperationError, match="restore rejected invalid persona state"):
+        restore_transfer(malformed_archive, target, PASSPHRASE)
+
+    assert not target.exists()
+    assert not tuple(tmp_path.glob(".target.restore-*"))
 
 
 def test_failed_final_restore_swap_keeps_an_existing_clean_target(

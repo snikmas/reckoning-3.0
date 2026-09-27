@@ -338,6 +338,82 @@ def test_sqlite_migration_splits_legacy_notice_prefix(tmp_path: Path) -> None:
     assert messages[1] == ChannelMessage("assistant", "reply")
 
 
+def test_sqlite_migration_renames_empty_session_with_foreign_keys(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    legacy_path = tmp_path / "interfaces.json"
+    db_path = tmp_path / "reckoning.sqlite3"
+    connection = sqlite3.connect(str(db_path))
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute(
+        "CREATE TABLE root_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE interface_sessions (
+            channel TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            PRIMARY KEY (channel, session_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE interface_session_messages (
+            channel TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            PRIMARY KEY (channel, session_id, position),
+            FOREIGN KEY (channel, session_id)
+                REFERENCES interface_sessions(channel, session_id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO root_metadata (key, value) VALUES (?, ?)",
+        ("interfaces_schema_version", "1"),
+    )
+    connection.execute(
+        "INSERT INTO interface_sessions (channel, session_id, revision) VALUES (?, ?, ?)",
+        ("terminal", "", 1),
+    )
+    connection.execute(
+        """
+        INSERT INTO interface_session_messages (channel, session_id, position, role, content)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("terminal", "", 0, "user", "legacy question"),
+    )
+    connection.execute(
+        """
+        INSERT INTO interface_session_messages (channel, session_id, position, role, content)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("terminal", "", 1, "assistant", "legacy reply"),
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = SQLiteInterfaceRepository(legacy_path)
+    sessions = reopened.load().sessions
+    assert [(session.channel, session.session_id) for session in sessions] == [
+        ("terminal", "legacy-terminal")
+    ]
+    assert [message.content for message in sessions[0].messages] == [
+        "legacy question",
+        "legacy reply",
+    ]
+    selection = reopened.get_selected_session("terminal")
+    assert selection is not None
+    assert selection.selected_session_id == "legacy-terminal"
+
+
 def test_malformed_legacy_turn_order_fails_without_rewriting_state(
     tmp_path: Path,
 ) -> None:

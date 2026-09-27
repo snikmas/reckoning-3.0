@@ -1306,6 +1306,7 @@ def _validate_legacy_turn_order(messages: list[tuple[Any, ...]]) -> None:
 
 
 def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    connection.execute("PRAGMA defer_foreign_keys = ON")
     # Add session metadata columns if they are missing (e.g. from a v2 database).
     columns = {
         row[1]
