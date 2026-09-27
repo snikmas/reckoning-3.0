@@ -47,15 +47,28 @@ printf 'exit=%s\njsonl=%s\n' "$EVALUATION_STATUS" "$EVALUATION_OUTPUT"
 `full-stage-2` selects the complete scenario set. The console summary names
 scenarios excluded by the selected profile.
 
+The full profile includes the fictional private-persona journey. It imports and
+reviews two versions through setup, verifies activation and rollback, uses the
+rendered Web controls and the Terminal entry point, restarts the application,
+and performs an encrypted backup and clean restore. It also submits a private
+persona message to a cloud destination with no processing grant and verifies
+that the model is not called.
+
 ## Read the evidence
 
 Each JSONL record identifies the run, scenario, profile, execution kind,
 provider route, result, and limitations. It also records:
 
 - the Git revision and whether the working tree was dirty;
-- SHA-256 digests for the scenario set and the individual scenario;
+- independent versions and SHA-256 digests for the scenario set and scenario;
+- the persona identifier and version, selected channel sessions, and observed
+  reply;
 - observed output and application-state evidence;
-- rubric results, latency, and cost status.
+- rubric results, limitations, latency, token usage, and cost status.
+
+Default JSONL evidence contains persona metadata and pass/fail state evidence.
+It does not contain fictional or private bundle documents. The scenario file
+contains only committed fictional fixtures.
 
 Live records also contain `attempt_receipts`. The evaluator writes one receipt
 for every outbound attempt, including retries and failed transports. Each
@@ -82,6 +95,11 @@ deliberately bad fixtures that check whether an evaluator rule catches known
 failures. A correctly detected bad case remains `failed` in JSONL. Its unit
 test passes separately.
 
+The `Gate counts` line always lists passed, failed, partial,
+missing-implementation, skipped, unsupported, and unrun totals. A safe but
+deliberately product-wrong control proves that a passing safety detector cannot
+override a failed persona-version check.
+
 Inspect the JSONL file after either command:
 
 ```bash
@@ -104,15 +122,17 @@ Mutation evidence records before and after revisions, whether the request used
 a rendered proposal binding, and any durable operation receipt. Use
 `scenario_tags` to keep product records separate from detector records.
 
-Fake mode cannot prove naturalness, user usefulness, live-provider quality,
-provider cost, or Stage 2 acceptance. Human-judgment dimensions remain
-`unrun`, and missing product journeys remain visible rather than falling back
-to a fake pass.
+Fake mode cannot prove persona behavior, naturalness, usefulness,
+live-provider quality, provider cost, or Stage 2 acceptance. The `persona`,
+`naturalness`, and `usefulness` dimensions remain `unrun`. Automated safety and
+product-state checks use separate dimension names. Missing product journeys
+remain visible rather than falling back to a fake pass.
 
-Scenario schema version 2 names a versioned evaluator rule for each dimension.
-Runtime scoring reads the observed output, application-state evidence, and the
-named rule. Expected fake outcomes live only in evaluator tests; they are not
-part of the runtime `Scenario` type.
+Scenario schema version 3 requires an independent scenario-set version and a
+version for every scenario. It also names a versioned evaluator rule for each
+dimension. Runtime scoring reads the observed output, application-state
+evidence, and the named rule. Expected fake outcomes live only in evaluator
+tests; they are not part of the runtime `Scenario` type.
 
 The attempt receipts extend the JSONL evidence contract. They do not change the
 scenario schema version.

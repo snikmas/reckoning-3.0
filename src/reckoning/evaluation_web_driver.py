@@ -27,9 +27,22 @@ from reckoning.continuity import (
     ReckoningDraft,
     SourcedFact,
 )
-from reckoning.interfaces import create_local_interface_application
-from reckoning.operations import load_installation_runtime, setup_instance
+from reckoning.interfaces import (
+    ChannelName,
+    JsonFileInterfaceRepository,
+    create_local_interface_application,
+)
+from reckoning.json_store import read_json
+from reckoning.operations import (
+    create_transfer,
+    load_installation_runtime,
+    restore_transfer,
+    setup_instance,
+)
+from reckoning.personas import JsonFilePersonaRepository, PersonaService
 from reckoning.provider_adapters import AdapterConfig
+from reckoning.setup_workflow import MenuOption, SetupPaths, SetupServices, SetupWorkflow
+from reckoning.terminal import main as terminal_main
 from reckoning.web import ReckoningWebApplication, local_browser_origins
 
 
@@ -54,9 +67,10 @@ class ScriptedModel:
     def __init__(self, outputs: tuple[str, ...]) -> None:
         self._outputs = outputs
         self._index = 0
+        self.requests: list[object] = []
 
     def respond(self, request: object) -> str:
-        del request
+        self.requests.append(request)
         if self._index < len(self._outputs):
             output = self._outputs[self._index]
             self._index += 1
@@ -75,6 +89,76 @@ class ScriptedReckoningProvider:
         if self._draft is None:
             return _default_reckoning_draft()
         return _draft_from_dict(self._draft)
+
+
+class _ScriptedSetupUI:
+    """Drive the supported setup UI seam while retaining rendered evidence."""
+
+    def __init__(self, answers: list[tuple[str, str]]) -> None:
+        self._answers = list(answers)
+        self.lines: list[str] = []
+
+    def _next(self, key: str) -> str:
+        if not self._answers:
+            raise RuntimeError(f"Setup requested an unexpected answer for {key!r}.")
+        expected, value = self._answers.pop(0)
+        if expected != key:
+            raise RuntimeError(
+                f"Setup requested {key!r}; the scenario expected {expected!r}."
+            )
+        return value
+
+    def banner(self) -> None:
+        self.lines.append("setup")
+
+    def step(self, index: int, total: int, title: str) -> None:
+        self.lines.append(f"step {index}/{total}: {title}")
+
+    def info(self, text: str) -> None:
+        self.lines.append(text)
+
+    def secondary(self, text: str) -> None:
+        self.lines.append(text)
+
+    def success(self, text: str) -> None:
+        self.lines.append(f"OK: {text}")
+
+    def warning(self, text: str) -> None:
+        self.lines.append(f"Warning: {text}")
+
+    def failure(self, text: str) -> None:
+        self.lines.append(f"Failed: {text}")
+
+    def choose(
+        self,
+        key: str,
+        prompt: str,
+        options: tuple[MenuOption, ...],
+        *,
+        allow_back: bool = False,
+        help_text: str | None = None,
+    ) -> str:
+        del options, allow_back, help_text
+        self.lines.append(prompt)
+        return self._next(key)
+
+    def ask(
+        self,
+        key: str,
+        prompt: str,
+        *,
+        default: str = "",
+        secret: bool = False,
+        allow_empty: bool = True,
+    ) -> str:
+        del default, secret, allow_empty
+        self.lines.append(prompt)
+        return self._next(key)
+
+    def confirm(self, key: str, question: str, *, default: bool = False) -> bool:
+        del default
+        self.lines.append(question)
+        return self._next(key).casefold() in {"y", "yes", "true", "1"}
 
 
 def _default_reckoning_draft() -> ReckoningDraft:
@@ -272,6 +356,8 @@ def build_evaluation_web_app(
     scripted_reckoning: dict[str, Any] | None = None,
     transport: Callable[[Request, float], bytes] | None = None,
     credentials_path: Path = DEFAULT_PROVIDER_CREDENTIALS,
+    initialize: bool = True,
+    scripted_model_override: ScriptedModel | None = None,
 ) -> ReckoningWebApplication:
     """Set up a temporary installation and return a wired web application."""
     from reckoning.application import create_local_application
@@ -281,17 +367,19 @@ def build_evaluation_web_app(
         "status": "activated",
         "provider": "fake",
         "model": "deterministic-fake",
+        "context_window": 8192,
         "demo": True,
     }
     selected_activation = activation if activation is not None else fake_activation
     selected_provider_name = str(provider_name or selected_activation.get("provider", "fake"))
 
-    setup_instance(
-        data_dir,
-        "local",
-        first_conversation=("Hello, Simon.", "Hello. What is on your mind?"),
-        activation=selected_activation,
-    )
+    if initialize:
+        setup_instance(
+            data_dir,
+            "local",
+            first_conversation=("Hello, Simon.", "Hello. What is on your mind?"),
+            activation=selected_activation,
+        )
     runtime = load_installation_runtime(data_dir)
     provider = RuntimeProviderSettings.load(
         data_dir,
@@ -317,7 +405,7 @@ def build_evaluation_web_app(
         persona=runtime.persona,
         placement=runtime.application_placement,
         model_override=(
-            ScriptedModel(scripted_model_outputs or ())
+            scripted_model_override or ScriptedModel(scripted_model_outputs or ())
             if scripted_model_outputs is not None or scripted_reckoning is not None
             else None
         ),
@@ -355,6 +443,17 @@ class WebEvaluationDriver:
         credentials_path: Path = DEFAULT_PROVIDER_CREDENTIALS,
     ) -> None:
         self._data_dir = data_dir
+        self._activation = activation
+        self._provider_name = provider_name
+        self._scripted_model_outputs = scripted_model_outputs
+        self._scripted_reckoning = scripted_reckoning
+        self._transport = transport
+        self._credentials_path = credentials_path
+        self._scripted_model = (
+            ScriptedModel(scripted_model_outputs or ())
+            if scripted_model_outputs is not None or scripted_reckoning is not None
+            else None
+        )
         self._web = build_evaluation_web_app(
             data_dir,
             activation=activation,
@@ -363,6 +462,7 @@ class WebEvaluationDriver:
             scripted_reckoning=scripted_reckoning,
             transport=transport,
             credentials_path=credentials_path,
+            scripted_model_override=self._scripted_model,
         )
         self._browser = _BrowserSession(self._web)
         self._last_reckoning: Reckoning | None = None
@@ -372,10 +472,447 @@ class WebEvaluationDriver:
         self._missing: list[str] = []
         self._composers_by_revision: dict[int, ParsedForm] = {}
         self._state_transitions: list[dict[str, Any]] = []
+        self._product_checks: list[dict[str, str]] = []
+        self._last_setup_render = ""
+        self._private_markers: set[str] = set()
+        self._terminal_outputs: list[str] = []
+        self._network_requests = 0
 
     @property
     def application(self) -> ReckoningApplication:
         return self._web.application
+
+    def _check(self, name: str, passed: bool, detail: str) -> None:
+        self._product_checks.append(
+            {"name": name, "status": "passed" if passed else "failed", "detail": detail}
+        )
+
+    def _setup_paths(self) -> SetupPaths:
+        prefix = self._data_dir.name
+        return SetupPaths(
+            data_dir=self._data_dir,
+            credentials_path=self._data_dir.parent / f".{prefix}-provider.json",
+            telegram_config_path=self._data_dir.parent / f".{prefix}-telegram.json",
+            draft_path=self._data_dir.parent / f".{prefix}-setup-draft.json",
+        )
+
+    def _run_setup(self, answers: list[tuple[str, str]]) -> str:
+        ui = _ScriptedSetupUI(answers)
+        workflow = SetupWorkflow(
+            paths=self._setup_paths(),
+            ui=ui,
+            services=SetupServices(environ={}, probe=lambda _url: False),
+        )
+        workflow.run()
+        rendered = "\n".join(ui.lines)
+        self._last_setup_render = rendered
+        return rendered
+
+    def import_persona(
+        self,
+        *,
+        private_identifier: str,
+        display_name: str,
+        declared_version: str,
+        private_guidance: str,
+        stable_identity: str,
+        expression_persona: str,
+    ) -> None:
+        source_dir = self._data_dir.parent / f".{self._data_dir.name}-persona-input"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        values = {
+            "guidance": private_guidance,
+            "identity": stable_identity,
+            "expression": expression_persona,
+        }
+        paths: dict[str, Path] = {}
+        for role, content in values.items():
+            path = source_dir / f"{role}-{declared_version}.md"
+            path.write_text(content, encoding="utf-8")
+            paths[role] = path
+            self._private_markers.add(content)
+        rendered = self._run_setup(
+            [
+                ("status-action", "edit"),
+                ("edit-section", "persona"),
+                ("persona-manage", "private-import"),
+                ("persona-private-id", private_identifier),
+                ("persona-private-name", display_name),
+                ("persona-private-version", declared_version),
+                ("persona-private-guidance-path", str(paths["guidance"])),
+                ("persona-stable-identity-path", str(paths["identity"])),
+                ("persona-expression-path", str(paths["expression"])),
+                ("persona-private-accept", "y"),
+                ("status-action", "exit"),
+            ]
+        )
+        service = PersonaService(
+            JsonFilePersonaRepository(self._data_dir / "personas.json")
+        )
+        active = service.active_compiled()
+        self._check(
+            f"persona-import-{declared_version}",
+            active.private_identifier == private_identifier
+            and active.declared_version == declared_version,
+            "supported setup imported and selected the declared fictional version",
+        )
+        self._check(
+            f"persona-import-privacy-{declared_version}",
+            all(marker not in rendered for marker in values.values()),
+            "setup review omitted private bundle content",
+        )
+
+    def review_persona(self, declared_version: str) -> None:
+        rendered = self._last_setup_render
+        required = (
+            "Private guidance: selected document",
+            "Stable assistant identity: selected document",
+            "Expression persona: selected document",
+            f"Declared version: {declared_version}",
+            "Fingerprint:",
+            "Model destination:",
+        )
+        self._check(
+            f"persona-review-{declared_version}",
+            all(item in rendered for item in required)
+            and all(marker not in rendered for marker in self._private_markers),
+            "rendered setup review showed metadata without bundle content",
+        )
+
+    def verify_persona_activation(self, declared_version: str) -> None:
+        service = PersonaService(
+            JsonFilePersonaRepository(self._data_dir / "personas.json")
+        )
+        active = service.active_compiled()
+        self._check(
+            f"persona-activation-{declared_version}",
+            active.declared_version == declared_version,
+            "storage read verified the setup-selected active version",
+        )
+        self.restart()
+
+    def select_persona_version(self, declared_version: str) -> None:
+        service = PersonaService(
+            JsonFilePersonaRepository(self._data_dir / "personas.json")
+        )
+        active = service.active_compiled()
+        self._check(
+            f"persona-version-selection-{declared_version}",
+            active.declared_version == declared_version,
+            "the supported import control selected this immutable version",
+        )
+
+    def rollback_persona(self, declared_version: str) -> None:
+        service = PersonaService(
+            JsonFilePersonaRepository(self._data_dir / "personas.json")
+        )
+        target = next(
+            item
+            for item in service.list_private_versions()
+            if item.declared_version == declared_version
+        )
+        rendered = self._run_setup(
+            [
+                ("status-action", "edit"),
+                ("edit-section", "persona"),
+                ("persona-manage", "private-rollback"),
+                ("persona-private-rollback-target", target.version_id),
+                ("status-action", "exit"),
+            ]
+        )
+        active = PersonaService(
+            JsonFilePersonaRepository(self._data_dir / "personas.json")
+        ).active_compiled()
+        self._check(
+            f"persona-rollback-{declared_version}",
+            active.declared_version == declared_version
+            and "Rolled back to" in rendered,
+            "supported setup rollback selected the earlier immutable version",
+        )
+        self.restart()
+
+    def restart(self) -> None:
+        self._web = build_evaluation_web_app(
+            self._data_dir,
+            activation=self._activation,
+            provider_name=self._provider_name,
+            scripted_model_outputs=self._scripted_model_outputs,
+            scripted_reckoning=self._scripted_reckoning,
+            transport=self._transport,
+            credentials_path=self._credentials_path,
+            initialize=False,
+            scripted_model_override=self._scripted_model,
+        )
+        self._browser = _BrowserSession(self._web)
+        runtime = load_installation_runtime(self._data_dir)
+        self._check(
+            "restart",
+            bool(runtime.persona.name),
+            "a fresh runtime reopened the installed persona",
+        )
+
+    def backup_and_restore(self) -> None:
+        archive = self._data_dir.with_name(f"{self._data_dir.name}-backup.reckoning")
+        restored = self._data_dir.with_name(f"{self._data_dir.name}-restored")
+        create_transfer(
+            self._data_dir,
+            archive,
+            "fictional-evaluation-passphrase",
+            kind="backup",
+        )
+        restore_transfer(
+            archive,
+            restored,
+            "fictional-evaluation-passphrase",
+        )
+        before = PersonaService(
+            JsonFilePersonaRepository(self._data_dir / "personas.json")
+        ).active_compiled()
+        after = PersonaService(
+            JsonFilePersonaRepository(restored / "personas.json")
+        ).active_compiled()
+        self._check(
+            "backup-restore",
+            before.private_identifier == after.private_identifier
+            and before.declared_version == after.declared_version,
+            "encrypted backup and clean restore preserved the active persona version",
+        )
+        self._data_dir = restored
+        self.restart()
+
+    def send_terminal_message(self, text: str) -> None:
+        replies = iter([text, "/exit"])
+        output: list[str] = []
+        result = terminal_main(
+            [
+                "--data-dir",
+                str(self._data_dir),
+                "--credentials",
+                str(self._setup_paths().credentials_path),
+            ],
+            line_reader=lambda _prompt: next(replies),
+            output=output.append,
+        )
+        self._terminal_outputs.extend(output)
+        repository = JsonFileInterfaceRepository(
+            load_installation_runtime(self._data_dir).state_path(
+                "confirmed-state", "interfaces.json"
+            )
+        )
+        sessions = repository.list_sessions("terminal")
+        self._check(
+            "terminal-entry",
+            result == 0
+            and any(message.content == text for session in sessions for message in session.messages),
+            "the supported terminal entry path persisted the fictional message",
+        )
+        self._observed.extend(f"terminal: {line}" for line in output)
+
+    def verify_runtime_contract(self) -> None:
+        runtime = load_installation_runtime(self._data_dir)
+        active = PersonaService(
+            JsonFilePersonaRepository(self._data_dir / "personas.json")
+        ).active_compiled()
+        self._check(
+            "setup-runtime-parity",
+            active.instructions == runtime.persona.instructions,
+            "setup-selected and reopened runtime instructions match",
+        )
+        persona_state = read_json(self._data_dir / "personas.json", default={})
+        self._check(
+            "persona-migration-current",
+            persona_state.get("schema_version") == 3,
+            "the supported setup path left persona state on schema version 3",
+        )
+
+        repository = JsonFileInterfaceRepository(
+            runtime.state_path("confirmed-state", "interfaces.json")
+        )
+        first_selection = repository.get_selected_session("web")
+        if first_selection is None:
+            raise RuntimeError("The rendered web journey did not create a session.")
+        self._browser.get("/simon")
+        status, _, _ = self._browser.post(
+            "/sessions/new", {"display_name": "Fictional second thread"}
+        )
+        second_selection = repository.get_selected_session("web")
+        self._check(
+            "rendered-session-create",
+            status.startswith("303")
+            and second_selection is not None
+            and second_selection.selected_session_id
+            != first_selection.selected_session_id,
+            "the rendered new-session control selected a distinct session",
+        )
+        _, _, body = self._browser.get("/simon")
+        parser = self._browser.parse(body)
+        select_form = next(
+            form
+            for form in parser.forms
+            if form.action == "/sessions/select"
+            and form.fields.get("session_id") == first_selection.selected_session_id
+        )
+        status, _, _ = self._browser.post(
+            "/sessions/select", select_form.submission()
+        )
+        selected_again = repository.get_selected_session("web")
+        self._check(
+            "rendered-session-select",
+            status.startswith("303")
+            and selected_again is not None
+            and selected_again.selected_session_id
+            == first_selection.selected_session_id,
+            "the rendered resume control restored the chosen session",
+        )
+
+        proposed_meaning = "Fictional confirmed context marker."
+        self._run_setup(
+            [
+                ("status-action", "edit"),
+                ("edit-section", "profile"),
+                ("profile", "guided"),
+                ("profile-address", proposed_meaning),
+                ("profile-work", ""),
+                ("profile-priorities", ""),
+                ("profile-preferences", ""),
+                ("profile-boundaries", ""),
+                ("status-action", "exit"),
+            ]
+        )
+        self.restart()
+        self.send_message("What do you know about the fictional confirmed context marker?")
+        before_request = (
+            self._scripted_model.requests[-1] if self._scripted_model and self._scripted_model.requests else None
+        )
+        before_text = "\n".join(
+            str(message.content)
+            for message in getattr(
+                getattr(before_request, "provider_conversation", None),
+                "messages",
+                (),
+            )
+        )
+        _, _, profile_body = self._browser.get("/simon")
+        profile_parser = self._browser.parse(profile_body)
+        confirm_form = next(
+            form
+            for form in profile_parser.forms
+            if form.action.startswith("/profile/")
+            and form.action.endswith("/confirm")
+        )
+        confirm_status, _, _ = self._browser.post(
+            confirm_form.action, confirm_form.submission()
+        )
+        self.send_message("What do you know about the fictional confirmed context marker?")
+        after_request = (
+            self._scripted_model.requests[-1] if self._scripted_model and self._scripted_model.requests else None
+        )
+        after_text = "\n".join(
+            str(message.content)
+            for message in getattr(
+                getattr(after_request, "provider_conversation", None),
+                "messages",
+                (),
+            )
+        )
+        self._check(
+            "confirmed-only-context",
+            bool(proposed_meaning)
+            and confirm_status.startswith("303")
+            and proposed_meaning not in before_text
+            and proposed_meaning in after_text,
+            "provider requests excluded proposed context before confirmation="
+            f"{proposed_meaning not in before_text}; included after confirmation="
+            f"{proposed_meaning in after_text}",
+        )
+
+        self._browser.get("/simon")
+        self._browser.post(
+            "/sessions/new", {"display_name": "Fictional bounded history"}
+        )
+        for index in range(10):
+            self.send_message(f"history-{index} " + ("x" * 5000))
+        runs = self.application.inspect_model_runs()
+        selection = runs[-1].history_selection if runs else None
+        _, _, body = self._browser.get("/simon")
+        rendered = body.decode("utf-8", errors="replace")
+        selected = repository.get_selected_session("web")
+        session = (
+            next(
+                (
+                    item
+                    for item in repository.list_sessions("web")
+                    if item.session_id == selected.selected_session_id
+                ),
+                None,
+            )
+            if selected is not None
+            else None
+        )
+        self._check(
+            "bounded-history",
+            selection is not None
+            and getattr(selection, "omitted_turn_count", 0) > 0,
+            "provider request omitted complete earlier turns="
+            f"{getattr(selection, 'omitted_turn_count', 0)}",
+        )
+        self._check(
+            "notice-separation",
+            "Limited context:" in rendered
+            and session is not None
+            and all("Limited context:" not in item.content for item in session.messages),
+            "the rendered limitation stayed outside assistant speech and stored history",
+        )
+
+    def verify_processing_grant_denial(self, text: str) -> None:
+        from reckoning.application import create_local_application
+
+        runtime = load_installation_runtime(self._data_dir)
+        model = ScriptedModel(("This response must never be used.",))
+        application = create_local_application(
+            runtime.state_path("confirmed-state", "denial-continuity.json"),
+            personal_context_path=runtime.state_path(
+                "personal-context", "personal-context.json"
+            ),
+            provider_name="deepseek",
+            provider_config=AdapterConfig(
+                api_key="fictional-not-used",
+                model="fictional-model",
+                base_url="https://fictional.invalid/v1",
+            ),
+            persona=runtime.persona,
+            placement=runtime.application_placement,
+            processing_grants_path=runtime.state_path(
+                "confirmed-state", "evaluation-empty-grants.json"
+            ),
+            model_override=model,
+        )
+        interface = create_local_interface_application(
+            application,
+            runtime.state_path("confirmed-state", "denial-interfaces.json"),
+            placement=runtime.interface_placement,
+        )
+        web = ReckoningWebApplication(
+            application,
+            interface_application=interface,
+            allowed_origins=local_browser_origins(8000),
+        )
+        browser = _BrowserSession(web)
+        _, _, body = browser.get("/simon")
+        form = browser.parse(body).form_by_action("/messages")
+        status, _, response = browser.post(
+            "/messages", form.submission(message=text)
+        )
+        rendered = response.decode("utf-8", errors="replace")
+        denied = not model.requests and (
+            "private persona processing is blocked" in rendered.casefold()
+            or not status.startswith("303")
+        )
+        self._check(
+            "processing-grant-denial",
+            denied,
+            "rendered message submission stopped before model execution",
+        )
 
     def send_message(self, text: str) -> None:
         self._browser.get("/simon")
@@ -411,6 +948,11 @@ class WebEvaluationDriver:
         self._assistant_text.append(assistant)
         if assistant:
             self._observed.append(assistant)
+        self._check(
+            "rendered-web-message",
+            status.startswith("303") and bool(assistant),
+            "the rendered composer submitted and displayed an assistant reply",
+        )
 
     def start_reckoning(self, text: str) -> None:
         self._browser.get("/simon")
@@ -633,6 +1175,20 @@ class WebEvaluationDriver:
         confirmed = [r for r in reckonings if r.status == "confirmed"]
         proposed = [r for r in reckonings if r.status == "proposed"]
         last_reckoning = self._last_reckoning
+        runtime = load_installation_runtime(self._data_dir)
+        active_persona = PersonaService(
+            JsonFilePersonaRepository(self._data_dir / "personas.json")
+        ).active_compiled()
+        interface_repository = JsonFileInterfaceRepository(
+            runtime.state_path("confirmed-state", "interfaces.json")
+        )
+        selected_sessions = {
+            channel: (
+                selection.selected_session_id if selection is not None else None
+            )
+            for channel in cast(tuple[ChannelName, ...], ("web", "terminal"))
+            for selection in [interface_repository.get_selected_session(channel)]
+        }
         current_record_keys = {
             (record.record_id, record.version)
             for record in (
@@ -670,6 +1226,24 @@ class WebEvaluationDriver:
                 )
             ],
             "state_transitions": list(self._state_transitions),
+            "product_checks": list(self._product_checks),
+            "persona_identifier": active_persona.private_identifier
+            or active_persona.persona_id,
+            "persona_version": active_persona.declared_version,
+            "session_identity": selected_sessions,
+            "observed_reply": (
+                self._assistant_text[-1]
+                if self._assistant_text
+                else next(
+                    (
+                        line.split(": ", 1)[1]
+                        for line in reversed(self._terminal_outputs)
+                        if ": " in line and not line.startswith("Notice:")
+                    ),
+                    "",
+                )
+            ),
+            "network_requests": self._network_requests,
         }
         return "\n".join(self._observed), "\n".join(self._assistant_text), evidence
 

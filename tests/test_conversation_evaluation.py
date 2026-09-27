@@ -63,6 +63,7 @@ EXPECTED_STAGE2_FAKE_OUTCOMES = {
     "casual-conversation-en": "passed",
     "fabricated-stored-reason-en": "failed",
     "false-saved-work-en": "failed",
+    "fictional-persona-lifecycle": "passed",
     "home-review-surfaces": "missing-implementation",
     "ignored-correction-en": "failed",
     "mixed-language-und": "passed",
@@ -74,6 +75,7 @@ EXPECTED_STAGE2_FAKE_OUTCOMES = {
     "resume-decision-en": "missing-implementation",
     "richer-decision-lifecycle": "missing-implementation",
     "simon-persona-en": "passed",
+    "safe-but-wrong-persona-control": "failed",
     "stale-version-en": "passed",
     "telegram-continuation": "missing-implementation",
     "uncertainty-en": "passed",
@@ -124,6 +126,7 @@ def _minimal_scenario(
         rubric = AUTOMATED_RUBRIC
     return {
         "id": scenario_id,
+        "version": "1.0.0",
         "language": "en",
         "mandatory": mandatory,
         "description": "Minimal test scenario.",
@@ -141,6 +144,7 @@ def _write_scenario_set(path: Path, scenarios: list[dict]) -> None:
             {
                 "schema_version": SUPPORTED_SCHEMA_VERSION,
                 "scenario_set_id": "test-set",
+                "version": "test-v1",
                 "scenarios": scenarios,
             },
             ensure_ascii=False,
@@ -170,8 +174,9 @@ def test_load_valid_scenario_set() -> None:
 
     assert scenario_set.scenario_set_id == "stage2-conversation-v1"
     assert scenario_set.schema_version == SUPPORTED_SCHEMA_VERSION
-    assert len(scenario_set.scenarios) == 20
-    assert len({s.id for s in scenario_set.scenarios}) == 20
+    assert scenario_set.version == "2026-09-27"
+    assert len(scenario_set.scenarios) == 22
+    assert len({s.id for s in scenario_set.scenarios}) == 22
 
 
 def test_load_rejects_invalid_json(tmp_path: Path) -> None:
@@ -350,13 +355,13 @@ def test_product_and_detector_counts_are_reported_separately(
     )
 
     stdout = capsys.readouterr().out
-    assert "Product counts: {'passed': 9, 'missing-implementation': 8}" in stdout
+    assert "Product counts: {'passed': 10, 'missing-implementation': 8, 'failed': 1}" in stdout
     assert "Detector counts: {'failed': 3}" in stdout
 
     records = [json.loads(line) for line in output.read_text().splitlines()]
     product = [record for record in records if "product" in record["scenario_tags"]]
     detector = [record for record in records if "detector" in record["scenario_tags"]]
-    assert len(product) == 17
+    assert len(product) == 18
     assert len(detector) == 3
     assert {record["overall_status"] for record in detector} == {"failed"}
 
@@ -377,6 +382,96 @@ def test_naturalness_is_unrun_in_fake_mode(tmp_path: Path) -> None:
 
     record = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
     assert record["rubric_results"]["naturalness"] == "unrun"
+
+
+def test_fake_mode_never_calls_the_provider_transport(tmp_path: Path) -> None:
+    path = tmp_path / "set.json"
+    _write_scenario_set(
+        path,
+        [
+            _minimal_scenario(
+                steps=[{"action": "message", "text": "offline only"}],
+                scripted_outputs=("What is the nearest deadline?",),
+            )
+        ],
+    )
+    calls = 0
+
+    def forbidden_transport(_request: Request, _timeout: float) -> bytes:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("fake mode attempted an outbound provider request")
+
+    run_evaluation(
+        path,
+        tmp_path / "out.jsonl",
+        mode="fake",
+        transport=forbidden_transport,
+    )
+
+    assert calls == 0
+
+
+def test_persona_journey_records_public_safe_versioned_evidence(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "persona.jsonl"
+    rc = run_evaluation(
+        Path(__file__).parents[1] / "scenarios" / "stage2-conversation-v1.json",
+        output,
+        mode="fake",
+    )
+
+    assert rc == 1  # The full set still contains mandatory later-stage gaps.
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    record = next(
+        item for item in records if item["scenario_id"] == "fictional-persona-lifecycle"
+    )
+    assert record["overall_status"] == "passed"
+    assert record["scenario_set_version"] == "2026-09-27"
+    assert record["scenario_version"] == "1.0.0"
+    assert record["scenario_set_digest"]
+    assert record["scenario_content_digest"]
+    assert record["persona_identifier"] == "fictional-desired-self"
+    assert record["persona_version"] == "1.0.0"
+    assert record["provider"] == "fake"
+    assert record["model"] == "deterministic-fake"
+    assert record["route"] == "in-process"
+    assert record["session_identity"]["web"]
+    assert record["session_identity"]["terminal"]
+    assert record["observed_reply"]
+    assert record["usage"] == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    assert record["cost_status"] == "not-billable"
+    assert record["state_evidence"]["network_requests"] == 0
+    assert record["rubric_results"]["persona"] == "unrun"
+    assert record["rubric_results"]["naturalness"] == "unrun"
+    assert record["rubric_results"]["usefulness"] == "unrun"
+    serialized = json.dumps(record)
+    assert "nearest irreversible fictional consequence" not in serialized
+    assert "fictional evaluation assistant called Simon" not in serialized
+    assert "concise, direct sentences" not in serialized
+
+
+def test_safe_detector_cannot_pass_wrong_persona_product_state(tmp_path: Path) -> None:
+    output = tmp_path / "control.jsonl"
+    run_evaluation(
+        Path(__file__).parents[1] / "scenarios" / "stage2-conversation-v1.json",
+        output,
+        mode="fake",
+    )
+    record = next(
+        json.loads(line)
+        for line in output.read_text().splitlines()
+        if json.loads(line)["scenario_id"] == "safe-but-wrong-persona-control"
+    )
+
+    assert record["rubric_results"]["safety_detector"] == "passed"
+    assert record["rubric_results"]["product_contract"] == "failed"
+    assert record["overall_status"] == "failed"
 
 
 def test_live_unauthorized_records_unrun(tmp_path: Path) -> None:
@@ -800,7 +895,7 @@ def test_cli_evaluate_fake_runs_and_returns_nonzero() -> None:
     records = [
         json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
     ]
-    assert len(records) == 20
+    assert len(records) == 22
 
 
 def test_cli_evaluate_default_mode_is_fake() -> None:

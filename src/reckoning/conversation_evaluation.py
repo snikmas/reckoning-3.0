@@ -36,10 +36,11 @@ EvaluatorRule = Literal[
     "clarification-v1",
     "human-judgment-v1",
     "persona-safety-v1",
+    "product-contract-v1",
     "uncertainty-v1",
 ]
 
-SUPPORTED_SCHEMA_VERSION = "2"
+SUPPORTED_SCHEMA_VERSION = "3"
 
 KNOWN_PROFILES = frozenset({"full-stage-2", "early-web"})
 KNOWN_EVALUATOR_RULES = frozenset(
@@ -53,6 +54,7 @@ KNOWN_EVALUATOR_RULES = frozenset(
         "clarification-v1",
         "human-judgment-v1",
         "persona-safety-v1",
+        "product-contract-v1",
         "uncertainty-v1",
     }
 )
@@ -112,6 +114,61 @@ class MissingJourneyStep:
     journey: str
 
 
+@dataclass(frozen=True)
+class PersonaImportStep:
+    private_identifier: str
+    display_name: str
+    declared_version: str
+    private_guidance: str
+    stable_identity: str
+    expression_persona: str
+
+
+@dataclass(frozen=True)
+class PersonaReviewStep:
+    declared_version: str
+
+
+@dataclass(frozen=True)
+class PersonaActivateStep:
+    declared_version: str
+
+
+@dataclass(frozen=True)
+class PersonaSelectVersionStep:
+    declared_version: str
+
+
+@dataclass(frozen=True)
+class PersonaRollbackStep:
+    declared_version: str
+
+
+@dataclass(frozen=True)
+class ProcessingGrantDenialStep:
+    text: str
+
+
+@dataclass(frozen=True)
+class TerminalMessageStep:
+    text: str
+
+
+@dataclass(frozen=True)
+class RestartStep:
+    pass
+
+
+@dataclass(frozen=True)
+class BackupRestoreStep:
+    pass
+
+
+@dataclass(frozen=True)
+class RuntimeContractStep:
+    pass
+
+
 ScenarioStep = (
     MessageStep
     | ReckonStep
@@ -123,6 +180,16 @@ ScenarioStep = (
     | ProfileRejectStep
     | FeedbackStep
     | MissingJourneyStep
+    | PersonaImportStep
+    | PersonaReviewStep
+    | PersonaActivateStep
+    | PersonaSelectVersionStep
+    | PersonaRollbackStep
+    | ProcessingGrantDenialStep
+    | TerminalMessageStep
+    | RestartStep
+    | BackupRestoreStep
+    | RuntimeContractStep
 )
 
 
@@ -135,6 +202,7 @@ class RubricRule:
 @dataclass(frozen=True)
 class Scenario:
     id: str
+    version: str
     language: str
     mandatory: bool
     steps: tuple[ScenarioStep, ...]
@@ -150,6 +218,7 @@ class Scenario:
 class ScenarioSet:
     scenario_set_id: str
     schema_version: str
+    version: str
     scenarios: tuple[Scenario, ...]
     content_digest: str
 
@@ -579,6 +648,9 @@ def load_scenario_set(path: str | Path) -> ScenarioSet:
         raise ScenarioSetError(
             "scenario_set_id is required and must be a non-empty string."
         )
+    scenario_set_version = data.get("version")
+    if not isinstance(scenario_set_version, str) or not scenario_set_version.strip():
+        raise ScenarioSetError("version is required and must be a non-empty string.")
 
     raw_scenarios = data.get("scenarios")
     if not isinstance(raw_scenarios, list) or not raw_scenarios:
@@ -600,6 +672,7 @@ def load_scenario_set(path: str | Path) -> ScenarioSet:
     return ScenarioSet(
         scenario_set_id=scenario_set_id.strip(),
         schema_version=SUPPORTED_SCHEMA_VERSION,
+        version=scenario_set_version.strip(),
         scenarios=tuple(scenarios),
         content_digest=content_digest,
     )
@@ -610,6 +683,7 @@ def _validate_scenario(raw: object, index: int) -> Scenario:
     if not isinstance(raw, dict):
         raise ScenarioSetError(f"{prefix} must be an object.")
     scenario_id = _require_string(raw, "id", prefix)
+    scenario_version = _require_string(raw, "version", prefix)
     language = _require_string(raw, "language", prefix)
     mandatory = raw.get("mandatory")
     if not isinstance(mandatory, bool):
@@ -646,6 +720,7 @@ def _validate_scenario(raw: object, index: int) -> Scenario:
 
     return Scenario(
         id=scenario_id,
+        version=scenario_version,
         language=language,
         mandatory=mandatory,
         steps=parsed_steps,
@@ -737,6 +812,38 @@ def _parse_step(raw: object, prefix: str, index: int) -> ScenarioStep:
         return FeedbackStep()
     if action == "missing_journey":
         return MissingJourneyStep(_require_string(raw, "journey", step_prefix))
+    if action == "persona_import":
+        bundle = raw.get("bundle")
+        if not isinstance(bundle, dict):
+            raise ScenarioSetError(f"{step_prefix}.bundle must be an object.")
+        return PersonaImportStep(
+            private_identifier=_require_string(raw, "private_identifier", step_prefix),
+            display_name=_require_string(raw, "display_name", step_prefix),
+            declared_version=_require_string(raw, "declared_version", step_prefix),
+            private_guidance=_require_string(bundle, "private_guidance", f"{step_prefix}.bundle"),
+            stable_identity=_require_string(bundle, "stable_identity", f"{step_prefix}.bundle"),
+            expression_persona=_require_string(bundle, "expression_persona", f"{step_prefix}.bundle"),
+        )
+    if action == "persona_review":
+        return PersonaReviewStep(_require_string(raw, "declared_version", step_prefix))
+    if action == "persona_activate":
+        return PersonaActivateStep(_require_string(raw, "declared_version", step_prefix))
+    if action == "persona_select_version":
+        return PersonaSelectVersionStep(
+            _require_string(raw, "declared_version", step_prefix)
+        )
+    if action == "persona_rollback":
+        return PersonaRollbackStep(_require_string(raw, "declared_version", step_prefix))
+    if action == "processing_grant_denial":
+        return ProcessingGrantDenialStep(_require_string(raw, "text", step_prefix))
+    if action == "terminal_message":
+        return TerminalMessageStep(_require_string(raw, "text", step_prefix))
+    if action == "restart":
+        return RestartStep()
+    if action == "backup_restore":
+        return BackupRestoreStep()
+    if action == "runtime_contract":
+        return RuntimeContractStep()
     raise ScenarioSetError(f"{step_prefix} has unknown action: {action!r}.")
 
 
@@ -754,7 +861,7 @@ def _run_scenario_steps(
 ) -> tuple[str, str, dict[str, Any]]:
     """Execute scenario steps through the web UI and return observed output."""
     with tempfile.TemporaryDirectory(prefix="reckoning-eval-") as tmp:
-        driver = WebEvaluationDriver(Path(tmp), **driver_kwargs)
+        driver = WebEvaluationDriver(Path(tmp) / "data", **driver_kwargs)
         for step in scenario.steps:
             if isinstance(step, MessageStep):
                 driver.send_message(step.text)
@@ -776,6 +883,33 @@ def _run_scenario_steps(
                 driver.feedback()
             elif isinstance(step, MissingJourneyStep):
                 driver.missing_journey(step.journey)
+            elif isinstance(step, PersonaImportStep):
+                driver.import_persona(
+                    private_identifier=step.private_identifier,
+                    display_name=step.display_name,
+                    declared_version=step.declared_version,
+                    private_guidance=step.private_guidance,
+                    stable_identity=step.stable_identity,
+                    expression_persona=step.expression_persona,
+                )
+            elif isinstance(step, PersonaReviewStep):
+                driver.review_persona(step.declared_version)
+            elif isinstance(step, PersonaActivateStep):
+                driver.verify_persona_activation(step.declared_version)
+            elif isinstance(step, PersonaSelectVersionStep):
+                driver.select_persona_version(step.declared_version)
+            elif isinstance(step, PersonaRollbackStep):
+                driver.rollback_persona(step.declared_version)
+            elif isinstance(step, ProcessingGrantDenialStep):
+                driver.verify_processing_grant_denial(step.text)
+            elif isinstance(step, TerminalMessageStep):
+                driver.send_terminal_message(step.text)
+            elif isinstance(step, RestartStep):
+                driver.restart()
+            elif isinstance(step, BackupRestoreStep):
+                driver.backup_and_restore()
+            elif isinstance(step, RuntimeContractStep):
+                driver.verify_runtime_contract()
             else:  # pragma: no cover - the union is exhaustive
                 raise ScenarioSetError(f"Unknown step: {step!r}")
         return driver.finish()
@@ -802,6 +936,17 @@ def _evaluate_rubric(
             results[dimension] = _evaluate_uncertainty(assistant_lower)
         elif rule.evaluator == "persona-safety-v1":
             results[dimension] = _evaluate_persona(assistant_lower)
+        elif rule.evaluator == "product-contract-v1":
+            checks = evidence.get("product_checks", [])
+            if not isinstance(checks, list) or not checks:
+                results[dimension] = "unrun"
+            elif any(
+                not isinstance(check, dict) or check.get("status") != "passed"
+                for check in checks
+            ):
+                results[dimension] = "failed"
+            else:
+                results[dimension] = "passed"
         else:
             raise ScenarioSetError(f"Unknown evaluator rule: {rule.evaluator!r}.")
     return results
@@ -1183,9 +1328,10 @@ def evaluate_scenario(
     record: dict[str, Any] = {
         "run_id": run_id,
         "scenario_set_id": scenario_set.scenario_set_id,
-        "scenario_set_version": SUPPORTED_SCHEMA_VERSION,
+        "scenario_set_version": scenario_set.version,
         "scenario_set_digest": scenario_set.content_digest,
         "scenario_id": scenario.id,
+        "scenario_version": scenario.version,
         "scenario_content_digest": scenario.content_digest,
         "scenario_tags": list(scenario.tags),
         "profile": profile,
@@ -1198,12 +1344,21 @@ def evaluate_scenario(
         "model": model,
         "route": route,
         "observed_output": observed,
+        "observed_reply": evidence.get("observed_reply", assistant_text),
+        "persona_identifier": evidence.get("persona_identifier"),
+        "persona_version": evidence.get("persona_version"),
+        "session_identity": evidence.get("session_identity"),
         "state_evidence": evidence,
         "rubric_results": rubric,
         "overall_status": overall,
         "latency_ms": latency_ms,
         "cost_status": cost_status,
         "limitations": limitations,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        },
     }
     if execution_kind == "live":
         attempt_receipts = (
@@ -1283,9 +1438,10 @@ def _unrun_record(
     record = {
         "run_id": run_id,
         "scenario_set_id": scenario_set.scenario_set_id,
-        "scenario_set_version": SUPPORTED_SCHEMA_VERSION,
+        "scenario_set_version": scenario_set.version,
         "scenario_set_digest": scenario_set.content_digest,
         "scenario_id": scenario.id,
+        "scenario_version": scenario.version,
         "scenario_content_digest": scenario.content_digest,
         "scenario_tags": list(scenario.tags),
         "profile": profile,
@@ -1298,12 +1454,17 @@ def _unrun_record(
         "model": model,
         "route": route,
         "observed_output": reason,
+        "observed_reply": "",
+        "persona_identifier": None,
+        "persona_version": None,
+        "session_identity": None,
         "state_evidence": {},
         "rubric_results": {dim: "unrun" for dim in scenario.rubric},
         "overall_status": "unrun",
         "latency_ms": 0,
         "cost_status": "unavailable",
         "limitations": limitations,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
     if execution_kind == "live":
         record["attempt_receipts"] = [
@@ -1380,12 +1541,22 @@ def _summarize(
     by_kind: dict[str, dict[str, int]] = {"fake": {}, "live": {}}
     product_counts: dict[str, int] = {}
     detector_counts: dict[str, int] = {}
+    gate_counts = {
+        "passed": 0,
+        "failed": 0,
+        "partial": 0,
+        "missing-implementation": 0,
+        "skipped": len(excluded_scenario_ids),
+        "unsupported": 0,
+        "unrun": 0,
+    }
     by_scenario: dict[str, list[dict[str, Any]]] = {
         scenario.id: [] for scenario in scenario_set.scenarios
     }
     for record in records:
         kind = cast(str, record.get("execution_kind", "fake"))
         status = cast(str, record.get("overall_status", "failed"))
+        gate_counts[status] = gate_counts.get(status, 0) + 1
         by_kind.setdefault(kind, {})[status] = (
             by_kind.setdefault(kind, {}).get(status, 0) + 1
         )
@@ -1417,6 +1588,7 @@ def _summarize(
         "live_counts": by_kind.get("live", {}),
         "product_counts": product_counts,
         "detector_counts": detector_counts,
+        "gate_counts": gate_counts,
         "mandatory_failures": mandatory_failures,
         "non_passing_scenarios": sorted(set(non_passing)),
         "excluded_scenarios": sorted(excluded_scenario_ids),
@@ -1537,6 +1709,7 @@ def run_evaluation(
     print(f"Mode: {mode}")
     print(f"Product counts: {summary['product_counts']}")
     print(f"Detector counts: {summary['detector_counts']}")
+    print(f"Gate counts: {summary['gate_counts']}")
     print(f"Fake counts: {summary['fake_counts']}")
     print(f"Live counts: {summary['live_counts']}")
     if summary["excluded_scenarios"]:
