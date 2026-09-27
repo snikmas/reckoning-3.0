@@ -43,6 +43,10 @@ EvaluatorRule = Literal[
 SUPPORTED_SCHEMA_VERSION = "3"
 
 KNOWN_PROFILES = frozenset({"full-stage-2", "early-web"})
+PROFILE_VERSIONS = {
+    "early-web": "1.0.0",
+    "full-stage-2": "2026-09-27",
+}
 KNOWN_EVALUATOR_RULES = frozenset(
     {
         "authority-v1",
@@ -1335,6 +1339,7 @@ def evaluate_scenario(
         "scenario_content_digest": scenario.content_digest,
         "scenario_tags": list(scenario.tags),
         "profile": profile,
+        "profile_version": PROFILE_VERSIONS[profile],
         "attempt": attempt,
         "timestamp": started_at.isoformat(),
         "runtime_revision": runtime_revision,
@@ -1445,6 +1450,7 @@ def _unrun_record(
         "scenario_content_digest": scenario.content_digest,
         "scenario_tags": list(scenario.tags),
         "profile": profile,
+        "profile_version": PROFILE_VERSIONS[profile],
         "attempt": attempt,
         "timestamp": started_at.isoformat(),
         "runtime_revision": runtime_revision,

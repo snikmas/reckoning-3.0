@@ -430,6 +430,7 @@ def test_persona_journey_records_public_safe_versioned_evidence(
     assert record["overall_status"] == "passed"
     assert record["scenario_set_version"] == "2026-09-27"
     assert record["scenario_version"] == "1.0.0"
+    assert record["profile_version"] == "2026-09-27"
     assert record["scenario_set_digest"]
     assert record["scenario_content_digest"]
     assert record["persona_identifier"] == "fictional-desired-self"

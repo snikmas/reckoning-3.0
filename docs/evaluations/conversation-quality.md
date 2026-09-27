@@ -60,7 +60,8 @@ Each JSONL record identifies the run, scenario, profile, execution kind,
 provider route, result, and limitations. It also records:
 
 - the Git revision and whether the working tree was dirty;
-- independent versions and SHA-256 digests for the scenario set and scenario;
+- independent versions and SHA-256 digests for the scenario set and scenario,
+  plus the selected profile version;
 - the persona identifier and version, selected channel sessions, and observed
   reply;
 - observed output and application-state evidence;
